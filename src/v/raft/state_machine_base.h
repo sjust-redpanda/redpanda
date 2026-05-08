@@ -120,6 +120,15 @@ public:
         return snapshot_at_offset_supported::yes;
     }
 
+    /// Return false to permanently opt out of all future snapshots.  The
+    /// manager excludes this STM from the next snapshot and evicts it
+    /// immediately after the snapshot data is serialised.
+    ///
+    /// The STM must uphold two invariants: the return value is deterministic
+    /// for a given applied log offset, and once false it never returns true
+    /// again.
+    virtual bool include_in_snapshot() const { return true; }
+
     /**
      * Returns state machine configured initial recovery policy.
      */

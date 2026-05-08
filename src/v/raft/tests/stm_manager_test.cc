@@ -1226,3 +1226,208 @@ TEST_F_CORO(
       nodes().at(restart_id)->raft()->stm_manager()->get<snapshot_kv>()->state,
       expected);
 }
+
+// ── Step 1c: STM self-eviction via snapshot opt-out ───────────────────────
+
+// STM that opts out of all future snapshots once it applies a designated
+// terminal batch.  This simulates archival_metadata_stm opting out after the
+// migration terminal command is committed.
+struct opt_out_kv : simple_kv {
+    using simple_kv::simple_kv;
+    static constexpr std::string_view name = "opt_out_kv";
+    static constexpr auto eviction_batch_type
+      = model::record_batch_type::archival_metadata;
+
+    bool include_in_snapshot() const override { return !_evicted; }
+
+    ss::future<> apply(
+      const model::record_batch& batch,
+      const ssx::semaphore_units& units) override {
+        if (batch.header().type == eviction_batch_type) {
+            _evicted = true;
+        }
+        return simple_kv::apply(batch, units);
+    }
+
+    bool _evicted{false};
+};
+
+static void register_opt_out_factory(
+  raft::state_machine_manager_builder& builder, raft_node_instance& node) {
+    builder.add_factory(
+      ss::sstring(opt_out_kv::name),
+      [&node](raft::consensus*) { return ss::make_shared<opt_out_kv>(node); });
+}
+
+TEST_F_CORO(state_machine_fixture, test_opted_out_stm_evicted_after_snapshot) {
+    // An STM that returns include_in_snapshot()==false must be removed from
+    // _machines immediately after take_snapshot() returns.  Other STMs and the
+    // node must remain healthy.
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<simple_kv>(*node);
+        builder.create_stm<opt_out_kv>(*node);
+        register_opt_out_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    co_await build_random_state(50);
+    co_await wait_for_apply();
+
+    // Replicate the terminal batch — all replicas must apply it.
+    auto res = co_await replicate_trigger_batch(
+      opt_out_kv::eviction_batch_type);
+    ASSERT_TRUE_CORO(res.has_value());
+    co_await wait_for_apply();
+
+    // Take and install the eviction snapshot on all nodes.
+    for (auto& [id, node] : nodes()) {
+        auto snap = co_await node->raft()->stm_manager()->take_snapshot();
+        co_await node->raft()->write_snapshot(
+          raft::write_snapshot_cfg(
+            snap.last_included_offset, std::move(snap.data)));
+    }
+
+    for (auto& [id, node] : nodes()) {
+        ASSERT_TRUE_CORO(
+          node->raft()->stm_manager()->get<opt_out_kv>() == nullptr);
+        ASSERT_TRUE_CORO(
+          node->raft()->stm_manager()->get<simple_kv>() != nullptr);
+    }
+}
+
+TEST_F_CORO(state_machine_fixture, test_opted_out_stm_absent_after_restart) {
+    // After an eviction snapshot, a restarted node must not reconstruct the
+    // opted-out STM (its entry is removed from initial_recovery_snapshot).
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<simple_kv>(*node);
+        builder.create_stm<opt_out_kv>(*node);
+        register_opt_out_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    auto expected = co_await build_random_state(50);
+    co_await wait_for_apply();
+
+    auto res = co_await replicate_trigger_batch(
+      opt_out_kv::eviction_batch_type);
+    ASSERT_TRUE_CORO(res.has_value());
+    co_await wait_for_apply();
+
+    for (auto& [id, node] : nodes()) {
+        auto snap = co_await node->raft()->stm_manager()->take_snapshot();
+        co_await node->raft()->write_snapshot(
+          raft::write_snapshot_cfg(
+            snap.last_included_offset, std::move(snap.data)));
+    }
+
+    // Restart node 0 — opt_out_kv must not come back.
+    model::node_id restart_id(0);
+    auto data_dir
+      = nodes().at(restart_id)->raft()->log()->config().base_directory();
+    co_await stop_node(restart_id);
+    add_node(restart_id, model::revision_id{0}, data_dir);
+
+    raft::state_machine_manager_builder builder;
+    builder.create_stm<simple_kv>(*nodes().at(restart_id));
+    register_opt_out_factory(builder, *nodes().at(restart_id));
+    co_await nodes()
+      .at(restart_id)
+      ->init_and_start(all_vnodes(), std::move(builder));
+
+    ASSERT_TRUE_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<opt_out_kv>()
+      == nullptr);
+
+    auto committed_offset2 = co_await with_leader(
+      10s, [](raft_node_instance& n) { return n.raft()->committed_offset(); });
+    co_await nodes()
+      .at(restart_id)
+      ->raft()
+      ->stm_manager()
+      ->get<simple_kv>()
+      ->wait(committed_offset2, model::timeout_clock::now() + 15s);
+
+    ASSERT_EQ_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<simple_kv>()->state,
+      expected);
+}
+
+TEST_F_CORO(
+  state_machine_fixture, test_opted_out_stm_transiently_reconstructed) {
+    // If the node restarts after the terminal batch but before the eviction
+    // snapshot, the STM is transiently reconstructed from
+    // initial_recovery_snapshot, replays to the terminal offset (opting out
+    // again), and is evicted at the next snapshot.
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<simple_kv>(*node);
+        builder.create_stm<opt_out_kv>(*node);
+        register_opt_out_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    co_await build_random_state(50);
+    co_await wait_for_apply();
+
+    // Replicate terminal batch but do NOT take eviction snapshot.
+    auto res = co_await replicate_trigger_batch(
+      opt_out_kv::eviction_batch_type);
+    ASSERT_TRUE_CORO(res.has_value());
+    co_await wait_for_apply();
+
+    model::node_id restart_id(0);
+    auto data_dir
+      = nodes().at(restart_id)->raft()->log()->config().base_directory();
+    co_await stop_node(restart_id);
+    add_node(restart_id, model::revision_id{0}, data_dir);
+
+    raft::state_machine_manager_builder builder;
+    builder.create_stm<simple_kv>(*nodes().at(restart_id));
+    register_opt_out_factory(builder, *nodes().at(restart_id));
+    co_await nodes()
+      .at(restart_id)
+      ->init_and_start(all_vnodes(), std::move(builder));
+
+    // opt_out_kv is transiently present (initial_recovery_snapshot still has
+    // it).
+    ASSERT_TRUE_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<opt_out_kv>()
+      != nullptr);
+
+    // Wait for full replay — after applying the terminal batch,
+    // include_in_snapshot() must return false.
+    auto committed_offset = co_await with_leader(
+      10s, [](raft_node_instance& n) { return n.raft()->committed_offset(); });
+    co_await nodes()
+      .at(restart_id)
+      ->raft()
+      ->stm_manager()
+      ->get<opt_out_kv>()
+      ->wait(committed_offset, model::timeout_clock::now() + 15s);
+
+    ASSERT_TRUE_CORO(!nodes()
+                        .at(restart_id)
+                        ->raft()
+                        ->stm_manager()
+                        ->get<opt_out_kv>()
+                        ->include_in_snapshot());
+
+    // Taking the snapshot evicts the opted-out STM.
+    auto snap
+      = co_await nodes().at(restart_id)->raft()->stm_manager()->take_snapshot();
+    co_await nodes()
+      .at(restart_id)
+      ->raft()
+      ->write_snapshot(
+        raft::write_snapshot_cfg(
+          snap.last_included_offset, std::move(snap.data)));
+
+    ASSERT_TRUE_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<opt_out_kv>()
+      == nullptr);
+}

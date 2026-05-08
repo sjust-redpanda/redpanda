@@ -876,16 +876,55 @@ state_machine_manager::take_snapshot(model::offset last_included_offset) {
     // snapshot can only be taken  after  all background applies finished
     auto units = co_await acquire_background_apply_mutexes();
 
+    // Partition _machines into included and opted-out sets.
+    std::vector<std::pair<ss::sstring, entry_ptr>> included;
+    std::vector<entry_ptr> opted_out;
+    for (auto& [name, entry] : _machines) {
+        if (entry->stm->include_in_snapshot()) {
+            included.emplace_back(name, entry);
+        } else {
+            opted_out.push_back(entry);
+            vlog(_log.info, "STM '{}' opted out of snapshot; will evict", name);
+        }
+    }
+
     managed_snapshot snapshot;
     co_await ss::coroutine::parallel_for_each(
-      _machines, [last_included_offset, &snapshot](auto entry_pair) {
-          return entry_pair.second->stm
-            ->take_raft_snapshot(last_included_offset)
-            .then([&snapshot, key = entry_pair.first](auto snapshot_part) {
+      included, [last_included_offset, &snapshot](auto& pair) {
+          return pair.second->stm->take_raft_snapshot(last_included_offset)
+            .then([&snapshot, key = pair.first](auto snapshot_part) {
                 snapshot.snapshot_map.try_emplace(
                   key, std::move(snapshot_part));
             });
       });
+
+    // Erase opted-out STMs from _machines, update support flags and
+    // initial_recovery_snapshot while the apply mutex is still held.
+    for (auto& entry : opted_out) {
+        _machines.erase(entry->name);
+    }
+    if (!opted_out.empty()) {
+        _supports_snapshot_at_offset = snapshot_at_offset_supported::yes;
+        for (auto& [_, entry] : _machines) {
+            _supports_snapshot_at_offset
+              = _supports_snapshot_at_offset
+                && entry->stm->supports_snapshot_at_offset();
+        }
+        auto irsnap = co_await read_initial_recovery_snapshot();
+        if (irsnap) {
+            for (auto& entry : opted_out) {
+                irsnap->initial_recovery_next_offsets.erase(entry->name);
+            }
+            co_await write_initial_recovery_snapshot(std::move(*irsnap));
+        }
+    }
+
+    // Release mutex before stopping evicted STMs.
+    u.return_all();
+    units.clear();
+
+    co_await ss::coroutine::parallel_for_each(
+      opted_out, [this](entry_ptr& entry) { return do_stop_stm(entry); });
 
     co_return state_machine_manager::snapshot_result{
       serde::to_iobuf(std::move(snapshot)), last_included_offset};
@@ -911,15 +950,56 @@ state_machine_manager::take_snapshot() {
     // snapshot can only be taken  after  all background applies finished
     auto units = co_await acquire_background_apply_mutexes();
     auto snapshot_offset = last_applied();
+
+    // Partition _machines into included and opted-out sets.
+    std::vector<std::pair<ss::sstring, entry_ptr>> included;
+    std::vector<entry_ptr> opted_out;
+    for (auto& [name, entry] : _machines) {
+        if (entry->stm->include_in_snapshot()) {
+            included.emplace_back(name, entry);
+        } else {
+            opted_out.push_back(entry);
+            vlog(_log.info, "STM '{}' opted out of snapshot; will evict", name);
+        }
+    }
+
     managed_snapshot snapshot;
     co_await ss::coroutine::parallel_for_each(
-      _machines, [snapshot_offset, &snapshot](auto entry_pair) {
-          return entry_pair.second->stm->take_raft_snapshot(snapshot_offset)
-            .then([&snapshot, key = entry_pair.first](auto snapshot_part) {
+      included, [snapshot_offset, &snapshot](auto& pair) {
+          return pair.second->stm->take_raft_snapshot(snapshot_offset)
+            .then([&snapshot, key = pair.first](auto snapshot_part) {
                 snapshot.snapshot_map.try_emplace(
                   key, std::move(snapshot_part));
             });
       });
+
+    // Erase opted-out STMs from _machines, update support flags and
+    // initial_recovery_snapshot while the apply mutex is still held.
+    for (auto& entry : opted_out) {
+        _machines.erase(entry->name);
+    }
+    if (!opted_out.empty()) {
+        _supports_snapshot_at_offset = snapshot_at_offset_supported::yes;
+        for (auto& [_, entry] : _machines) {
+            _supports_snapshot_at_offset
+              = _supports_snapshot_at_offset
+                && entry->stm->supports_snapshot_at_offset();
+        }
+        auto irsnap = co_await read_initial_recovery_snapshot();
+        if (irsnap) {
+            for (auto& entry : opted_out) {
+                irsnap->initial_recovery_next_offsets.erase(entry->name);
+            }
+            co_await write_initial_recovery_snapshot(std::move(*irsnap));
+        }
+    }
+
+    // Release mutex before stopping evicted STMs.
+    u.return_all();
+    units.clear();
+
+    co_await ss::coroutine::parallel_for_each(
+      opted_out, [this](entry_ptr& entry) { return do_stop_stm(entry); });
 
     co_return state_machine_manager::snapshot_result{
       serde::to_iobuf(std::move(snapshot)), snapshot_offset};
