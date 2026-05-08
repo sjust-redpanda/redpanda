@@ -369,6 +369,7 @@ simple_metastore::get_first_ge(
           .object_size = object_size,
           .first_offset = it->base_offset,
           .last_offset = it->last_offset,
+          .imported = object_it->second.imported,
         };
     }
     return std::unexpected(metastore::errc::out_of_range);
@@ -409,6 +410,7 @@ simple_metastore::get_first_ge(
               .object_size = object_size,
               .first_offset = obj.base_offset,
               .last_offset = obj.last_offset,
+              .imported = object_it->second.imported,
             };
         }
     }
@@ -902,6 +904,7 @@ simple_metastore::get_extent_metadata_forwards(
               .oid = ext.oid,
               .footer_pos = object_it->second.footer_pos,
               .object_size = object_it->second.object_size,
+              .imported = object_it->second.imported,
             };
         }
 

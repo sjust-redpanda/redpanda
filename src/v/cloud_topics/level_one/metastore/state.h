@@ -273,7 +273,7 @@ struct topic_state
 // Metadata about a given object that is not specific to any partition.
 struct object_entry
   : public serde::
-      envelope<object_entry, serde::version<1>, serde::compat_version<0>> {
+      envelope<object_entry, serde::version<2>, serde::compat_version<0>> {
     friend bool operator==(const object_entry&, const object_entry&) = default;
     auto serde_fields() {
         return std::tie(
@@ -282,7 +282,8 @@ struct object_entry
           footer_pos,
           object_size,
           last_updated,
-          is_preregistration);
+          is_preregistration,
+          imported);
     }
     size_t total_data_size{0};
     size_t removed_data_size{0};
@@ -290,6 +291,7 @@ struct object_entry
     size_t object_size{0};
     model::timestamp last_updated;
     bool is_preregistration{false};
+    std::optional<imported_segment_info> imported;
 };
 
 // Tracks the state of each topic revision.
