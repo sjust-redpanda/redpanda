@@ -88,6 +88,17 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "object_handle",
+    hdrs = ["object_handle.h"],
+    deps = [
+        ":abstract_io",
+        ":object",
+        "//src/v/model",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "file_io",
     srcs = ["file_io.cc"],
     hdrs = ["file_io.h"],
