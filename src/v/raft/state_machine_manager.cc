@@ -11,9 +11,11 @@
 
 #include "raft/state_machine_manager.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "bytes/iostream.h"
 #include "config/property.h"
 #include "model/fundamental.h"
+#include "model/record_batch_types.h"
 #include "model/timeout_clock.h"
 #include "raft/consensus.h"
 #include "raft/logger.h"
@@ -53,7 +55,10 @@ public:
       const char* ctx,
       const std::vector<state_machine_manager::entry_ptr>& machines,
       ss::abort_source& as,
-      ctx_log& log);
+      ctx_log& log,
+      absl::flat_hash_set<model::record_batch_type> watch_types = {},
+      absl::flat_hash_map<model::record_batch_type, model::offset>* triggered
+      = nullptr);
 
     ss::future<ss::stop_iteration> operator()(model::record_batch);
 
@@ -74,16 +79,22 @@ private:
     model::offset _max_last_applied;
     ss::abort_source& _as;
     ctx_log& _log;
+    absl::flat_hash_set<model::record_batch_type> _watch_types;
+    absl::flat_hash_map<model::record_batch_type, model::offset>* _triggered;
 };
 
 batch_applicator::batch_applicator(
   const char* ctx,
   const std::vector<state_machine_manager::entry_ptr>& entries,
   ss::abort_source& as,
-  ctx_log& log)
+  ctx_log& log,
+  absl::flat_hash_set<model::record_batch_type> watch_types,
+  absl::flat_hash_map<model::record_batch_type, model::offset>* triggered)
   : _ctx(ctx)
   , _as(as)
-  , _log(log) {
+  , _log(log)
+  , _watch_types(std::move(watch_types))
+  , _triggered(triggered) {
     for (auto& m : entries) {
         _machines.push_back(apply_state{.stm_entry = m});
     }
@@ -91,6 +102,11 @@ batch_applicator::batch_applicator(
 
 ss::future<ss::stop_iteration>
 batch_applicator::operator()(model::record_batch batch) {
+    const bool is_trigger = _triggered
+                            && _watch_types.contains(batch.header().type);
+    if (is_trigger) {
+        _triggered->try_emplace(batch.header().type, batch.base_offset());
+    }
     const auto last_offset = batch.last_offset();
     std::vector<ss::future<applied_successfully>> futures;
     futures.reserve(_machines.size());
@@ -101,6 +117,14 @@ batch_applicator::operator()(model::record_batch batch) {
         futures.push_back(apply_to_stm(batch, state));
     }
     if (futures.empty()) {
+        // When the STM list is empty but we are watching for trigger batch
+        // types, keep reading so triggers at later offsets are detected.
+        if (_machines.empty() && !_watch_types.empty()) {
+            if (is_trigger) {
+                _max_last_applied = last_offset;
+            }
+            co_return ss::stop_iteration(_as.abort_requested());
+        }
         co_return ss::stop_iteration::yes;
     }
 
@@ -164,11 +188,14 @@ state_machine_manager::state_machine_manager(
   std::vector<named_stm> stms,
   absl::flat_hash_map<ss::sstring, stm_make_fn, sstring_hash, sstring_eq>
     stm_factories,
+  absl::flat_hash_map<model::record_batch_type, ss::sstring>
+    trigger_to_stm_name,
   ss::scheduling_group apply_sg,
   config::binding<std::chrono::milliseconds> stm_shutdown_timeout)
   : _raft(raft)
   , _log(ctx_log(_raft->group(), _raft->ntp()))
   , _stm_factories(std::move(stm_factories))
+  , _trigger_to_stm_name(std::move(trigger_to_stm_name))
   , _apply_sg(apply_sg)
   , _initial_recovery_snapshot_mgr(
       std::filesystem::path(_raft->log_config().work_directory()),
@@ -194,44 +221,47 @@ model::offset state_machine_manager::max_next_offset() const {
 
 ss::future<> state_machine_manager::start() {
     vlog(_log.debug, "starting state machine manager");
-    if (_machines.empty()) {
+    if (_machines.empty() && _trigger_to_stm_name.empty()) {
         co_return;
     }
-    co_await ss::coroutine::parallel_for_each(_machines, [this](auto& pair) {
-        vlog(_log.trace, "starting {} state machine", pair.first);
-        return pair.second->stm->start();
-    });
-    std::vector<model::offset> offsets;
-    for (const auto& [name, stm_meta] : _machines) {
+    if (!_machines.empty()) {
+        co_await ss::coroutine::parallel_for_each(
+          _machines, [this](auto& pair) {
+              vlog(_log.trace, "starting {} state machine", pair.first);
+              return pair.second->stm->start();
+          });
+        std::vector<model::offset> offsets;
+        for (const auto& [name, stm_meta] : _machines) {
+            vlog(
+              _log.trace,
+              "state machine {} last applied offset: {}",
+              name,
+              stm_meta->stm->last_applied_offset());
+            offsets.push_back(stm_meta->stm->last_applied_offset());
+        }
+        _next = model::next_offset(*std::ranges::max_element(offsets));
+        auto log_offsets = _raft->log()->offsets();
+        /**
+         * Special case for the `archival_metadata_stm` local snapshot created
+         * during recovery. The snapshot last included offset was set to the log
+         * start offset.
+         */
+        if (log_offsets.start_offset > log_offsets.committed_offset) {
+            vlog(
+              _log.info,
+              "starting state machine manager with empty log. Clamping _next "
+              "{} to the start offset: {}",
+              _next,
+              log_offsets.start_offset);
+            _next = log_offsets.start_offset;
+        }
         vlog(
-          _log.trace,
-          "state machine {} last applied offset: {}",
-          name,
-          stm_meta->stm->last_applied_offset());
-        offsets.push_back(stm_meta->stm->last_applied_offset());
+          _log.debug,
+          "started state machine manager with initial next offset: {}",
+          _next);
+        // it safe to update next here as the apply loop didn't start yet.
+        co_await apply_initial_recovery_policy();
     }
-    _next = model::next_offset(*std::ranges::max_element(offsets));
-    auto log_offsets = _raft->log()->offsets();
-    /**
-     * Special case for the `archival_metadata_stm` local snapshot created
-     * during recovery. The snapshot last included offset was set to the log
-     * start offset.
-     */
-    if (log_offsets.start_offset > log_offsets.committed_offset) {
-        vlog(
-          _log.info,
-          "starting state machine manager with empty log. Clamping _next {} to "
-          "the start offset: {}",
-          _next,
-          log_offsets.start_offset);
-        _next = log_offsets.start_offset;
-    }
-    vlog(
-      _log.debug,
-      "started state machine manager with initial next offset: {}",
-      _next);
-    // it safe to update next here as the apply loop didn't start yet.
-    co_await apply_initial_recovery_policy();
     ssx::spawn_with_gate(_gate, [this] {
         return ss::do_until(
           [this] { return _as.abort_requested(); }, [this] { return apply(); });
@@ -258,6 +288,14 @@ ss::future<> state_machine_manager::stop() {
       _machines.size());
     _apply_mutex.broken();
     _as.request_abort();
+
+    for (auto& [name, waiters] : _stm_install_waiters) {
+        for (auto& p : waiters) {
+            p.set_exception(
+              std::make_exception_ptr(ss::gate_closed_exception{}));
+        }
+    }
+    _stm_install_waiters.clear();
 
     auto gate_f = _gate.close();
     co_await ss::coroutine::parallel_for_each(
@@ -581,7 +619,16 @@ ss::future<> state_machine_manager::try_apply_in_foreground() {
                 machines.push_back(entry);
             }
         }
-        if (machines.empty()) {
+
+        // Collect trigger batch types for factories not yet installed.
+        absl::flat_hash_set<model::record_batch_type> watch_types;
+        for (auto& [bt, name] : _trigger_to_stm_name) {
+            if (!_machines.contains(name)) {
+                watch_types.insert(bt);
+            }
+        }
+
+        if (machines.empty() && watch_types.empty()) {
             vlog(
               _log.debug,
               "no machines were selected to apply in foreground, current next "
@@ -607,13 +654,21 @@ ss::future<> state_machine_manager::try_apply_in_foreground() {
         auto config = storage::local_log_reader_config(
           _next, _raft->committed_offset());
 
+        absl::flat_hash_map<model::record_batch_type, model::offset> triggered;
+
         model::record_batch_reader reader = co_await _raft->make_reader(config);
 
         auto max_last_applied = co_await std::move(reader).consume(
-          batch_applicator(default_ctx, machines, _as, _log),
+          batch_applicator(
+            default_ctx,
+            machines,
+            _as,
+            _log,
+            std::move(watch_types),
+            &triggered),
           model::no_timeout);
 
-        if (max_last_applied == model::offset{}) {
+        if (max_last_applied == model::offset{} && triggered.empty()) {
             vlogl(
               _log,
               _raft->log_config().cache_enabled() ? ss::log_level::warn
@@ -627,8 +682,25 @@ ss::future<> state_machine_manager::try_apply_in_foreground() {
             co_await ss::sleep_abortable(100ms, _as);
             co_return;
         }
-        _next = std::max(model::next_offset(max_last_applied), _next);
-        vlog(_log.trace, "updating _next offset with: {}", _next);
+        if (max_last_applied != model::offset{}) {
+            _next = std::max(model::next_offset(max_last_applied), _next);
+            vlog(_log.trace, "updating _next offset with: {}", _next);
+        }
+
+        // Install any factories whose trigger batch type was seen.
+        for (auto& [bt, trigger_offset] : triggered) {
+            auto name_it = _trigger_to_stm_name.find(bt);
+            if (name_it == _trigger_to_stm_name.end()) {
+                continue;
+            }
+            const auto& stm_name = name_it->second;
+            if (_machines.contains(stm_name)) {
+                continue;
+            }
+            u.return_all();
+            co_await install_factory_stm(stm_name, trigger_offset);
+            u = co_await _apply_mutex.get_units();
+        }
     } catch (const ss::timed_out_error&) {
         vlog(_log.debug, "state machine apply timeout");
     } catch (const ss::abort_requested_exception&) {
@@ -957,6 +1029,77 @@ ss::future<> state_machine_manager::write_initial_recovery_snapshot(
 
     co_await writer.close();
     co_await _initial_recovery_snapshot_mgr.finish_snapshot(writer);
+}
+
+ss::future<> state_machine_manager::install_factory_stm(
+  ss::sstring name, model::offset trigger_offset) {
+    if (_machines.contains(name)) {
+        co_return;
+    }
+
+    auto it = _stm_factories.find(name);
+    if (it == _stm_factories.end()) {
+        vlog(
+          _log.warn, "no factory closure for STM '{}'; cannot install", name);
+        co_return;
+    }
+
+    vlog(
+      _log.info,
+      "installing STM '{}' triggered at offset {}",
+      name,
+      trigger_offset);
+
+    auto stm = it->second(_raft);
+    co_await stm->start();
+
+    auto u = co_await _apply_mutex.get_units();
+
+    if (_machines.contains(name)) {
+        co_await stm->stop();
+        co_return;
+    }
+
+    stm->set_next(std::max(trigger_offset, stm->next()));
+
+    auto snap = co_await read_initial_recovery_snapshot();
+    if (!snap) {
+        snap.emplace(initial_recovery_snapshot{});
+    }
+    snap->initial_recovery_next_offsets.insert_or_assign(name, stm->next());
+    co_await write_initial_recovery_snapshot(std::move(*snap));
+
+    _supports_snapshot_at_offset = _supports_snapshot_at_offset
+                                   && stm->supports_snapshot_at_offset();
+
+    auto entry = ss::make_lw_shared<state_machine_entry>(name, std::move(stm));
+    _machines.try_emplace(name, entry);
+
+    if (
+      auto wit = _stm_install_waiters.find(name);
+      wit != _stm_install_waiters.end()) {
+        for (auto& p : wit->second) {
+            p.set_value();
+        }
+        _stm_install_waiters.erase(wit);
+    }
+
+    maybe_start_background_apply(entry);
+
+    vlog(_log.info, "STM '{}' installed successfully", name);
+}
+
+ss::future<> state_machine_manager::wait_for_stm_name(
+  ss::sstring name, model::timeout_clock::time_point deadline) {
+    if (_machines.contains(name)) {
+        co_return;
+    }
+
+    ss::promise<> p;
+    auto fut = p.get_future();
+    _stm_install_waiters[name].push_back(std::move(p));
+
+    co_await ss::with_timeout(deadline, std::move(fut));
 }
 
 } // namespace raft

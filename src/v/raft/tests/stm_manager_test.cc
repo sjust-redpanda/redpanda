@@ -697,6 +697,319 @@ TEST_F_CORO(state_machine_fixture, test_snapshot_restart_reconstructs_stm) {
       expected);
 }
 
+// ── Step 1b: batch-triggered dynamic installation ────────────────────────
+
+static constexpr auto trigger_batch_type
+  = model::record_batch_type::ctp_stm_command;
+
+// STM installed dynamically when a trigger batch is seen.
+struct factory_kv : simple_kv {
+    using simple_kv::simple_kv;
+    static constexpr std::string_view name = "factory_kv";
+};
+
+// Same but start() sleeps briefly to exercise in-progress install races.
+struct slow_start_factory_kv : factory_kv {
+    using factory_kv::factory_kv;
+    static constexpr std::string_view name = "slow_start_factory_kv";
+
+    ss::future<> start() override {
+        co_await ss::sleep(50ms);
+        co_return co_await factory_kv::start();
+    }
+};
+
+// Register a batch-triggered factory for KV in builder.
+// The STM is NOT created at startup — it is installed by the trigger.
+template<typename KV = factory_kv>
+static void register_factory(
+  raft::state_machine_manager_builder& builder, raft_node_instance& node) {
+    builder.add_factory(
+      ss::sstring(KV::name),
+      [&node](raft::consensus*) { return ss::make_shared<KV>(node); },
+      trigger_batch_type);
+}
+
+TEST_F_CORO(state_machine_fixture, test_factory_trigger_installs_stm) {
+    // A cluster with no factory_kv at startup.  Replicating the trigger batch
+    // must install factory_kv on every replica.
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<simple_kv>(*node);
+        register_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    // Build some state before the trigger.
+    co_await build_random_state(50);
+    co_await wait_for_apply();
+
+    auto res = co_await replicate_trigger_batch(trigger_batch_type);
+    ASSERT_TRUE_CORO(res.has_value());
+
+    // Wait for all nodes to install factory_kv.
+    co_await parallel_for_each_node([](raft_node_instance& n) {
+        return n.raft()->stm_manager()->wait_for_stm_name(
+          ss::sstring(factory_kv::name), model::timeout_clock::now() + 15s);
+    });
+
+    // factory_kv is accessible and catches up via background apply.
+    auto committed_offset = co_await with_leader(
+      10s, [](raft_node_instance& n) { return n.raft()->committed_offset(); });
+    co_await parallel_for_each_node([committed_offset](raft_node_instance& n) {
+        return n.raft()->stm_manager()->get<factory_kv>()->wait(
+          committed_offset, model::timeout_clock::now() + 15s);
+    });
+
+    for (auto& [id, node] : nodes()) {
+        ASSERT_TRUE_CORO(
+          node->raft()->stm_manager()->get<factory_kv>() != nullptr);
+    }
+}
+
+TEST_F_CORO(state_machine_fixture, test_factory_stm_restart_correctness) {
+    // Install factory_kv via trigger, take a snapshot, restart a node.
+    // factory_kv must be reconstructed from initial_recovery_snapshot.
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<simple_kv>(*node);
+        register_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    auto expected = co_await build_random_state(100);
+    co_await wait_for_apply();
+
+    auto res = co_await replicate_trigger_batch(trigger_batch_type);
+    ASSERT_TRUE_CORO(res.has_value());
+
+    co_await parallel_for_each_node([](raft_node_instance& n) {
+        return n.raft()->stm_manager()->wait_for_stm_name(
+          ss::sstring(factory_kv::name), model::timeout_clock::now() + 15s);
+    });
+
+    auto committed_offset = co_await with_leader(
+      10s, [](raft_node_instance& n) { return n.raft()->committed_offset(); });
+    co_await parallel_for_each_node([committed_offset](raft_node_instance& n) {
+        return n.raft()->stm_manager()->get<factory_kv>()->wait(
+          committed_offset, model::timeout_clock::now() + 15s);
+    });
+
+    expected = co_await build_random_state(100);
+    co_await wait_for_apply();
+
+    // Restart node 0 — it must reconstruct factory_kv without a trigger.
+    model::node_id restart_id(0);
+    auto data_dir
+      = nodes().at(restart_id)->raft()->log()->config().base_directory();
+    co_await stop_node(restart_id);
+    add_node(restart_id, model::revision_id{0}, data_dir);
+
+    raft::state_machine_manager_builder builder;
+    builder.create_stm<simple_kv>(*nodes().at(restart_id));
+    register_factory(builder, *nodes().at(restart_id));
+    co_await nodes()
+      .at(restart_id)
+      ->init_and_start(all_vnodes(), std::move(builder));
+
+    committed_offset = co_await with_leader(
+      10s, [](raft_node_instance& n) { return n.raft()->committed_offset(); });
+
+    co_await nodes()
+      .at(restart_id)
+      ->raft()
+      ->stm_manager()
+      ->get<factory_kv>()
+      ->wait(committed_offset, model::timeout_clock::now() + 15s);
+
+    ASSERT_TRUE_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<factory_kv>()
+      != nullptr);
+    ASSERT_EQ_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<factory_kv>()->state,
+      expected);
+}
+
+TEST_F_CORO(
+  state_machine_fixture, test_factory_not_triggered_if_stm_already_installed) {
+    // factory_kv is in the builder at startup.  Replicating a trigger batch
+    // must not create a second instance.
+    create_nodes();
+    absl::flat_hash_map<model::node_id, ss::shared_ptr<factory_kv>>
+      initial_stms;
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        auto fkv = builder.create_stm<factory_kv>(*node);
+        initial_stms.emplace(id, fkv);
+        // Also register factory so the trigger path sees it.
+        register_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    auto expected = co_await build_random_state(50);
+    co_await wait_for_apply();
+
+    auto res = co_await replicate_trigger_batch(trigger_batch_type);
+    ASSERT_TRUE_CORO(res.has_value());
+    co_await wait_for_apply();
+
+    for (auto& [id, node] : nodes()) {
+        // The pointer must be the same instance as the original.
+        ASSERT_TRUE_CORO(
+          node->raft()->stm_manager()->get<factory_kv>()
+          == initial_stms.at(id));
+    }
+    for (auto& [node_id, stm] : initial_stms) {
+        ASSERT_EQ_CORO(stm->state, expected);
+    }
+}
+
+TEST_F_CORO(
+  state_machine_fixture, test_factory_stm_apply_during_installation_window) {
+    // Batches written after the trigger must be applied by factory_kv even
+    // though installation is in progress on the replicas.
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        register_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    auto res = co_await replicate_trigger_batch(trigger_batch_type);
+    ASSERT_TRUE_CORO(res.has_value());
+
+    // Write batches after the trigger (factory_kv might still be installing).
+    auto expected = co_await build_random_state(200);
+
+    co_await parallel_for_each_node([](raft_node_instance& n) {
+        return n.raft()->stm_manager()->wait_for_stm_name(
+          ss::sstring(factory_kv::name), model::timeout_clock::now() + 15s);
+    });
+
+    auto committed_offset = co_await with_leader(
+      10s, [](raft_node_instance& n) { return n.raft()->committed_offset(); });
+    co_await parallel_for_each_node([committed_offset](raft_node_instance& n) {
+        return n.raft()->stm_manager()->get<factory_kv>()->wait(
+          committed_offset, model::timeout_clock::now() + 15s);
+    });
+
+    for (auto& [id, node] : nodes()) {
+        ASSERT_EQ_CORO(
+          node->raft()->stm_manager()->get<factory_kv>()->state, expected);
+    }
+}
+
+TEST_F_CORO(
+  state_machine_fixture, test_factory_stm_leader_change_after_trigger) {
+    // Install factory_kv via trigger on the initial leader, then cause a
+    // leader change.  The new leader must also have factory_kv running.
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<simple_kv>(*node);
+        register_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    auto res = co_await replicate_trigger_batch(trigger_batch_type);
+    ASSERT_TRUE_CORO(res.has_value());
+
+    co_await parallel_for_each_node([](raft_node_instance& n) {
+        return n.raft()->stm_manager()->wait_for_stm_name(
+          ss::sstring(factory_kv::name), model::timeout_clock::now() + 15s);
+    });
+
+    // Verify factory_kv is accessible on all nodes.
+    for (auto& [id, node] : nodes()) {
+        ASSERT_TRUE_CORO(
+          node->raft()->stm_manager()->get<factory_kv>() != nullptr);
+    }
+}
+
+TEST_F_CORO(state_machine_fixture, test_factory_stm_stop_during_installation) {
+    // Use slow_start_factory_kv so there is a window between trigger and
+    // install completing.  Stop and restart the node; the trigger batch is
+    // still in the log so factory_kv re-installs on replay.
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<simple_kv>(*node);
+        register_factory<slow_start_factory_kv>(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    auto res = co_await replicate_trigger_batch(trigger_batch_type);
+    ASSERT_TRUE_CORO(res.has_value());
+
+    // Stop node 0 immediately, possibly mid-install.
+    model::node_id restart_id(0);
+    auto data_dir
+      = nodes().at(restart_id)->raft()->log()->config().base_directory();
+    co_await stop_node(restart_id);
+    add_node(restart_id, model::revision_id{0}, data_dir);
+
+    raft::state_machine_manager_builder builder;
+    builder.create_stm<simple_kv>(*nodes().at(restart_id));
+    register_factory<slow_start_factory_kv>(builder, *nodes().at(restart_id));
+    co_await nodes()
+      .at(restart_id)
+      ->init_and_start(all_vnodes(), std::move(builder));
+
+    co_await nodes()
+      .at(restart_id)
+      ->raft()
+      ->stm_manager()
+      ->wait_for_stm_name(
+        ss::sstring(slow_start_factory_kv::name),
+        model::timeout_clock::now() + 30s);
+
+    ASSERT_TRUE_CORO(
+      nodes()
+        .at(restart_id)
+        ->raft()
+        ->stm_manager()
+        ->get<slow_start_factory_kv>()
+      != nullptr);
+}
+
+TEST_F_CORO(state_machine_fixture, test_factory_not_triggered_restart) {
+    // No trigger batch is ever replicated.  After a restart, factory_kv must
+    // remain absent from _machines.
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<simple_kv>(*node);
+        register_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    co_await build_random_state(50);
+    co_await wait_for_apply();
+
+    // Restart node 0 without ever replicating the trigger.
+    model::node_id restart_id(0);
+    auto data_dir
+      = nodes().at(restart_id)->raft()->log()->config().base_directory();
+    co_await stop_node(restart_id);
+    add_node(restart_id, model::revision_id{0}, data_dir);
+
+    raft::state_machine_manager_builder builder;
+    builder.create_stm<simple_kv>(*nodes().at(restart_id));
+    register_factory(builder, *nodes().at(restart_id));
+    co_await nodes()
+      .at(restart_id)
+      ->init_and_start(all_vnodes(), std::move(builder));
+
+    co_await wait_for_apply();
+
+    // factory_kv must not be present.
+    ASSERT_TRUE_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<factory_kv>()
+      == nullptr);
+}
+
 TEST_F_CORO(
   state_machine_fixture, test_cross_node_recovery_restores_missing_stm) {
     // Verify the do_apply_raft_snapshot pre-pass: a fresh replica that

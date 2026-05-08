@@ -12,8 +12,10 @@
 #pragma once
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "config/configuration.h"
 #include "model/fundamental.h"
+#include "model/record_batch_types.h"
 #include "raft/fwd.h"
 #include "raft/logger.h"
 #include "raft/state_machine_base.h"
@@ -89,6 +91,11 @@ public:
       model::timeout_clock::time_point,
       std::optional<std::reference_wrapper<ss::abort_source>> as
       = std::nullopt);
+
+    /// Block until the named STM is present in _machines, until the deadline,
+    /// or until the manager is stopped (ss::gate_closed_exception).
+    ss::future<>
+    wait_for_stm_name(ss::sstring name, model::timeout_clock::time_point);
     /**
      * In classic Raft protocol a snapshot is always taken from the current STM
      * state i.e last snapshot index is derived from last_applied_offset. In
@@ -184,6 +191,8 @@ private:
       std::vector<named_stm> stms_to_manage,
       absl::flat_hash_map<ss::sstring, stm_make_fn, sstring_hash, sstring_eq>
         stm_factories,
+      absl::flat_hash_map<model::record_batch_type, ss::sstring>
+        trigger_to_stm_name,
       ss::scheduling_group apply_sg,
       config::binding<std::chrono::milliseconds> stm_shutdown_timeout);
 
@@ -235,6 +244,12 @@ private:
 
     ss::future<> apply_initial_recovery_policy();
     ss::future<> do_stop_stm(entry_ptr entry);
+
+    /// Create and start the STM identified by name using the registered
+    /// factory closure, then insert it into _machines and persist the install
+    /// to initial_recovery_snapshot.  Must NOT be called with _apply_mutex
+    /// held; acquires it internally.
+    ss::future<> install_factory_stm(ss::sstring name, model::offset trigger);
     /**
      * Methods to access/write the local state machine manager snapshot. The
      * snapshot is currently used to maintain the state of initial recovery for
@@ -270,6 +285,14 @@ private:
     ssx::mutex _apply_mutex{"stm_manager::apply"};
     absl::flat_hash_map<ss::sstring, stm_make_fn, sstring_hash, sstring_eq>
       _stm_factories;
+    absl::flat_hash_map<model::record_batch_type, ss::sstring>
+      _trigger_to_stm_name;
+    absl::flat_hash_map<
+      ss::sstring,
+      std::vector<ss::promise<>>,
+      sstring_hash,
+      sstring_eq>
+      _stm_install_waiters;
     state_machines_t _machines;
     model::offset _next{0};
     ss::gate _gate;
@@ -295,10 +318,17 @@ public:
 
     void with_scheduing_group(ss::scheduling_group sg) { _sg = sg; }
 
-    /// Register a factory closure used for snapshot-driven reconstruction.
-    /// Called by state_machine_registry::make_builder_for() for every
-    /// registered factory, regardless of whether is_applicable_for() is true.
-    void add_factory(ss::sstring name, state_machine_manager::stm_make_fn fn) {
+    /// Register a factory closure used for snapshot-driven reconstruction
+    /// (Step 1a) and optionally batch-triggered dynamic installation (Step
+    /// 1b).  Called by state_machine_registry::make_builder_for() for every
+    /// registered factory.
+    void add_factory(
+      ss::sstring name,
+      state_machine_manager::stm_make_fn fn,
+      std::optional<model::record_batch_type> trigger_type = std::nullopt) {
+        if (trigger_type) {
+            _trigger_to_stm_name.emplace(*trigger_type, name);
+        }
         _stm_factories.emplace(std::move(name), std::move(fn));
     }
 
@@ -307,6 +337,7 @@ public:
           raft,
           std::move(_stms),
           std::move(_stm_factories),
+          std::move(_trigger_to_stm_name),
           _sg,
           std::move(_stm_shutdown_timeout),
         };
@@ -320,6 +351,8 @@ private:
       sstring_hash,
       sstring_eq>
       _stm_factories;
+    absl::flat_hash_map<model::record_batch_type, ss::sstring>
+      _trigger_to_stm_name;
     ss::scheduling_group _sg = ss::default_scheduling_group();
     config::binding<std::chrono::milliseconds> _stm_shutdown_timeout
       = config::shard_local_cfg()

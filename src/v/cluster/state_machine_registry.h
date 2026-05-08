@@ -9,6 +9,7 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "model/record_batch_types.h"
 #include "raft/consensus.h"
 #include "raft/fwd.h"
 #include "raft/state_machine_manager.h"
@@ -42,6 +43,14 @@ public:
     /// The canonical name of the STM this factory produces.  Must match the
     /// value stored in initial_recovery_snapshot and managed_snapshot.
     virtual std::string_view stm_name() const = 0;
+
+    /// Return the batch type whose first occurrence triggers dynamic
+    /// installation of this STM on a running partition.  Returns std::nullopt
+    /// if the factory does not support batch-triggered installation (the
+    /// default).
+    virtual std::optional<model::record_batch_type> trigger_batch_type() const {
+        return std::nullopt;
+    }
 
     /**
      * Must return true if STM should be created for a partition underlaid by
@@ -99,7 +108,8 @@ public:
               ss::sstring(factory->stm_name()),
               [f = factory.get()](raft::consensus* r) {
                   return f->make_stm(r);
-              });
+              },
+              factory->trigger_batch_type());
         }
         return builder;
     }

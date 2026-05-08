@@ -16,6 +16,7 @@
 #include "model/metadata.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
+#include "model/record_batch_types.h"
 #include "model/timeout_clock.h"
 #include "raft/consensus.h"
 #include "raft/group_configuration.h"
@@ -173,6 +174,20 @@ struct state_machine_fixture : raft_fixture {
             builder.add_raw_kv(serde::to_iobuf(k), serde::to_iobuf(v));
         }
 
+        co_return co_await retry_with_leader(
+          10s + model::timeout_clock::now(),
+          [b = std::move(builder).build()](
+            raft_node_instance& leader_node) mutable {
+              return leader_node.raft()->replicate(
+                b.share(),
+                raft::replicate_options(raft::consistency_level::quorum_ack));
+          });
+    }
+
+    ss::future<result<raft::replicate_result>>
+    replicate_trigger_batch(model::record_batch_type type) {
+        storage::record_batch_builder builder(type, model::offset(0));
+        builder.add_raw_kv(iobuf{}, iobuf{});
         co_return co_await retry_with_leader(
           10s + model::timeout_clock::now(),
           [b = std::move(builder).build()](
