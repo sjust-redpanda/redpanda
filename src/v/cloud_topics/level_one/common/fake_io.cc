@@ -11,6 +11,7 @@
 #include "cloud_topics/level_one/common/fake_io.h"
 
 #include "bytes/iostream.h"
+#include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_storage_clients/multipart_upload.h"
 #include "cloud_topics/level_one/common/object_id.h"
 
@@ -122,10 +123,16 @@ fake_io::read_object(object_extent extent, ss::abort_source*) {
       .value_or(std::unexpected(io::errc::cloud_missing_object));
 }
 
+ss::future<std::expected<std::unique_ptr<object_handle>, io::errc>>
+fake_io::open_object(object_extent, ss::abort_source*) {
+    co_return std::unexpected(io::errc::cloud_op_error);
+}
+
 ss::future<std::expected<void, io::errc>>
-fake_io::delete_objects(chunked_vector<object_id> oids, ss::abort_source*) {
-    for (const auto& oid : oids) {
-        remove_object(oid);
+fake_io::delete_objects(
+  chunked_vector<object_extent> extents, ss::abort_source*) {
+    for (const auto& extent : extents) {
+        remove_object(extent.id);
     }
     co_return std::expected<void, io::errc>{};
 }

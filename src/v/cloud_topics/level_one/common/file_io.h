@@ -31,7 +31,9 @@ public:
       std::filesystem::path staging_dir,
       cloud_io::remote* remote,
       cloud_storage_clients::bucket_name bucket,
-      cloud_io::cache* cache);
+      cloud_io::cache* cache,
+      std::optional<cloud_storage_clients::bucket_name> ts_bucket
+      = std::nullopt);
     ss::future<std::expected<std::unique_ptr<staging_file>, errc>>
     create_tmp_file() override;
 
@@ -41,8 +43,11 @@ public:
     ss::future<std::expected<ss::input_stream<char>, errc>>
     read_object(object_extent, ss::abort_source*) override;
 
+    ss::future<std::expected<std::unique_ptr<object_handle>, errc>>
+    open_object(object_extent, ss::abort_source*) override;
+
     ss::future<std::expected<void, errc>>
-    delete_objects(chunked_vector<object_id>, ss::abort_source*) override;
+    delete_objects(chunked_vector<object_extent>, ss::abort_source*) override;
 
     ss::future<std::expected<cloud_storage_clients::multipart_upload_ref, errc>>
     create_multipart_upload(
@@ -56,7 +61,8 @@ private:
       uint64_t content_length);
 
     cloud_io::remote* _remote;
-    cloud_storage_clients::bucket_name _bucket;
+    cloud_storage_clients::bucket_name _bucket;     // L1 objects
+    cloud_storage_clients::bucket_name _ts_bucket;  // imported TS segments (may equal _bucket)
     std::filesystem::path _staging_dir;
     cloud_io::cache* _cache;
 };

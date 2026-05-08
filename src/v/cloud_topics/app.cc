@@ -88,7 +88,15 @@ ss::future<> app::construct(
       config::node().l1_staging_path(),
       ss::sharded_parameter([&remote] { return &remote->local(); }),
       bucket,
-      ss::sharded_parameter([&cloud_cache] { return &cloud_cache->local(); }));
+      ss::sharded_parameter([&cloud_cache] { return &cloud_cache->local(); }),
+      ss::sharded_parameter(
+        []() -> std::optional<cloud_storage_clients::bucket_name> {
+            auto b = config::shard_local_cfg().cloud_storage_bucket();
+            if (!b) {
+                return std::nullopt;
+            }
+            return cloud_storage_clients::bucket_name{*b};
+        }));
 
     co_await construct_service(
       domain_supervisor,
