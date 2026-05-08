@@ -1470,6 +1470,7 @@ db_domain_manager::get_extent_metadata(rpc::get_extent_metadata_request req) {
               .oid = extent.val.oid,
               .footer_pos = object.footer_pos,
               .object_size = object.object_size,
+              .imported = object.imported,
             };
         }
         extents.push_back(std::move(em));
