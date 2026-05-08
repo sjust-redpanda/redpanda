@@ -109,6 +109,7 @@ redpanda_cc_library(
     ],
     deps = [
         ":abstract_io",
+        ":object",
         ":object_handle",
         ":object_id",
         ":object_utils",

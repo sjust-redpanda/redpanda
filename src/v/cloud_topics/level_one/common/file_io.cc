@@ -14,6 +14,7 @@
 #include "cloud_io/remote.h"
 #include "cloud_storage_clients/client.h"
 #include "cloud_topics/level_one/common/abstract_io.h"
+#include "cloud_topics/level_one/common/object.h"
 #include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
 #include "cloud_topics/level_one/common/object_utils.h"
@@ -86,6 +87,62 @@ struct one_time_stream_provider : public stream_provider {
         return ss::now();
     }
     std::optional<ss::input_stream<char>> _st;
+};
+
+class l1_footer_index final : public object_index {
+public:
+    explicit l1_footer_index(footer f)
+      : _footer(std::move(f)) {}
+
+    std::optional<seek_result> seek_to_offset(
+      model::topic_id_partition tidp, kafka::offset offset) const override {
+        auto r = _footer.file_position_before_kafka_offset(tidp, offset);
+        if (r == footer::npos) {
+            return std::nullopt;
+        }
+        return seek_result{.file_position = r.file_position, .length = r.length};
+    }
+
+    std::optional<seek_result> seek_to_timestamp(
+      model::topic_id_partition tidp, model::timestamp ts) const override {
+        auto r = _footer.file_position_before_max_timestamp(tidp, ts);
+        if (r == footer::npos) {
+            return std::nullopt;
+        }
+        return seek_result{.file_position = r.file_position, .length = r.length};
+    }
+
+private:
+    footer _footer;
+};
+
+class l1_native_object_handle final : public object_handle {
+public:
+    l1_native_object_handle(object_id oid, footer f, file_io* io)
+      : _oid(oid)
+      , _index(std::move(f))
+      , _io(io) {}
+
+    const object_index& index() const override { return _index; }
+
+    ss::future<std::expected<std::unique_ptr<object_reader>, io::errc>>
+    open_reader(const seek_result& seek, ss::abort_source* as) override {
+        object_extent extent{
+          .id = _oid,
+          .position = seek.file_position,
+          .size = seek.length,
+        };
+        auto stream_result = co_await _io->read_object(extent, as);
+        if (!stream_result.has_value()) {
+            co_return std::unexpected(stream_result.error());
+        }
+        co_return object_reader::create(std::move(stream_result).value());
+    }
+
+private:
+    object_id _oid;
+    l1_footer_index _index;
+    file_io* _io;
 };
 
 } // namespace
@@ -253,10 +310,25 @@ file_io::read_object(object_extent extent, ss::abort_source* as) {
 }
 
 ss::future<std::expected<std::unique_ptr<object_handle>, io::errc>>
-file_io::open_object(object_extent, ss::abort_source*) {
-    // Implemented in steps 5 (native) and 7 (routing).
-    vassert(false, "open_object not yet implemented");
-    std::unreachable();
+file_io::open_object(object_extent extent, ss::abort_source* as) {
+    if (extent.imported.has_value()) {
+        // Routing to imported path — implemented in steps 6 and 7.
+        vassert(false, "imported open_object not yet implemented");
+        std::unreachable();
+    }
+
+    auto read_result = co_await read_object_as_iobuf(extent, as);
+    if (!read_result.has_value()) {
+        co_return std::unexpected(read_result.error());
+    }
+    auto footer_result = co_await footer::read(std::move(read_result).value());
+    if (!std::holds_alternative<footer>(footer_result)) {
+        vlog(
+          cd_log.warn, "Failed to parse L1 footer for object {}", extent.id);
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    co_return std::make_unique<l1_native_object_handle>(
+      extent.id, std::get<footer>(std::move(footer_result)), this);
 }
 
 ss::future<std::expected<void, io::errc>>
