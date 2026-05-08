@@ -272,4 +272,14 @@ void stm_factory::create(
     raft->log()->stm_hookset()->add_stm(stm);
 }
 
+std::string_view stm_factory::stm_name() const { return simple_stm::name; }
+
+ss::shared_ptr<raft::state_machine_base>
+stm_factory::make_stm(raft::consensus* raft) {
+    auto stm = ss::make_shared<simple_stm>(
+      cd_log, raft, config::mock_binding(10s));
+    raft->log()->stm_hookset()->add_stm(stm);
+    return stm;
+}
+
 } // namespace cloud_topics::l1

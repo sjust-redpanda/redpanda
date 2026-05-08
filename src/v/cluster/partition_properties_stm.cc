@@ -362,6 +362,18 @@ void partition_properties_stm_factory::create(
     raft->log()->stm_hookset()->add_stm(stm);
 }
 
+std::string_view partition_properties_stm_factory::stm_name() const {
+    return partition_properties_stm::name;
+}
+
+ss::shared_ptr<raft::state_machine_base>
+partition_properties_stm_factory::make_stm(raft::consensus* raft) {
+    auto stm = ss::make_shared<partition_properties_stm>(
+      raft, clusterlog, _kvstore, _sync_timeout);
+    raft->log()->stm_hookset()->add_stm(stm);
+    return stm;
+}
+
 fmt::iterator
 partition_properties_stm::raft_snapshot::format_to(fmt::iterator it) const {
     return fmt::format_to(

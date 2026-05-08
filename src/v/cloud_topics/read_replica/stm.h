@@ -171,6 +171,8 @@ public:
       raft::state_machine_manager_builder&,
       raft::consensus*,
       const cluster::stm_instance_config&) final;
+    std::string_view stm_name() const final;
+    ss::shared_ptr<raft::state_machine_base> make_stm(raft::consensus*) final;
 };
 
 } // namespace cloud_topics::read_replica

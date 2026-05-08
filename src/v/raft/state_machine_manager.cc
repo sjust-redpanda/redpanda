@@ -27,6 +27,7 @@
 #include "ssx/watchdog.h"
 #include "storage/snapshot.h"
 #include "storage/types.h"
+#include "utils/absl_sstring_hash.h"
 
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
@@ -161,10 +162,13 @@ state_machine_manager::named_stm::named_stm(ss::sstring name, stm_ptr stm)
 state_machine_manager::state_machine_manager(
   consensus* raft,
   std::vector<named_stm> stms,
+  absl::flat_hash_map<ss::sstring, stm_make_fn, sstring_hash, sstring_eq>
+    stm_factories,
   ss::scheduling_group apply_sg,
   config::binding<std::chrono::milliseconds> stm_shutdown_timeout)
   : _raft(raft)
   , _log(ctx_log(_raft->group(), _raft->ntp()))
+  , _stm_factories(std::move(stm_factories))
   , _apply_sg(apply_sg)
   , _initial_recovery_snapshot_mgr(
       std::filesystem::path(_raft->log_config().work_directory()),
@@ -272,6 +276,39 @@ ss::future<> state_machine_manager::apply_initial_recovery_policy() {
         snapshot.emplace(initial_recovery_snapshot{});
     }
     vlog(_log.debug, "Starting with initial recovery snapshot: {}", *snapshot);
+
+    // Reconstruct STMs recorded in a prior snapshot that are absent from
+    // _machines.  This happens when is_applicable_for() returns false at
+    // startup for an STM that was running before the last restart — e.g.,
+    // archival_metadata_stm during the migration window after the topic
+    // config changed to tiered_cloud.
+    for (auto& [name, next_offset] : snapshot->initial_recovery_next_offsets) {
+        if (_machines.contains(name)) {
+            continue;
+        }
+        auto it = _stm_factories.find(name);
+        if (it == _stm_factories.end()) {
+            vlog(
+              _log.warn,
+              "no factory for STM '{}' in initial recovery snapshot; "
+              "it will not be reconstructed",
+              name);
+            continue;
+        }
+        vlog(
+          _log.info,
+          "reconstructing STM '{}' from initial recovery snapshot at "
+          "offset {}",
+          name,
+          next_offset);
+        auto stm = it->second(_raft);
+        co_await stm->start();
+        _supports_snapshot_at_offset = _supports_snapshot_at_offset
+                                       && stm->supports_snapshot_at_offset();
+        _machines.try_emplace(
+          name, ss::make_lw_shared<state_machine_entry>(name, std::move(stm)));
+    }
+
     for (auto& [name, entry] : _machines) {
         auto it = snapshot->initial_recovery_next_offsets.find(name);
         if (it != snapshot->initial_recovery_next_offsets.end()) {
@@ -388,7 +425,8 @@ ss::future<> state_machine_manager::apply_raft_snapshot() {
             all_state_machines(),
             std::move(snapshot->metadata),
             snapshot->reader,
-            std::move(units));
+            std::move(units),
+            true);
       }));
     // update the _next offset to the max of the state machines applied offset
     // as some of them might have thrown
@@ -408,7 +446,8 @@ ss::future<> state_machine_manager::do_apply_raft_snapshot(
   std::vector<entry_ptr> state_machines,
   snapshot_metadata metadata,
   storage::snapshot_reader& reader,
-  [[maybe_unused]] std::vector<ssx::semaphore_units> background_apply_units) {
+  [[maybe_unused]] std::vector<ssx::semaphore_units> background_apply_units,
+  bool do_prepass) {
     const auto snapshot_file_sz = co_await reader.get_snapshot_size();
     const auto last_offset = metadata.last_included_index;
 
@@ -447,6 +486,38 @@ ss::future<> state_machine_manager::do_apply_raft_snapshot(
     } else {
         iobuf_parser parser(std::move(snapshot_content));
         auto snap = co_await serde::read_async<managed_snapshot>(parser);
+
+        // Reconstruct STMs present in the snapshot but absent from _machines.
+        // Only run from the foreground (apply_raft_snapshot) path, which holds
+        // the apply mutex.  The background single-STM path skips this.
+        if (do_prepass) {
+            for (auto& [name, _] : snap.snapshot_map) {
+                if (_machines.contains(name)) {
+                    continue;
+                }
+                auto it = _stm_factories.find(name);
+                if (it == _stm_factories.end()) {
+                    vlog(
+                      _log.warn,
+                      "no factory for snapshot STM '{}'; skipping",
+                      name);
+                    continue;
+                }
+                vlog(
+                  _log.info,
+                  "reconstructing STM '{}' from raft snapshot",
+                  name);
+                auto stm = it->second(_raft);
+                co_await stm->start();
+                _supports_snapshot_at_offset
+                  = _supports_snapshot_at_offset
+                    && stm->supports_snapshot_at_offset();
+                auto entry = ss::make_lw_shared<state_machine_entry>(
+                  name, std::move(stm));
+                _machines.emplace(name, entry);
+                state_machines.push_back(entry);
+            }
+        }
 
         co_await ss::coroutine::parallel_for_each(
           state_machines,

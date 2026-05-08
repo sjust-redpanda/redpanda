@@ -265,4 +265,13 @@ void stm_factory::create(
     raft->log()->stm_hookset()->add_stm(stm);
 }
 
+std::string_view stm_factory::stm_name() const { return translation_stm::name; }
+
+ss::shared_ptr<raft::state_machine_base>
+stm_factory::make_stm(raft::consensus* raft) {
+    auto stm = ss::make_shared<translation_stm>(datalake_log, raft);
+    raft->log()->stm_hookset()->add_stm(stm);
+    return stm;
+}
+
 } // namespace datalake::translation

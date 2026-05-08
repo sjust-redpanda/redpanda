@@ -68,6 +68,12 @@ concept StateMachineIterateFunc = requires(
  */
 class state_machine_manager final {
 public:
+    /// Factory function type used for snapshot-driven STM reconstruction.
+    /// Called with the partition's raft::consensus* to create a new STM
+    /// instance; start() is called by the manager after construction.
+    using stm_make_fn
+      = std::function<ss::shared_ptr<state_machine_base>(consensus*)>;
+
     /**
      * A result returned after taking a snapshot it contains a serde serialized
      * snapshot data and last offset included into the snapshot.
@@ -176,6 +182,8 @@ private:
     state_machine_manager(
       consensus* raft,
       std::vector<named_stm> stms_to_manage,
+      absl::flat_hash_map<ss::sstring, stm_make_fn, sstring_hash, sstring_eq>
+        stm_factories,
       ss::scheduling_group apply_sg,
       config::binding<std::chrono::milliseconds> stm_shutdown_timeout);
 
@@ -213,7 +221,8 @@ private:
       std::vector<entry_ptr> state_machines,
       raft::snapshot_metadata metadata,
       storage::snapshot_reader& reader,
-      std::vector<ssx::semaphore_units> background_apply_units);
+      std::vector<ssx::semaphore_units> background_apply_units,
+      bool do_prepass = false);
     ss::future<> apply() noexcept;
     ss::future<> try_apply_in_foreground();
 
@@ -259,6 +268,8 @@ private:
     consensus* _raft;
     ctx_log _log;
     ssx::mutex _apply_mutex{"stm_manager::apply"};
+    absl::flat_hash_map<ss::sstring, stm_make_fn, sstring_hash, sstring_eq>
+      _stm_factories;
     state_machines_t _machines;
     model::offset _next{0};
     ss::gate _gate;
@@ -284,10 +295,18 @@ public:
 
     void with_scheduing_group(ss::scheduling_group sg) { _sg = sg; }
 
+    /// Register a factory closure used for snapshot-driven reconstruction.
+    /// Called by state_machine_registry::make_builder_for() for every
+    /// registered factory, regardless of whether is_applicable_for() is true.
+    void add_factory(ss::sstring name, state_machine_manager::stm_make_fn fn) {
+        _stm_factories.emplace(std::move(name), std::move(fn));
+    }
+
     state_machine_manager build(raft::consensus* raft) && {
         return {
           raft,
           std::move(_stms),
+          std::move(_stm_factories),
           _sg,
           std::move(_stm_shutdown_timeout),
         };
@@ -295,6 +314,12 @@ public:
 
 private:
     std::vector<state_machine_manager::named_stm> _stms;
+    absl::flat_hash_map<
+      ss::sstring,
+      state_machine_manager::stm_make_fn,
+      sstring_hash,
+      sstring_eq>
+      _stm_factories;
     ss::scheduling_group _sg = ss::default_scheduling_group();
     config::binding<std::chrono::milliseconds> _stm_shutdown_timeout
       = config::shard_local_cfg()

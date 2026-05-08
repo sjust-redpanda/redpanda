@@ -1752,4 +1752,21 @@ void archival_metadata_stm_factory::create(
     raft->log()->stm_hookset()->add_stm(stm);
 }
 
+std::string_view archival_metadata_stm_factory::stm_name() const {
+    return cluster::archival_metadata_stm::name;
+}
+
+ss::shared_ptr<raft::state_machine_base>
+archival_metadata_stm_factory::make_stm(raft::consensus* raft) {
+    auto stm = ss::make_shared<cluster::archival_metadata_stm>(
+      raft,
+      _cloud_storage_api.local(),
+      _feature_table.local(),
+      clusterlog,
+      std::nullopt,
+      std::nullopt);
+    raft->log()->stm_hookset()->add_stm(stm);
+    return stm;
+}
+
 } // namespace cluster

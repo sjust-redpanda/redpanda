@@ -478,6 +478,18 @@ void write_at_offset_stm_factory::create(
     raft->log()->stm_hookset()->add_stm(stm);
 }
 
+std::string_view write_at_offset_stm_factory::stm_name() const {
+    return write_at_offset_stm::name;
+}
+
+ss::shared_ptr<raft::state_machine_base>
+write_at_offset_stm_factory::make_stm(raft::consensus* raft) {
+    auto stm = ss::make_shared<write_at_offset_stm>(
+      raft, klog, _kvstore, _offset_translated_batches);
+    raft->log()->stm_hookset()->add_stm(stm);
+    return stm;
+}
+
 } // namespace kafka
 
 auto fmt::formatter<kafka::write_at_offset_stm::errc>::format(

@@ -256,4 +256,13 @@ void id_allocator_stm_factory::create(
     builder.create_stm<id_allocator_stm>(clusterlog, raft);
 }
 
+std::string_view id_allocator_stm_factory::stm_name() const {
+    return id_allocator_stm::name;
+}
+
+ss::shared_ptr<raft::state_machine_base>
+id_allocator_stm_factory::make_stm(raft::consensus* raft) {
+    return ss::make_shared<id_allocator_stm>(clusterlog, raft);
+}
+
 } // namespace cluster

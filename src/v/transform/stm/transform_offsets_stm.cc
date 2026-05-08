@@ -40,4 +40,13 @@ void transform_offsets_stm_factory::create(
       tcfg->partition_count, log, raft);
 }
 
+std::string_view transform_offsets_stm_factory::stm_name() const {
+    return transform_offsets_stm_t::name;
+}
+
+ss::shared_ptr<raft::state_machine_base>
+transform_offsets_stm_factory::make_stm(raft::consensus* raft) {
+    return ss::make_shared<transform_offsets_stm_t>(0, log, raft);
+}
+
 } // namespace transform

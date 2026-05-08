@@ -39,6 +39,10 @@ struct stm_instance_config {
  */
 class state_machine_factory {
 public:
+    /// The canonical name of the STM this factory produces.  Must match the
+    /// value stored in initial_recovery_snapshot and managed_snapshot.
+    virtual std::string_view stm_name() const = 0;
+
     /**
      * Must return true if STM should be created for a partition underlaid by
      * passed raft group
@@ -52,6 +56,14 @@ public:
       raft::state_machine_manager_builder&,
       raft::consensus*,
       const stm_instance_config& cfg) = 0;
+
+    /// Create an STM instance without going through a builder.
+    /// Called during snapshot-driven recovery when the STM was present in a
+    /// prior snapshot but is not in _machines (e.g., is_applicable_for()
+    /// returned false because topic config changed since the last restart).
+    /// The returned STM has NOT been started; the caller calls start()/stop().
+    virtual ss::shared_ptr<raft::state_machine_base>
+    make_stm(raft::consensus*) = 0;
 
     virtual ~state_machine_factory() = default;
 };
@@ -83,6 +95,11 @@ public:
             if (factory->is_applicable_for(raft->log_config())) {
                 factory->create(builder, raft, cfg);
             }
+            builder.add_factory(
+              ss::sstring(factory->stm_name()),
+              [f = factory.get()](raft::consensus* r) {
+                  return f->make_stm(r);
+              });
         }
         return builder;
     }

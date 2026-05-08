@@ -880,4 +880,15 @@ void tm_stm_factory::create(
     raft->log()->stm_hookset()->add_stm(tm_stm);
 }
 
+std::string_view tm_stm_factory::stm_name() const {
+    return cluster::tm_stm::name;
+}
+
+ss::shared_ptr<raft::state_machine_base>
+tm_stm_factory::make_stm(raft::consensus* raft) {
+    auto stm = ss::make_shared<cluster::tm_stm>(txlog, raft);
+    raft->log()->stm_hookset()->add_stm(stm);
+    return stm;
+}
+
 } // namespace cluster

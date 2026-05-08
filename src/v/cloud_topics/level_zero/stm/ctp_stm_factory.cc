@@ -30,4 +30,16 @@ void ctp_stm_factory::create(
     raft->log()->stm_hookset()->add_stm(stm);
 }
 
+std::string_view ctp_stm_factory::stm_name() const {
+    return cloud_topics::ctp_stm::name;
+}
+
+ss::shared_ptr<raft::state_machine_base>
+ctp_stm_factory::make_stm(raft::consensus* raft) {
+    auto stm = ss::make_shared<cloud_topics::ctp_stm>(
+      cloud_topics::cd_log, raft);
+    raft->log()->stm_hookset()->add_stm(stm);
+    return stm;
+}
+
 } // namespace cloud_topics::l0

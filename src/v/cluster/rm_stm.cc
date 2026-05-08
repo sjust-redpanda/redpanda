@@ -2508,4 +2508,21 @@ void rm_stm_factory::create(
     raft->log()->stm_hookset()->add_stm(stm);
 }
 
+std::string_view rm_stm_factory::stm_name() const {
+    return cluster::rm_stm::name;
+}
+
+ss::shared_ptr<raft::state_machine_base>
+rm_stm_factory::make_stm(raft::consensus* raft) {
+    auto stm = ss::make_shared<cluster::rm_stm>(
+      clusterlog,
+      raft,
+      _tx_gateway_frontend,
+      _feature_table,
+      _producer_state_manager,
+      std::nullopt);
+    raft->log()->stm_hookset()->add_stm(stm);
+    return stm;
+}
+
 } // namespace cluster

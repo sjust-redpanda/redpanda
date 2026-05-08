@@ -627,3 +627,289 @@ TEST_F_CORO(state_machine_fixture, test_opt_out_from_snapshot_at_offset) {
           n->raft()->start_offset(), model::next_offset(offsets[id]));
     }
 }
+
+// ── Step 1a: snapshot-driven STM reconstruction ──────────────────────────
+
+// Represents an STM that was running before a restart but is absent from
+// the builder on the next startup (simulating is_applicable_for() returning
+// false during a migration window).
+struct snapshot_kv : simple_kv {
+    using simple_kv::simple_kv;
+    static constexpr std::string_view name = "snapshot_kv";
+};
+
+// Register snapshot_kv as a factory-only STM (no trigger batch type).
+// Used to test snapshot-driven reconstruction without batch-triggering.
+static void register_snapshot_factory(
+  raft::state_machine_manager_builder& builder, raft_node_instance& node) {
+    builder.add_factory(
+      ss::sstring(snapshot_kv::name),
+      [&node](raft::consensus*) { return ss::make_shared<snapshot_kv>(node); });
+}
+
+TEST_F_CORO(state_machine_fixture, test_snapshot_restart_reconstructs_stm) {
+    // Verify the apply_initial_recovery_policy pre-pass: an STM absent from
+    // the builder at restart is reconstructed from initial_recovery_snapshot
+    // as long as a factory closure is registered.
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<simple_kv>(*node);
+        builder.create_stm<snapshot_kv>(*node);
+        register_snapshot_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    auto expected = co_await build_random_state(100);
+    co_await wait_for_apply();
+
+    // Restart node 0 without snapshot_kv in create_stm — simulates
+    // is_applicable_for() returning false — but with factory closure so the
+    // pre-pass can reconstruct it from the on-disk initial_recovery_snapshot.
+    model::node_id restart_id(0);
+    auto data_dir
+      = nodes().at(restart_id)->raft()->log()->config().base_directory();
+    co_await stop_node(restart_id);
+    add_node(restart_id, model::revision_id{0}, data_dir);
+
+    raft::state_machine_manager_builder builder;
+    builder.create_stm<simple_kv>(*nodes().at(restart_id));
+    register_snapshot_factory(builder, *nodes().at(restart_id));
+    co_await nodes()
+      .at(restart_id)
+      ->init_and_start(all_vnodes(), std::move(builder));
+
+    ASSERT_TRUE_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<snapshot_kv>()
+      != nullptr);
+
+    auto committed_offset = co_await with_leader(
+      10s, [](raft_node_instance& n) { return n.raft()->committed_offset(); });
+    co_await nodes()
+      .at(restart_id)
+      ->raft()
+      ->stm_manager()
+      ->get<snapshot_kv>()
+      ->wait(committed_offset, model::timeout_clock::now() + 15s);
+
+    ASSERT_EQ_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<snapshot_kv>()->state,
+      expected);
+}
+
+TEST_F_CORO(
+  state_machine_fixture, test_cross_node_recovery_restores_missing_stm) {
+    // Verify the do_apply_raft_snapshot pre-pass: a fresh replica that
+    // receives a managed_snapshot containing snapshot_kv reconstructs it
+    // even though snapshot_kv is absent from the builder.
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<simple_kv>(*node);
+        builder.create_stm<snapshot_kv>(*node);
+        register_snapshot_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    auto expected = co_await build_random_state(100);
+    co_await wait_for_apply();
+
+    // Take and write Raft snapshots so the log is truncated; the managed
+    // snapshot includes snapshot_kv's blob.
+    for (auto& [id, node] : nodes()) {
+        auto snap = co_await node->raft()->stm_manager()->take_snapshot();
+        co_await node->raft()->write_snapshot(
+          raft::write_snapshot_cfg(
+            snap.last_included_offset, std::move(snap.data)));
+    }
+
+    // Wipe node 0 and restart without snapshot_kv in create_stm.  The Raft
+    // layer will send the snapshot; the prepass must reconstruct snapshot_kv
+    // before applying the blob.
+    model::node_id fresh_id(0);
+    auto data_dir
+      = nodes().at(fresh_id)->raft()->log()->config().base_directory();
+    co_await stop_node(fresh_id, remove_data_dir::yes);
+    add_node(fresh_id, model::revision_id{0}, data_dir);
+
+    raft::state_machine_manager_builder builder;
+    builder.create_stm<simple_kv>(*nodes().at(fresh_id));
+    register_snapshot_factory(builder, *nodes().at(fresh_id));
+    co_await nodes().at(fresh_id)->init_and_start(
+      all_vnodes(), std::move(builder));
+
+    RPTEST_REQUIRE_EVENTUALLY_CORO(15s, [&] {
+        return nodes().at(fresh_id)->raft()->stm_manager()->get<snapshot_kv>()
+               != nullptr;
+    });
+
+    auto committed_offset = co_await with_leader(
+      10s, [](raft_node_instance& n) { return n.raft()->committed_offset(); });
+    co_await nodes()
+      .at(fresh_id)
+      ->raft()
+      ->stm_manager()
+      ->get<snapshot_kv>()
+      ->wait(committed_offset, model::timeout_clock::now() + 15s);
+
+    ASSERT_EQ_CORO(
+      nodes().at(fresh_id)->raft()->stm_manager()->get<snapshot_kv>()->state,
+      expected);
+}
+
+TEST_F_CORO(state_machine_fixture, test_restart_no_factory_skips_gracefully) {
+    // If the factory closure is not registered, the pre-pass must log a
+    // warning and skip — no crash, the STM stays absent, other STMs work.
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<simple_kv>(*node);
+        builder.create_stm<snapshot_kv>(*node);
+        register_snapshot_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    co_await build_random_state(50);
+    co_await wait_for_apply();
+
+    model::node_id restart_id(0);
+    auto data_dir
+      = nodes().at(restart_id)->raft()->log()->config().base_directory();
+    co_await stop_node(restart_id);
+    add_node(restart_id, model::revision_id{0}, data_dir);
+
+    // No factory closure for snapshot_kv — name is in initial_recovery_snapshot
+    // but _stm_factories.find() will return end().
+    raft::state_machine_manager_builder builder;
+    builder.create_stm<simple_kv>(*nodes().at(restart_id));
+    co_await nodes()
+      .at(restart_id)
+      ->init_and_start(all_vnodes(), std::move(builder));
+
+    ASSERT_TRUE_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<snapshot_kv>()
+      == nullptr);
+    ASSERT_TRUE_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<simple_kv>()
+      != nullptr);
+}
+
+TEST_F_CORO(
+  state_machine_fixture, test_cross_node_no_factory_skips_gracefully) {
+    // Same as test_restart_no_factory_skips_gracefully but for the
+    // do_apply_raft_snapshot prepass: snapshot has snapshot_kv blob but no
+    // factory closure exists — prepass must warn and skip.
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<simple_kv>(*node);
+        builder.create_stm<snapshot_kv>(*node);
+        register_snapshot_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    auto expected = co_await build_random_state(50);
+    co_await wait_for_apply();
+
+    for (auto& [id, node] : nodes()) {
+        auto snap = co_await node->raft()->stm_manager()->take_snapshot();
+        co_await node->raft()->write_snapshot(
+          raft::write_snapshot_cfg(
+            snap.last_included_offset, std::move(snap.data)));
+    }
+
+    model::node_id fresh_id(0);
+    auto data_dir
+      = nodes().at(fresh_id)->raft()->log()->config().base_directory();
+    co_await stop_node(fresh_id, remove_data_dir::yes);
+    add_node(fresh_id, model::revision_id{0}, data_dir);
+
+    // No factory closure — snapshot blob for snapshot_kv must be skipped.
+    raft::state_machine_manager_builder builder;
+    builder.create_stm<simple_kv>(*nodes().at(fresh_id));
+    co_await nodes().at(fresh_id)->init_and_start(
+      all_vnodes(), std::move(builder));
+
+    auto committed_offset = co_await with_leader(
+      10s, [](raft_node_instance& n) { return n.raft()->committed_offset(); });
+    co_await nodes()
+      .at(fresh_id)
+      ->raft()
+      ->stm_manager()
+      ->get<simple_kv>()
+      ->wait(committed_offset, model::timeout_clock::now() + 15s);
+
+    ASSERT_TRUE_CORO(
+      nodes().at(fresh_id)->raft()->stm_manager()->get<snapshot_kv>()
+      == nullptr);
+    ASSERT_EQ_CORO(
+      nodes().at(fresh_id)->raft()->stm_manager()->get<simple_kv>()->state,
+      expected);
+}
+
+TEST_F_CORO(
+  state_machine_fixture, test_reconstruction_survives_second_restart) {
+    // Verifies that apply_initial_recovery_policy preserves the snapshot_kv
+    // entry in initial_recovery_snapshot across runs so reconstruction works
+    // on every subsequent restart, not just the first.
+    create_nodes();
+    for (auto& [id, node] : nodes()) {
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<simple_kv>(*node);
+        builder.create_stm<snapshot_kv>(*node);
+        register_snapshot_factory(builder, *node);
+        co_await node->init_and_start(all_vnodes(), std::move(builder));
+    }
+
+    auto expected = co_await build_random_state(100);
+    co_await wait_for_apply();
+
+    model::node_id restart_id(0);
+
+    // First restart — reconstruct from initial_recovery_snapshot.
+    {
+        auto data_dir
+          = nodes().at(restart_id)->raft()->log()->config().base_directory();
+        co_await stop_node(restart_id);
+        add_node(restart_id, model::revision_id{0}, data_dir);
+        raft::state_machine_manager_builder b;
+        b.create_stm<simple_kv>(*nodes().at(restart_id));
+        register_snapshot_factory(b, *nodes().at(restart_id));
+        co_await nodes()
+          .at(restart_id)
+          ->init_and_start(all_vnodes(), std::move(b));
+    }
+    ASSERT_TRUE_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<snapshot_kv>()
+      != nullptr);
+
+    // Second restart — initial_recovery_snapshot must still carry the entry.
+    {
+        auto data_dir
+          = nodes().at(restart_id)->raft()->log()->config().base_directory();
+        co_await stop_node(restart_id);
+        add_node(restart_id, model::revision_id{0}, data_dir);
+        raft::state_machine_manager_builder b;
+        b.create_stm<simple_kv>(*nodes().at(restart_id));
+        register_snapshot_factory(b, *nodes().at(restart_id));
+        co_await nodes()
+          .at(restart_id)
+          ->init_and_start(all_vnodes(), std::move(b));
+    }
+    ASSERT_TRUE_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<snapshot_kv>()
+      != nullptr);
+
+    auto committed_offset = co_await with_leader(
+      10s, [](raft_node_instance& n) { return n.raft()->committed_offset(); });
+    co_await nodes()
+      .at(restart_id)
+      ->raft()
+      ->stm_manager()
+      ->get<snapshot_kv>()
+      ->wait(committed_offset, model::timeout_clock::now() + 15s);
+
+    ASSERT_EQ_CORO(
+      nodes().at(restart_id)->raft()->stm_manager()->get<snapshot_kv>()->state,
+      expected);
+}

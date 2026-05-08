@@ -354,6 +354,18 @@ void group_tx_tracker_stm_factory::create(
     raft->log()->stm_hookset()->add_stm(stm);
 }
 
+std::string_view group_tx_tracker_stm_factory::stm_name() const {
+    return kafka::group_tx_tracker_stm::name;
+}
+
+ss::shared_ptr<raft::state_machine_base>
+group_tx_tracker_stm_factory::make_stm(raft::consensus* raft) {
+    auto stm = ss::make_shared<kafka::group_tx_tracker_stm>(
+      cg_klog, raft, _feature_table);
+    raft->log()->stm_hookset()->add_stm(stm);
+    return stm;
+}
+
 void group_tx_tracker_stm::per_group_state::maybe_add_tx_begin(
   const kafka::group_id& group,
   model::record_batch_type fence_type,

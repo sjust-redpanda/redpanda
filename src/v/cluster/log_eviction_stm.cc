@@ -398,4 +398,15 @@ void log_eviction_stm_factory::create(
     raft->log()->stm_hookset()->add_stm(stm);
 }
 
+std::string_view log_eviction_stm_factory::stm_name() const {
+    return log_eviction_stm::name;
+}
+
+ss::shared_ptr<raft::state_machine_base>
+log_eviction_stm_factory::make_stm(raft::consensus* raft) {
+    auto stm = ss::make_shared<log_eviction_stm>(raft, clusterlog, _kvstore);
+    raft->log()->stm_hookset()->add_stm(stm);
+    return stm;
+}
+
 } // namespace cluster

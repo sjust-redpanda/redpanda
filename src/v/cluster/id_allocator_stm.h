@@ -155,6 +155,8 @@ public:
       raft::state_machine_manager_builder& builder,
       raft::consensus* raft,
       const cluster::stm_instance_config& cfg) final;
+    std::string_view stm_name() const final;
+    ss::shared_ptr<raft::state_machine_base> make_stm(raft::consensus*) final;
 };
 
 } // namespace cluster
