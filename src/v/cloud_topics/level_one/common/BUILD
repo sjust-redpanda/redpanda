@@ -109,6 +109,7 @@ redpanda_cc_library(
     ],
     deps = [
         ":abstract_io",
+        ":object_handle",
         ":object_id",
         ":object_utils",
         "//src/v/cloud_io:cache",
@@ -128,6 +129,7 @@ redpanda_cc_library(
     hdrs = ["fake_io.h"],
     deps = [
         ":abstract_io",
+        ":object_handle",
         ":object_id",
         ":object_utils",
         "//src/v/bytes:iobuf",

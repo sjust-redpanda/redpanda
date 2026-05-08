@@ -9,6 +9,7 @@
  */
 
 #include "cloud_topics/level_one/common/fake_io.h"
+#include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/metastore/garbage_collector.h"
 #include "cloud_topics/level_one/metastore/simple_stm.h"
 #include "cloud_topics/level_one/metastore/state_update.h"
@@ -209,8 +210,15 @@ public:
         return underlying_->read_object(ext, as);
     }
 
+    ss::future<std::expected<std::unique_ptr<object_handle>, errc>>
+    open_object(object_extent, ss::abort_source*) override {
+        return ss::make_ready_future<
+          std::expected<std::unique_ptr<object_handle>, errc>>(
+          std::unexpected(errc::cloud_op_error));
+    }
+
     ss::future<std::expected<void, errc>>
-    delete_objects(chunked_vector<object_id>, ss::abort_source*) override {
+    delete_objects(chunked_vector<object_extent>, ss::abort_source*) override {
         return ss::make_ready_future<std::expected<void, errc>>(
           std::unexpected(errc::cloud_op_error));
     }

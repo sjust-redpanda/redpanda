@@ -14,6 +14,7 @@
 #include "cloud_io/remote.h"
 #include "cloud_storage_clients/client.h"
 #include "cloud_topics/level_one/common/abstract_io.h"
+#include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
 #include "cloud_topics/level_one/common/object_utils.h"
 #include "cloud_topics/logger.h"
@@ -93,9 +94,11 @@ file_io::file_io(
   std::filesystem::path staging_dir,
   cloud_io::remote* remote,
   cloud_storage_clients::bucket_name bucket,
-  cloud_io::cache* cache)
+  cloud_io::cache* cache,
+  std::optional<cloud_storage_clients::bucket_name> ts_bucket)
   : _remote(remote)
   , _bucket(std::move(bucket))
+  , _ts_bucket(ts_bucket.value_or(_bucket))
   , _staging_dir(std::move(staging_dir))
   , _cache(cache) {}
 
@@ -249,14 +252,22 @@ file_io::read_object(object_extent extent, ss::abort_source* as) {
     }
 }
 
+ss::future<std::expected<std::unique_ptr<object_handle>, io::errc>>
+file_io::open_object(object_extent, ss::abort_source*) {
+    // Implemented in steps 5 (native) and 7 (routing).
+    vassert(false, "open_object not yet implemented");
+    std::unreachable();
+}
+
 ss::future<std::expected<void, io::errc>>
-file_io::delete_objects(chunked_vector<object_id> ids, ss::abort_source* as) {
+file_io::delete_objects(
+  chunked_vector<object_extent> extents, ss::abort_source* as) {
     static constexpr auto timeout = 10s;
     static constexpr auto backoff = 100ms;
     retry_chain_node root(*as, ss::lowres_clock::now() + timeout, backoff);
     chunked_vector<cloud_storage_clients::object_key> keys;
-    for (const auto& id : ids) {
-        keys.push_back(object_path_factory::level_one_path(id));
+    for (const auto& extent : extents) {
+        keys.push_back(object_path_factory::level_one_path(extent.id));
     }
     auto result_fut
       = co_await ss::coroutine::as_future<cloud_io::upload_result>(
