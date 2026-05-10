@@ -107,6 +107,11 @@ redpanda_cc_library(
         "//src/v/cloud_topics/level_one:__subpackages__",
         "//src/v/cloud_topics/read_replica:__pkg__",
     ],
+    implementation_deps = [
+        "//src/v/bytes:iostream",
+        "//src/v/cloud_storage",
+        "//src/v/storage:record_batch_utils",
+    ],
     deps = [
         ":abstract_io",
         ":object",

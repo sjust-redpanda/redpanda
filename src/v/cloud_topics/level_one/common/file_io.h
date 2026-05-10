@@ -60,6 +60,10 @@ private:
       std::filesystem::path,
       uint64_t content_length);
 
+    // Download a raw object by key into an iobuf, using _ts_bucket.
+    ss::future<std::expected<iobuf, errc>>
+    download_raw_iobuf(const ss::sstring& key, ss::abort_source* as);
+
     cloud_io::remote* _remote;
     cloud_storage_clients::bucket_name _bucket;     // L1 objects
     cloud_storage_clients::bucket_name _ts_bucket;  // imported TS segments (may equal _bucket)
