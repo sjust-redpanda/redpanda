@@ -64,6 +64,12 @@ private:
     ss::future<std::expected<iobuf, errc>>
     download_raw_iobuf(const ss::sstring& key, ss::abort_source* as);
 
+    // Delete a batch of keys from the given bucket.
+    ss::future<std::expected<void, errc>> delete_keys(
+      const cloud_storage_clients::bucket_name& bucket,
+      chunked_vector<cloud_storage_clients::object_key> keys,
+      retry_chain_node& parent);
+
     cloud_io::remote* _remote;
     cloud_storage_clients::bucket_name _bucket;     // L1 objects
     cloud_storage_clients::bucket_name _ts_bucket;  // imported TS segments (may equal _bucket)
