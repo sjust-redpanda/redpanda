@@ -133,6 +133,9 @@ redpanda_cc_library(
     name = "fake_io",
     srcs = ["fake_io.cc"],
     hdrs = ["fake_io.h"],
+    implementation_deps = [
+        ":object",
+    ],
     deps = [
         ":abstract_io",
         ":object_handle",
