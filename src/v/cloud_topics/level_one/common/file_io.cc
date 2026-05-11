@@ -21,11 +21,9 @@
 #include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
 #include "cloud_topics/level_one/common/object_utils.h"
+#include "cloud_topics/level_one/common/ts_reader.h"
 #include "cloud_topics/logger.h"
 #include "config/configuration.h"
-#include "model/record.h"
-#include "model/record_batch_types.h"
-#include "storage/record_batch_utils.h"
 
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
@@ -210,95 +208,6 @@ private:
     kafka::offset _max_kafka_offset;
     model::offset_delta _base_delta;
     size_t _segment_size;
-};
-
-// Implements object_reader over a raw Kafka-format byte stream (a TS segment).
-//
-// Translates log offsets to Kafka offsets by maintaining a running delta.
-// Non-data batches are skipped while incrementing the delta.
-class tiered_storage_object_reader final : public object_reader {
-public:
-    tiered_storage_object_reader(
-      ss::input_stream<char> stream, model::offset_delta delta)
-      : _stream(std::move(stream))
-      , _running_delta(delta) {}
-
-    ss::future<> close() override { return _stream.close(); }
-
-    ss::future<peek_result> peek() override {
-        if (!_peeked.has_value() && !_eof) {
-            auto next = co_await fetch_next_translated();
-            if (next.has_value()) {
-                _peeked = std::move(*next);
-            } else {
-                _eof = true;
-            }
-        }
-        if (_eof) {
-            co_return eof{};
-        }
-        co_return _peeked->header();
-    }
-
-    ss::future<result> read_next() override {
-        if (_peeked.has_value()) {
-            auto batch = std::move(*_peeked);
-            _peeked.reset();
-            co_return std::move(batch);
-        }
-        if (_eof) {
-            co_return eof{};
-        }
-        auto next = co_await fetch_next_translated();
-        if (!next.has_value()) {
-            co_return eof{};
-        }
-        co_return std::move(*next);
-    }
-
-private:
-    // Reads the next data batch from the raw TS stream. Skips non-data batches,
-    // incrementing _running_delta for each. Returns nullopt at EOF.
-    ss::future<std::optional<model::record_batch>> fetch_next_translated() {
-        static const auto translator_types
-          = model::offset_translator_batch_types();
-        for (;;) {
-            auto header_buf = co_await read_iobuf_exactly(
-              _stream, model::packed_record_batch_header_size);
-            if (
-              header_buf.size_bytes()
-              < model::packed_record_batch_header_size) {
-                co_return std::nullopt;
-            }
-            auto header = storage::batch_header_from_disk_iobuf(
-              std::move(header_buf));
-            auto records_size = static_cast<size_t>(header.size_bytes)
-                                - model::packed_record_batch_header_size;
-            auto records_buf = co_await read_iobuf_exactly(
-              _stream, records_size);
-            if (records_buf.size_bytes() != records_size) {
-                throw std::runtime_error(fmt::format(
-                  "truncated TS segment: expected {} record bytes, got {}",
-                  records_size,
-                  records_buf.size_bytes()));
-            }
-            if (std::ranges::contains(translator_types, header.type)) {
-                _running_delta += static_cast<int64_t>(header.record_count);
-                continue;
-            }
-            header.base_offset = model::offset{
-              header.base_offset() - _running_delta()};
-            co_return model::record_batch(
-              header,
-              std::move(records_buf),
-              model::record_batch::tag_ctor_ng{});
-        }
-    }
-
-    ss::input_stream<char> _stream;
-    model::offset_delta _running_delta;
-    std::optional<model::record_batch> _peeked;
-    bool _eof{false};
 };
 
 // Implements object_handle for an imported tiered-storage segment.

@@ -13,6 +13,7 @@
 #include "bytes/iostream.h"
 #include "cloud_topics/level_one/common/object.h"
 #include "cloud_topics/level_one/common/object_handle.h"
+#include "cloud_topics/level_one/common/ts_reader.h"
 #include "cloud_storage_clients/multipart_upload.h"
 #include "cloud_topics/level_one/common/object_id.h"
 
@@ -76,6 +77,65 @@ private:
     object_extent _extent;
     fake_io* _io;
     fake_footer_index _index;
+};
+
+// Trivial index for an imported TS segment stored in fake_io. Always seeks to
+// file_position=0 (conservative full-segment scan), which is correct since the
+// caller is responsible for dispatching only to a segment whose range includes
+// the target offset.
+class fake_ts_index final : public object_index {
+public:
+    fake_ts_index(
+      size_t segment_size,
+      model::offset_delta delta,
+      kafka::offset last_kafka_offset)
+      : _segment_size(segment_size)
+      , _delta(delta)
+      , _last(last_kafka_offset) {}
+
+    std::optional<seek_result>
+    seek_to_offset(model::topic_id_partition, kafka::offset target)
+      const override {
+        if (target > _last) {
+            return std::nullopt;
+        }
+        return seek_result{
+          .file_position = 0, .length = _segment_size, .delta = _delta};
+    }
+
+    std::optional<seek_result>
+    seek_to_timestamp(model::topic_id_partition, model::timestamp)
+      const override {
+        return seek_result{
+          .file_position = 0, .length = _segment_size, .delta = _delta};
+    }
+
+private:
+    size_t _segment_size;
+    model::offset_delta _delta;
+    kafka::offset _last;
+};
+
+class fake_ts_object_handle final : public object_handle {
+public:
+    fake_ts_object_handle(iobuf bytes, fake_ts_index index)
+      : _bytes(std::move(bytes))
+      , _index(std::move(index)) {}
+
+    const object_index& index() const override { return _index; }
+
+    ss::future<std::expected<std::unique_ptr<object_reader>, io::errc>>
+    open_reader(const seek_result& seek, ss::abort_source*) override {
+        auto stream = make_iobuf_input_stream(
+          _bytes.share(seek.file_position, seek.length));
+        auto delta = seek.delta.value_or(model::offset_delta{0});
+        co_return std::make_unique<tiered_storage_object_reader>(
+          std::move(stream), delta);
+    }
+
+private:
+    iobuf _bytes;
+    fake_ts_index _index;
 };
 
 } // anonymous namespace
@@ -184,10 +244,35 @@ fake_io::read_object(object_extent extent, ss::abort_source*) {
       .value_or(std::unexpected(io::errc::cloud_missing_object));
 }
 
+void fake_io::put_ts_segment(
+  ss::sstring ts_path,
+  iobuf segment_bytes,
+  kafka::offset base_kafka_offset,
+  kafka::offset last_kafka_offset,
+  model::offset_delta delta_offset) {
+    _ts_storage.insert_or_assign(
+      std::move(ts_path),
+      ts_segment_fixture{
+        .bytes = std::move(segment_bytes),
+        .base_kafka_offset = base_kafka_offset,
+        .last_kafka_offset = last_kafka_offset,
+        .delta_offset = delta_offset,
+      });
+}
+
 ss::future<std::expected<std::unique_ptr<object_handle>, io::errc>>
 fake_io::open_object(object_extent extent, ss::abort_source* as) {
     if (extent.imported.has_value()) {
-        co_return std::unexpected(io::errc::cloud_op_error);
+        auto it = _ts_storage.find(extent.imported->ts_path);
+        if (it == _ts_storage.end()) {
+            co_return std::unexpected(io::errc::cloud_missing_object);
+        }
+        auto& fixture = it->second;
+        size_t segment_size = fixture.bytes.size_bytes();
+        fake_ts_index idx{
+          segment_size, fixture.delta_offset, fixture.last_kafka_offset};
+        co_return std::make_unique<fake_ts_object_handle>(
+          fixture.bytes.share(0, segment_size), std::move(idx));
     }
     auto stream_result = co_await read_object(extent, as);
     if (!stream_result.has_value()) {
