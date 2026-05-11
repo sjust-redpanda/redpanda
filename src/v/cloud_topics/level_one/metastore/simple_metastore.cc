@@ -95,6 +95,15 @@ simple_object_builder::add(
 std::expected<void, metastore::object_metadata_builder::error>
 simple_object_builder::finish(
   object_id oid, size_t footer_pos, size_t object_size) {
+    return finish(oid, footer_pos, object_size, std::nullopt);
+}
+
+std::expected<void, metastore::object_metadata_builder::error>
+simple_object_builder::finish(
+  object_id oid,
+  size_t footer_pos,
+  size_t object_size,
+  std::optional<imported_segment_info> imported) {
     auto it = pending_objects_.find(oid);
     if (it == pending_objects_.end()) {
         return std::unexpected(
@@ -106,6 +115,7 @@ simple_object_builder::finish(
         .footer_pos = footer_pos,
         .object_size = object_size,
         .ntp_metas = std::move(it->second),
+        .imported = std::move(imported),
       });
     pending_objects_.erase(it);
     return {};
@@ -250,6 +260,11 @@ simple_metastore::add_objects(
       apply_res.has_value(),
       "Apply must succeed if can_apply() is true: {}",
       apply_res.error());
+    for (const auto& o : objects) {
+        if (o.imported.has_value()) {
+            state_.objects[o.oid].imported = o.imported;
+        }
+    }
     co_return resp;
 }
 

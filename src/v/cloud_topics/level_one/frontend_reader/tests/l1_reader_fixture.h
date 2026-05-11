@@ -56,6 +56,66 @@ protected:
         return std::make_pair(ntp, tidp);
     }
 
+    /// Register a raw TS-format segment as an imported extent in the metastore
+    /// and inject it into fake_io. `segment_bytes` must already be in the
+    /// on-disk format (packed header + raw records, no L1 framing).
+    ss::future<> register_imported_extent(
+      const model::topic_id_partition& tidp,
+      iobuf segment_bytes,
+      kafka::offset base_kafka_offset,
+      kafka::offset last_kafka_offset,
+      model::offset_delta delta,
+      ss::sstring ts_path = "test/0-1-v1.log") {
+        size_t seg_size = segment_bytes.size_bytes();
+
+        _io.put_ts_segment(
+          ts_path,
+          segment_bytes.share(0, seg_size),
+          base_kafka_offset,
+          last_kafka_offset,
+          delta);
+
+        auto meta_builder = (co_await _metastore.object_builder()).value();
+        auto oid = (co_await meta_builder->create_object_for(tidp)).value();
+
+        meta_builder
+          ->add(
+            oid,
+            l1::metastore::object_metadata::ntp_metadata{
+              .tidp = tidp,
+              .base_offset = base_kafka_offset,
+              .last_offset = last_kafka_offset,
+              .max_timestamp = model::timestamp::now(),
+              .pos = 0,
+              .size = seg_size,
+            })
+          .value();
+
+        auto& simple_builder
+          = dynamic_cast<l1::simple_object_builder&>(*meta_builder);
+        simple_builder
+          .finish(
+            oid,
+            /*footer_pos=*/0,
+            /*object_size=*/seg_size,
+            imported_segment_info{
+              .ts_path = ts_path,
+              .delta_offset = delta,
+              .delta_offset_end = delta,
+              .base_kafka_offset = base_kafka_offset,
+              .last_kafka_offset = last_kafka_offset,
+            })
+          .value();
+
+        metastore::term_offset_map_t term_map;
+        term_map[tidp].push_back(
+          l1::metastore::term_offset{
+            .term = model::term_id{1},
+            .first_offset = base_kafka_offset,
+          });
+        co_await _metastore.add_objects(*meta_builder, term_map);
+    }
+
     ss::future<> make_l1_objects(std::vector<tidp_batches_t> batches_by_tidp) {
         auto meta_builder = (co_await _metastore.object_builder()).value();
 

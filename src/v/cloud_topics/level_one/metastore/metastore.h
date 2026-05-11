@@ -90,6 +90,7 @@ public:
         size_t footer_pos;
         size_t object_size;
         ntp_metas_list_t ntp_metas;
+        std::optional<imported_segment_info> imported;
     };
     struct object_response {
         object_id oid;

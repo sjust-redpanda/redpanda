@@ -39,6 +39,12 @@ public:
       add(object_id, metastore::object_metadata::ntp_metadata) override;
     std::expected<void, error>
     finish(object_id, size_t footer_pos, size_t object_size) override;
+    // Overload for imported TS extents.
+    std::expected<void, error> finish(
+      object_id,
+      size_t footer_pos,
+      size_t object_size,
+      std::optional<imported_segment_info> imported);
     bool is_empty() const override;
 
     std::expected<chunked_vector<metastore::object_metadata>, error> release();
