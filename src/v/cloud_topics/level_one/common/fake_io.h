@@ -51,8 +51,26 @@ public:
     // Return a list of the object IDs that haven't been removed.
     chunked_vector<object_id> list_objects() const;
 
+    /// Inject a raw TS-format segment for use with open_object on imported
+    /// extents whose ts_path matches. open_object always seeks to
+    /// file_position=0, performing a conservative full-segment scan.
+    void put_ts_segment(
+      ss::sstring ts_path,
+      iobuf segment_bytes,
+      kafka::offset base_kafka_offset,
+      kafka::offset last_kafka_offset,
+      model::offset_delta delta_offset);
+
 private:
+    struct ts_segment_fixture {
+        iobuf bytes;
+        kafka::offset base_kafka_offset;
+        kafka::offset last_kafka_offset;
+        model::offset_delta delta_offset;
+    };
+
     absl::btree_map<object_id, iobuf> _storage;
+    absl::btree_map<ss::sstring, ts_segment_fixture> _ts_storage;
 };
 
 } // namespace cloud_topics::l1
