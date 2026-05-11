@@ -15,6 +15,7 @@
 #include "cloud_topics/level_one/common/object_id.h"
 #include "model/fundamental.h"
 #include "model/tests/random_batch.h"
+#include "storage/record_batch_utils.h"
 
 #include <seastar/util/defer.hh>
 
@@ -175,6 +176,156 @@ TEST(OpenObjectTest, MissingObjectReturnsError) {
       .position = 0,
       .size = 100,
       .imported = std::nullopt,
+    };
+    auto result = fio.open_object(extent, &as).get();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), io::errc::cloud_missing_object);
+}
+
+// ── Group C: fake_io imported (TS segment) path ──────────────────────────────
+
+namespace {
+
+// Serialise a batch into the on-disk storage format used by TS segments:
+// packed header followed by raw records.
+iobuf batch_to_disk_iobuf(model::record_batch batch) {
+    iobuf out;
+    out.append(storage::batch_header_to_disk_iobuf(batch.header()));
+    out.append(std::move(batch).release_data());
+    return out;
+}
+
+// Build a TS segment (on-disk format) from a single batch.
+iobuf make_ts_segment(model::record_batch batch) {
+    return batch_to_disk_iobuf(std::move(batch));
+}
+
+imported_segment_info make_imported_info(
+  const ss::sstring& ts_path,
+  kafka::offset base,
+  kafka::offset last,
+  model::offset_delta delta = model::offset_delta{0}) {
+    return imported_segment_info{
+      .ts_path = ts_path,
+      .delta_offset = delta,
+      .delta_offset_end = delta,
+      .base_kafka_offset = base,
+      .last_kafka_offset = last,
+    };
+}
+
+} // namespace
+
+// put_ts_segment + open_object with an imported extent returns a valid handle
+// whose index always returns {file_position=0, length=segment_size, delta}.
+TEST(OpenObjectTsTest, SeekReturnsFullSegment) {
+    fake_io fio;
+    const ss::sstring ts_path = "00000000000000000000-1-v1.log";
+    const model::offset_delta delta{5};
+
+    auto batch = make_batch(5_o, 14_o);
+    auto segment = make_ts_segment(batch.copy());
+    size_t segment_size = segment.size_bytes();
+
+    fio.put_ts_segment(ts_path, std::move(segment), 0_o, 9_o, delta);
+
+    auto tidp = model::topic_id_partition{
+      model::topic_id(uuid_t::create()), model::partition_id{0}};
+    ss::abort_source as;
+    object_extent extent{
+      .id = create_object_id(),
+      .position = 0,
+      .size = segment_size,
+      .imported = make_imported_info(ts_path, 0_o, 9_o, delta),
+    };
+    auto handle_result = fio.open_object(extent, &as).get();
+    ASSERT_TRUE(handle_result.has_value());
+    auto& handle = *handle_result;
+
+    auto seek = handle->index().seek_to_offset(tidp, 5_o);
+    ASSERT_TRUE(seek.has_value());
+    EXPECT_EQ(seek->file_position, size_t{0});
+    EXPECT_EQ(seek->length, segment_size);
+    ASSERT_TRUE(seek->delta.has_value());
+    EXPECT_EQ(*seek->delta, delta);
+}
+
+// Seeking past last_kafka_offset must return nullopt.
+TEST(OpenObjectTsTest, SeekBeyondLastOffsetReturnsNullopt) {
+    fake_io fio;
+    const ss::sstring ts_path = "00000000000000000000-1-v1.log";
+
+    auto segment = make_ts_segment(make_batch(0_o, 9_o));
+    size_t sz = segment.size_bytes();
+    fio.put_ts_segment(ts_path, std::move(segment), 0_o, 9_o, model::offset_delta{0});
+
+    auto tidp = model::topic_id_partition{
+      model::topic_id(uuid_t::create()), model::partition_id{0}};
+    ss::abort_source as;
+    object_extent extent{
+      .id = create_object_id(),
+      .position = 0,
+      .size = sz,
+      .imported = make_imported_info(ts_path, 0_o, 9_o),
+    };
+    auto handle_result = fio.open_object(extent, &as).get();
+    ASSERT_TRUE(handle_result.has_value());
+
+    EXPECT_FALSE(
+      (*handle_result)->index().seek_to_offset(tidp, 10_o).has_value());
+}
+
+// open_reader on an imported handle reads batches with delta-translated kafka
+// offsets. Log offset 15..19 with delta=5 must yield kafka offset 10..14.
+TEST(OpenObjectTsTest, ReadBatchesWithDeltaTranslation) {
+    fake_io fio;
+    const ss::sstring ts_path = "00000000000000000000-2-v1.log";
+    const model::offset_delta delta{5};
+
+    // Log offsets 15..19 (kafka 10..14 after subtracting delta=5)
+    auto batch = make_batch(15_o, 19_o);
+    auto segment = make_ts_segment(batch.copy());
+    size_t sz = segment.size_bytes();
+    fio.put_ts_segment(ts_path, std::move(segment), 10_o, 14_o, delta);
+
+    auto tidp = model::topic_id_partition{
+      model::topic_id(uuid_t::create()), model::partition_id{0}};
+    ss::abort_source as;
+    object_extent extent{
+      .id = create_object_id(),
+      .position = 0,
+      .size = sz,
+      .imported = make_imported_info(ts_path, 10_o, 14_o, delta),
+    };
+    auto handle_result = fio.open_object(extent, &as).get();
+    ASSERT_TRUE(handle_result.has_value());
+    auto& handle = *handle_result;
+
+    auto seek = handle->index().seek_to_offset(tidp, 10_o);
+    ASSERT_TRUE(seek.has_value());
+
+    auto reader_result = handle->open_reader(*seek, &as).get();
+    ASSERT_TRUE(reader_result.has_value());
+    auto& reader = *reader_result;
+    auto _r = ss::defer([&reader] { reader->close().get(); });
+
+    auto item = reader->read_next().get();
+    ASSERT_TRUE(std::holds_alternative<model::record_batch>(item));
+    const auto& got = std::get<model::record_batch>(item);
+    EXPECT_EQ(got.base_offset(), kafka::offset_cast(10_o));
+    EXPECT_EQ(got.last_offset(), kafka::offset_cast(14_o));
+}
+
+// open_object with an imported extent whose ts_path was never injected must
+// return cloud_missing_object.
+TEST(OpenObjectTsTest, MissingTsSegmentReturnsError) {
+    fake_io fio;
+    ss::abort_source as;
+    object_extent extent{
+      .id = create_object_id(),
+      .position = 0,
+      .size = 100,
+      .imported = make_imported_info("no-such-segment.log", 0_o, 9_o),
     };
     auto result = fio.open_object(extent, &as).get();
     ASSERT_FALSE(result.has_value());

@@ -45,6 +45,7 @@ redpanda_cc_gtest(
         "//src/v/cloud_topics/level_one/common:object_id",
         "//src/v/model",
         "//src/v/model/tests:random",
+        "//src/v/storage:record_batch_utils",
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",
         "@seastar",
