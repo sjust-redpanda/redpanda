@@ -11,6 +11,7 @@
 #include "cloud_topics/level_one/common/fake_io.h"
 
 #include "bytes/iostream.h"
+#include "cloud_topics/level_one/common/object.h"
 #include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_storage_clients/multipart_upload.h"
 #include "cloud_topics/level_one/common/object_id.h"
@@ -18,6 +19,66 @@
 namespace cloud_topics::l1 {
 
 static ss::logger fake_io_log("fake_io");
+
+namespace {
+
+class fake_footer_index final : public object_index {
+public:
+    explicit fake_footer_index(l1::footer f) : _footer(std::move(f)) {}
+
+    std::optional<seek_result>
+    seek_to_offset(model::topic_id_partition tidp, kafka::offset offset)
+      const override {
+        auto r = _footer.file_position_before_kafka_offset(tidp, offset);
+        if (r == l1::footer::npos) {
+            return std::nullopt;
+        }
+        return seek_result{.file_position = r.file_position, .length = r.length};
+    }
+
+    std::optional<seek_result> seek_to_timestamp(
+      model::topic_id_partition tidp, model::timestamp ts) const override {
+        auto r = _footer.file_position_before_max_timestamp(tidp, ts);
+        if (r == l1::footer::npos) {
+            return std::nullopt;
+        }
+        return seek_result{.file_position = r.file_position, .length = r.length};
+    }
+
+private:
+    l1::footer _footer;
+};
+
+class fake_object_handle final : public object_handle {
+public:
+    fake_object_handle(object_extent extent, fake_io* io, l1::footer footer)
+      : _extent(extent)
+      , _io(io)
+      , _index(std::move(footer)) {}
+
+    const object_index& index() const override { return _index; }
+
+    ss::future<std::expected<std::unique_ptr<l1::object_reader>, io::errc>>
+    open_reader(const seek_result& seek, ss::abort_source* as) override {
+        l1::object_extent read_extent{
+          .id = _extent.id,
+          .position = seek.file_position,
+          .size = seek.length,
+        };
+        auto stream_result = co_await _io->read_object(read_extent, as);
+        if (!stream_result.has_value()) {
+            co_return std::unexpected(stream_result.error());
+        }
+        co_return l1::object_reader::create(std::move(*stream_result));
+    }
+
+private:
+    object_extent _extent;
+    fake_io* _io;
+    fake_footer_index _index;
+};
+
+} // anonymous namespace
 
 // In-memory multipart upload state for testing.
 class fake_multipart_state final
@@ -124,8 +185,22 @@ fake_io::read_object(object_extent extent, ss::abort_source*) {
 }
 
 ss::future<std::expected<std::unique_ptr<object_handle>, io::errc>>
-fake_io::open_object(object_extent, ss::abort_source*) {
-    co_return std::unexpected(io::errc::cloud_op_error);
+fake_io::open_object(object_extent extent, ss::abort_source* as) {
+    if (extent.imported.has_value()) {
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    auto stream_result = co_await read_object(extent, as);
+    if (!stream_result.has_value()) {
+        co_return std::unexpected(stream_result.error());
+    }
+    auto footer_buf = co_await read_iobuf_exactly(
+      *stream_result, extent.size);
+    auto footer_result = co_await l1::footer::read(std::move(footer_buf));
+    if (!std::holds_alternative<l1::footer>(footer_result)) {
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    co_return std::make_unique<fake_object_handle>(
+      extent, this, std::get<l1::footer>(std::move(footer_result)));
 }
 
 ss::future<std::expected<void, io::errc>>
