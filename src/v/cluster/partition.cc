@@ -13,6 +13,8 @@
 #include "cloud_storage/partition_manifest_downloader.h"
 #include "cloud_storage/read_path_probes.h"
 #include "cloud_storage/remote_partition.h"
+#include "cloud_topics/level_zero/stm/ctp_stm.h"
+#include "cloud_topics/level_zero/stm/ctp_stm_api.h"
 #include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/archival/ntp_archiver_service.h"
 #include "cluster/archival/upload_housekeeping_service.h"
@@ -883,7 +885,18 @@ ss::future<> partition::update_configuration(topic_properties new_properties) {
         cloud_storage_changed = true;
     }
 
-    // Pass the configuration update into the storage layer
+    // Capture the transition flag before set_overrides() overwrites the ref.
+    bool const needs_ct_migration
+      = !old_ntp_config.cloud_topic_enabled()
+        && (new_overrides.storage_mode
+              == model::redpanda_storage_mode::tiered_cloud
+            || new_overrides.storage_mode
+                 == model::redpanda_storage_mode::cloud);
+
+    // Pass the configuration update into the storage layer.  This must happen
+    // before init_ts_ct_migration() so that cloud_topic_enabled() returns true
+    // for any produce requests that arrive while the async start_ts_import_cmd
+    // replication is in flight.
     _raft->log()->set_overrides(new_overrides);
     bool compaction_changed = _raft->log()->notify_compaction_update();
     if (compaction_changed) {
@@ -901,6 +914,12 @@ ss::future<> partition::update_configuration(topic_properties new_properties) {
 
     // Pass the configuration update to the raft layer
     _raft->notify_config_update();
+
+    // Record the TS migration boundary after the storage config is updated but
+    // before the archiver is torn down, so _archival_meta_stm is still valid.
+    if (needs_ct_migration) {
+        co_await init_ts_ct_migration();
+    }
 
     // If this partition's cloud storage mode changed, rebuild the archiver.
     // This must happen after the raft+storage update, because it reads raft's
@@ -943,6 +962,70 @@ ss::future<> partition::restart_archiver(bool should_notify_topic_config) {
             _archiver->notify_topic_config();
         }
         co_await _archiver->start();
+    }
+}
+
+ss::future<> partition::init_ts_ct_migration() {
+    if (!_raft->is_leader()) {
+        co_return;
+    }
+    auto ctp = _raft->stm_manager()->get<cloud_topics::ctp_stm>();
+    if (!ctp) {
+        vlog(
+          clusterlog.warn,
+          "[{}] ctp_stm absent during tiered→cloud-topic transition",
+          _raft->ntp());
+        co_return;
+    }
+    cloud_topics::ctp_stm_api api{ctp};
+    if (api.get_ts_migration_boundary().has_value()) {
+        co_return;
+    }
+
+    // Use the highest kafka offset that is recoverable from cloud storage as
+    // the migration boundary.  The archival_meta_stm only records a segment
+    // after its S3 upload has succeeded, so manifest().get_last_kafka_offset()
+    // is always ≤ the actual last uploaded kafka offset — it can lag but never
+    // lead S3 state.  If a segment is uploaded concurrently and its
+    // add_segments command has not yet been applied to the manifest, we set the
+    // boundary one segment lower; the CT reconciler re-reads those records from
+    // the raft log and re-uploads them, which is acceptable.
+    //
+    // log_boundary is the corresponding raft offset of the last uploaded
+    // segment.  It is stored in start_ts_import_cmd so that on apply the STM
+    // can advance _last_reconciled_log_offset to this point immediately,
+    // allowing the raft log to be trimmed up to the TS frontier without
+    // waiting for the CT reconciler to process the gap between the TS upload
+    // frontier and the start_ts_import_cmd batch itself.
+    // kafka::offset::min() (-1) means no TS data has been uploaded. We still
+    // record a migration boundary so that the STM and tests can detect that
+    // the promotion has been processed. Downstream, a boundary of min()
+    // signals "CT starts at offset 0, no TS passthrough needed."
+    const kafka::offset boundary
+      = _archival_meta_stm
+          ? _archival_meta_stm->manifest().get_last_kafka_offset().value_or(
+              kafka::offset::min())
+          : kafka::offset::min();
+    const model::offset log_boundary
+      = _archival_meta_stm ? _archival_meta_stm->get_last_offset()
+                           : model::offset::min();
+
+    const auto deadline = model::timeout_clock::now()
+                          + std::chrono::seconds{30};
+    auto res = co_await api.start_ts_import(boundary, log_boundary, deadline, _as);
+    if (!res.has_value()) {
+        vlog(
+          clusterlog.warn,
+          "[{}] failed to replicate start_ts_import_cmd (boundary={}): {}",
+          _raft->ntp(),
+          boundary,
+          res.error());
+    } else {
+        vlog(
+          clusterlog.info,
+          "[{}] TS migration boundary set to {}",
+          _raft->ntp(),
+          boundary);
     }
 }
 
