@@ -18,6 +18,7 @@ redpanda_test_cc_library(
         "//src/v/cloud_io/tests:s3_imposter",
         "//src/v/redpanda/tests:fixture",
         "//src/v/test_utils:scoped_config",
+        "//src/v/test_utils:test_env",
     ],
 )
 
@@ -55,6 +56,7 @@ redpanda_test_cc_library(
         "//src/v/storage:record_batch_utils",
         "//src/v/storage/tests:disk_log_builder",
         "//src/v/test_utils:scoped_config",
+        "//src/v/test_utils:test_env",
         "//src/v/test_utils:test_macros",
         "//src/v/test_utils:tmp_dir",
         "//src/v/utils:lazy_abort_source",

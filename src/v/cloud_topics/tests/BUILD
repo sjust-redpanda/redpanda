@@ -197,6 +197,7 @@ redpanda_cc_gtest(
         "//src/v/redpanda/tests:fixture",
         "//src/v/test_utils:gtest",
         "//src/v/test_utils:scoped_config",
+        "//src/v/test_utils:test_env",
         "@googletest//:gtest",
         "@seastar",
         "@seastar//:testing",
