@@ -45,4 +45,10 @@ std::string getenv_default(
 // Checks if the CI environment variable is set to "true" (case-insensitive).
 bool is_on_ci() noexcept;
 
+// Returns a free TCP port on 127.0.0.1 by asking the OS to assign one.
+// Uses the bind-to-0 / getsockname trick; the port is released before
+// returning so the caller should bind it promptly.  Suitable for test
+// fixture ports that must not collide across concurrent test processes.
+uint16_t find_free_port() noexcept;
+
 } // namespace test_env

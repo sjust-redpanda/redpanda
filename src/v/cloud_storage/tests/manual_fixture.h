@@ -13,11 +13,13 @@
 #include "cluster/cloud_metadata/tests/manual_mixin.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
+#include "config/node_config.h"
 #include "kafka/server/tests/produce_consume_utils.h"
 #include "model/fundamental.h"
 #include "redpanda/tests/fixture.h"
 #include "storage/disk_log_impl.h"
 #include "test_utils/scoped_config.h"
+#include "test_utils/test_env.h"
 
 class cloud_storage_manual_multinode_test_base
   : public s3_imposter_fixture
@@ -41,14 +43,15 @@ public:
     }
 
     std::unique_ptr<redpanda_thread_fixture> start_second_fixture() {
+        auto node1_rpc_port = config::node().rpc_server().port();
         return std::make_unique<redpanda_thread_fixture>(
           model::node_id(2),
-          9092 + 10,
-          33145 + 10,
+          test_env::find_free_port(),
+          test_env::find_free_port(),
           std::nullopt,
           std::nullopt,
           std::vector<config::seed_server>{
-            {.addr = net::unresolved_address("127.0.0.1", 33145)}},
+            {.addr = net::unresolved_address("127.0.0.1", node1_rpc_port)}},
           test_directory(),
           /*remove_on_shutdown=*/false,
           get_s3_config(httpd_port_number()),

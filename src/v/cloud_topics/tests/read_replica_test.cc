@@ -18,6 +18,7 @@
 #include "redpanda/tests/fixture.h"
 #include "test_utils/async.h"
 #include "test_utils/scoped_config.h"
+#include "test_utils/test_env.h"
 
 #include <seastar/util/log.hh>
 
@@ -99,8 +100,8 @@ public:
           .use_lsm_metastore = true, .skip_flush_loop = true};
         auto replica = std::make_unique<redpanda_thread_fixture>(
           model::node_id(2),
-          9092 + 10,  // kafka_port
-          33145 + 10, // rpc_port
+          test_env::find_free_port(),
+          test_env::find_free_port(),
           std::nullopt,
           std::nullopt,
           std::vector<config::seed_server>{},

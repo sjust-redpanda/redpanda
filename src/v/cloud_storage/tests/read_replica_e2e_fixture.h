@@ -12,6 +12,7 @@
 #include "cloud_io/tests/s3_imposter.h"
 #include "redpanda/tests/fixture.h"
 #include "test_utils/scoped_config.h"
+#include "test_utils/test_env.h"
 
 class read_replica_e2e_fixture
   : public s3_imposter_fixture
@@ -43,8 +44,8 @@ public:
     std::unique_ptr<redpanda_thread_fixture> start_read_replica_fixture() {
         return std::make_unique<redpanda_thread_fixture>(
           model::node_id(2),
-          9092 + 10,
-          33145 + 10,
+          test_env::find_free_port(),
+          test_env::find_free_port(),
           std::nullopt,
           std::nullopt,
           std::vector<config::seed_server>{},

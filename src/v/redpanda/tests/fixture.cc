@@ -57,6 +57,7 @@
 #include "security/scram_authenticator.h"
 #include "storage/tests/utils/disk_log_builder.h"
 #include "test_utils/async.h"
+#include "test_utils/test_env.h"
 #include "utils/unresolved_address.h"
 
 #include <seastar/core/future.hh>
@@ -185,17 +186,24 @@ redpanda_thread_fixture::redpanda_thread_fixture(
 // creates single node with default configuration
 redpanda_thread_fixture::redpanda_thread_fixture()
   : redpanda_thread_fixture(
-      model::node_id(1), 9092, 33145, 8082, 8081, {}, test_directory(), true) {}
+      model::node_id(1),
+      test_env::find_free_port(),
+      test_env::find_free_port(),
+      test_env::find_free_port(),
+      test_env::find_free_port(),
+      {},
+      test_directory(),
+      true) {}
 
 // Restart the fixture with an existing data directory
 redpanda_thread_fixture::redpanda_thread_fixture(
   std::filesystem::path existing_data_dir)
   : redpanda_thread_fixture(
       model::node_id(1),
-      9092,
-      33145,
-      8082,
-      8081,
+      test_env::find_free_port(),
+      test_env::find_free_port(),
+      test_env::find_free_port(),
+      test_env::find_free_port(),
       {},
       existing_data_dir.string(),
       true) {}
@@ -209,10 +217,10 @@ redpanda_thread_fixture::redpanda_thread_fixture(
   model::node_id node_id)
   : redpanda_thread_fixture(
       node_id,
-      9092,
-      33145,
-      8082,
-      8081,
+      test_env::find_free_port(),
+      test_env::find_free_port(),
+      test_env::find_free_port(),
+      test_env::find_free_port(),
       {},
       test_directory(),
       true,
@@ -229,10 +237,10 @@ redpanda_thread_fixture::redpanda_thread_fixture(
   cloud_topics::test_fixture_cfg ct_test_cfg)
   : redpanda_thread_fixture(
       node_id,
-      9092,
-      33145,
-      8082,
-      8081,
+      test_env::find_free_port(),
+      test_env::find_free_port(),
+      test_env::find_free_port(),
+      test_env::find_free_port(),
       {},
       test_directory(),
       true,
@@ -254,10 +262,10 @@ redpanda_thread_fixture::redpanda_thread_fixture(
   cloud_storage_clients::s3_url_style url_style)
   : redpanda_thread_fixture(
       model::node_id(1),
-      9092,
-      33145,
-      8082,
-      8081,
+      test_env::find_free_port(),
+      test_env::find_free_port(),
+      test_env::find_free_port(),
+      test_env::find_free_port(),
       {},
       test_directory(),
       true,
