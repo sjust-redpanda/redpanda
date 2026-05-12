@@ -12,13 +12,20 @@
 
 #include "cloud_topics/level_zero/stm/ctp_stm.h"
 #include "cloud_topics/logger.h"
+#include "config/configuration.h"
 
 namespace cloud_topics::l0 {
 
 bool ctp_stm_factory::is_applicable_for(
   const storage::ntp_config& ntp_cfg) const {
-    return ntp_cfg.cloud_topic_enabled()
-           && !ntp_cfg.is_read_replica_mode_enabled();
+    if (ntp_cfg.is_read_replica_mode_enabled()) {
+        return false;
+    }
+    if (ntp_cfg.cloud_topic_enabled()) {
+        return true;
+    }
+    return config::shard_local_cfg().cloud_topics_enabled()
+           && ntp_cfg.is_archival_enabled();
 }
 
 void ctp_stm_factory::create(
