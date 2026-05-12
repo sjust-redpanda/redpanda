@@ -307,6 +307,11 @@ public:
         }
     }
 
+    // If this is a tiered_cloud partition and no TS migration boundary has been
+    // recorded yet, replicates start_ts_import_cmd to set one. Idempotent.
+    // Must only be called on the leader.
+    ss::future<> init_ts_ct_migration();
+
     uint64_t upload_backlog_size() const;
 
     /**
