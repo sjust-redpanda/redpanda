@@ -24,6 +24,7 @@ enum class ctp_stm_key : uint8_t {
     advance_epoch = 3,
     reset_state = 4,
     set_allowed_local_start_offset = 5,
+    start_ts_import = 6,
 };
 
 struct [[nodiscard]] cluster_epoch_fence {

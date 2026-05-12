@@ -347,4 +347,31 @@ void ctp_stm_api::register_reader(active_reader_state* state) {
     return _stm->register_reader(state);
 }
 
+ss::future<std::expected<std::monostate, ctp_stm_api_errc>>
+ctp_stm_api::start_ts_import(
+  kafka::offset boundary,
+  model::offset log_boundary,
+  model::timeout_clock::time_point deadline,
+  ss::abort_source& as) {
+    if (_stm->state().get_ts_migration_boundary().has_value()) {
+        co_return std::monostate{};
+    }
+    storage::record_batch_builder builder(
+      model::record_batch_type::ctp_stm_command, model::offset{0});
+    builder.add_raw_kv(
+      serde::to_iobuf(start_ts_import_cmd::key),
+      serde::to_iobuf(start_ts_import_cmd{boundary, log_boundary}));
+    auto apply_result = co_await replicated_apply(
+      std::move(builder).build(), std::nullopt, deadline, as);
+    if (!apply_result.has_value()) {
+        co_return std::unexpected(apply_result.error());
+    }
+    co_return std::monostate{};
+}
+
+std::optional<kafka::offset>
+ctp_stm_api::get_ts_migration_boundary() const noexcept {
+    return _stm->state().get_ts_migration_boundary();
+}
+
 }; // namespace cloud_topics
