@@ -242,6 +242,9 @@ private:
       const cloud_topic_log_reader_config& cfg,
       model::topic_id_partition tidp) const;
 
+    ss::future<storage::translating_reader>
+    make_ts_passthrough_reader(cloud_topic_log_reader_config cfg) const;
+
     ss::lw_shared_ptr<cluster::partition> _partition;
     data_plane_api* _data_plane;
     ss::lw_shared_ptr<cloud_topics::ctp_stm_api> _ctp_stm_api;
