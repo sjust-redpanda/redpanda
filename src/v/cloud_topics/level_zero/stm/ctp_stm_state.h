@@ -142,6 +142,12 @@ public:
     std::optional<kafka::offset>
     get_allowed_local_start_offset() const noexcept;
 
+    /// Record the pre-migration tiered-storage boundary and advance LRO to it.
+    /// Idempotent: a second call with any value is a no-op.
+    void start_ts_import(kafka::offset boundary, model::offset log_offset) noexcept;
+
+    std::optional<kafka::offset> get_ts_migration_boundary() const noexcept;
+
     auto serde_fields() {
         return std::tie(
           _max_applied_epoch,
@@ -152,7 +158,8 @@ public:
           _previous_applied_epoch,
           _start_offset,
           _size_estimator,
-          _allowed_local_start_offset);
+          _allowed_local_start_offset,
+          _ts_migration_boundary);
     }
 
     /// Max collectible offset is defined by the LRO.
@@ -236,6 +243,11 @@ private:
     /// Allowed local start offset hint, produced by the reconciler.
     /// Cached state only; truncation is applied elsewhere.
     std::optional<kafka::offset> _allowed_local_start_offset;
+
+    // Set once when the partition transitions from tiered to tiered_cloud.
+    // Pre-migration reads (offset <= boundary) are served via the TS
+    // passthrough reader; reads above it go through the normal L1 path.
+    std::optional<kafka::offset> _ts_migration_boundary;
 };
 
 }; // namespace cloud_topics

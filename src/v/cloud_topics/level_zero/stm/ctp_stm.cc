@@ -310,6 +310,9 @@ ss::future<> ctp_stm::do_apply(const model::record_batch& batch) {
               case ctp_stm_key::set_allowed_local_start_offset:
                   apply_set_allowed_local_start_offset(std::move(r));
                   return ss::stop_iteration::no;
+              case ctp_stm_key::start_ts_import:
+                  apply_start_ts_import(std::move(r));
+                  return ss::stop_iteration::no;
               }
               throw std::runtime_error(fmt_with_ctx(
                 fmt::format, "Unknown ctp_stm_key({})", static_cast<int>(key)));
@@ -356,6 +359,17 @@ void ctp_stm::apply_set_allowed_local_start_offset(model::record record) {
       record.release_value());
     vlog(_log.debug, "Applying set_allowed_local_start_offset: {}", cmd.value);
     _state.set_allowed_local_start_offset(cmd.value);
+    _lro_advanced.signal();
+}
+
+void ctp_stm::apply_start_ts_import(model::record record) {
+    auto cmd = serde::from_iobuf<start_ts_import_cmd>(record.release_value());
+    vlog(
+      _log.info,
+      "Setting TS migration boundary to {}, log boundary {}",
+      cmd.migration_boundary,
+      cmd.log_boundary);
+    _state.start_ts_import(cmd.migration_boundary, cmd.log_boundary);
     _lro_advanced.signal();
 }
 

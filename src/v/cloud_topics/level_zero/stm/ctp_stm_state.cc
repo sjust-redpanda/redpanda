@@ -190,6 +190,22 @@ ctp_stm_state::get_allowed_local_start_offset() const noexcept {
     return _allowed_local_start_offset;
 }
 
+void ctp_stm_state::start_ts_import(
+  kafka::offset boundary, model::offset log_offset) noexcept {
+    if (_ts_migration_boundary.has_value()) {
+        return;
+    }
+    _ts_migration_boundary = boundary;
+    _last_reconciled_offset = std::max(
+      _last_reconciled_offset.value_or(kafka::offset::min()), boundary);
+    _last_reconciled_log_offset = log_offset;
+}
+
+std::optional<kafka::offset>
+ctp_stm_state::get_ts_migration_boundary() const noexcept {
+    return _ts_migration_boundary;
+}
+
 fmt::iterator ctp_stm_state::format_to(fmt::iterator it) const {
     return fmt::format_to(
       it,
