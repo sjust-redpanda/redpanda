@@ -305,6 +305,9 @@ ss::future<> ctp_stm::do_apply(const model::record_batch& batch) {
               case ctp_stm_key::reset_state:
                   apply_reset_state(std::move(r));
                   return ss::stop_iteration::no;
+              case ctp_stm_key::start_ts_import:
+                  apply_start_ts_import(std::move(r));
+                  return ss::stop_iteration::no;
               }
               throw std::runtime_error(fmt_with_ctx(
                 fmt::format, "Unknown ctp_stm_key({})", static_cast<int>(key)));
@@ -344,6 +347,17 @@ void ctp_stm::apply_reset_state(model::record record) {
     auto cmd = serde::from_iobuf<reset_state_cmd>(record.release_value());
     vlog(_log.info, "Resetting ctp_stm state: {}", cmd.state);
     _state = std::move(cmd.state);
+}
+
+void ctp_stm::apply_start_ts_import(model::record record) {
+    auto cmd = serde::from_iobuf<start_ts_import_cmd>(record.release_value());
+    vlog(
+      _log.info,
+      "Setting TS migration boundary to {}, log boundary {}",
+      cmd.migration_boundary,
+      cmd.log_boundary);
+    _state.start_ts_import(cmd.migration_boundary, cmd.log_boundary);
+    _lro_advanced.signal();
 }
 
 void ctp_stm::apply_placeholder(const model::record_batch& batch) {

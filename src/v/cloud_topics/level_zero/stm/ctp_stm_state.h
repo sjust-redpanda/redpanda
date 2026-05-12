@@ -22,7 +22,7 @@ namespace cloud_topics {
 ///
 class ctp_stm_state
   : public serde::
-      envelope<ctp_stm_state, serde::version<0>, serde::compat_version<0>> {
+      envelope<ctp_stm_state, serde::version<1>, serde::compat_version<0>> {
     friend class ctp_stm_state_accessor;
 
 public:
@@ -130,6 +130,12 @@ public:
     std::optional<model::offset>
     get_last_reconciled_log_offset() const noexcept;
 
+    /// Record the pre-migration tiered-storage boundary and advance LRO to it.
+    /// Idempotent: a second call with any value is a no-op.
+    void start_ts_import(kafka::offset boundary, model::offset log_offset) noexcept;
+
+    std::optional<kafka::offset> get_ts_migration_boundary() const noexcept;
+
     auto serde_fields() {
         return std::tie(
           _max_applied_epoch,
@@ -139,7 +145,8 @@ public:
           _min_epoch_lower_bound,
           _previous_applied_epoch,
           _start_offset,
-          _size_estimator);
+          _size_estimator,
+          _ts_migration_boundary);
     }
 
     /// Max collectible offset is defined by the LRO.
@@ -219,6 +226,11 @@ private:
 
     // Estimates total cloud data bytes addressable by the surviving log.
     size_estimator _size_estimator;
+
+    // Set once when the partition transitions from tiered to tiered_cloud.
+    // Pre-migration reads (offset <= boundary) are served via the TS
+    // passthrough reader; reads above it go through the normal L1 path.
+    std::optional<kafka::offset> _ts_migration_boundary;
 };
 
 }; // namespace cloud_topics

@@ -138,6 +138,15 @@ public:
     /// log for this partition.
     uint64_t estimated_data_size() const noexcept;
 
+    /// Replicate start_ts_import_cmd to record the pre-migration TS boundary.
+    ss::future<std::expected<std::monostate, ctp_stm_api_errc>> start_ts_import(
+      kafka::offset migration_boundary,
+      model::offset log_boundary,
+      model::timeout_clock::time_point deadline,
+      ss::abort_source& as);
+
+    std::optional<kafka::offset> get_ts_migration_boundary() const noexcept;
+
 private:
     /// Replicate a record batch and wait for it to be applied to the ctp_stm.
     /// Returns the offset at which the batch was applied.

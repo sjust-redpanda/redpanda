@@ -110,4 +110,34 @@ struct reset_state_cmd
     ctp_stm_state state;
 };
 
+/// Records the Kafka offset boundary up to which pre-migration tiered-storage
+/// data exists. Applied once; subsequent applications are no-ops.
+///
+/// log_boundary is the raft log offset of the last segment durably uploaded
+/// to S3 before the migration.  It is set as _last_reconciled_log_offset
+/// immediately on apply so that the raft log can be trimmed up to the TS
+/// frontier without waiting for the CT reconciler to process the gap between
+/// the TS upload frontier and the start_ts_import_cmd batch.
+struct start_ts_import_cmd
+  : public serde::envelope<
+      start_ts_import_cmd,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    static constexpr cmd_key key = cmd_key(
+      std::to_underlying(ctp_stm_key::start_ts_import));
+
+    start_ts_import_cmd() noexcept = default;
+    start_ts_import_cmd(
+      kafka::offset kafka_boundary, model::offset raft_boundary) noexcept
+      : migration_boundary(kafka_boundary)
+      , log_boundary(raft_boundary) {}
+
+    auto serde_fields() {
+        return std::tie(migration_boundary, log_boundary);
+    }
+
+    kafka::offset migration_boundary;
+    model::offset log_boundary;
+};
+
 } // namespace cloud_topics
