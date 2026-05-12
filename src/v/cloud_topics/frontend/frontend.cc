@@ -248,14 +248,32 @@ model::term_id frontend::leader_epoch() const {
     return _partition->raft()->confirmed_term();
 }
 
+frontend::read_path
+frontend::select_read_path(kafka::offset start_offset) const {
+    const auto ts_bound = _ctp_stm_api->get_ts_migration_boundary();
+    if (ts_bound.has_value() && start_offset <= *ts_bound) {
+        return read_path::ts_passthrough;
+    }
+    const auto lro = _ctp_stm_api->get_last_reconciled_offset();
+    if (lro > kafka::offset::min() && start_offset <= lro) {
+        return read_path::l1;
+    }
+    return read_path::l0;
+}
+
 ss::future<storage::translating_reader>
 frontend::make_reader(cloud_topic_log_reader_config cfg) {
     vassert(_data_plane != nullptr, "cloud topics api not initialized");
 
+    const auto path = select_read_path(cfg.start_offset);
+
+    if (path == read_path::ts_passthrough) {
+        co_return co_await make_ts_passthrough_reader(cfg);
+    }
+
     const auto lro = _ctp_stm_api->get_last_reconciled_offset();
 
-    const auto level_one = lro > kafka::offset::min()
-                           && cfg.start_offset <= lro;
+    const auto level_one = path == read_path::l1;
 
     vlog(
       cd_log.debug,
@@ -1417,6 +1435,26 @@ frontend::coarse_grained_timequery_result::format_to(fmt::iterator it) const {
       time,
       start_offset,
       last_offset);
+}
+
+ss::future<storage::translating_reader>
+frontend::make_ts_passthrough_reader(cloud_topic_log_reader_config cfg) const {
+    vlog(
+      cd_log.debug,
+      "Building TS passthrough reader for {} from {}",
+      _partition->ntp(),
+      cfg.start_offset);
+    cloud_storage::cloud_log_reader_config reader_cfg{
+      cfg.start_offset,
+      cfg.max_offset,
+      cfg.min_bytes,
+      cfg.max_bytes,
+      cfg.type_filter,
+      cfg.first_timestamp,
+      cfg.abort_source,
+      cfg.client_address,
+      cfg.strict_max_bytes};
+    co_return co_await _partition->make_cloud_reader(reader_cfg);
 }
 
 } // namespace cloud_topics
