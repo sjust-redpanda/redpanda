@@ -1,3 +1,4 @@
+#include "config/node_config.h"
 #include "kafka/client/cluster.h"
 #include "kafka/client/configuration.h"
 #include "kafka/protocol/produce.h"
@@ -14,7 +15,8 @@ using namespace kafka::client;
 kafka::client::connection_configuration
 make_cluster_config(std::chrono::milliseconds max_metadata_age) {
     return kafka::client::connection_configuration{
-      .initial_brokers = {net::unresolved_address{"localhost", 9092}},
+      .initial_brokers = {net::unresolved_address{
+        "localhost", config::node().kafka_api()[0].address.port()}},
       .client_id = "test_client",
       .max_metadata_age = max_metadata_age,
     };

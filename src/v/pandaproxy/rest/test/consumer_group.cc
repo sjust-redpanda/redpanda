@@ -91,7 +91,7 @@ FIXTURE_TEST(pandaproxy_consumer_group, pandaproxy_test_fixture) {
           fmt::format(
             "http://{}:{}/consumers/{}/instances/{}",
             "127.0.0.1",
-            "8082",
+            *proxy_port,
             group_id(),
             member_id()));
         BOOST_REQUIRE_EQUAL(
@@ -322,7 +322,7 @@ FIXTURE_TEST(
           fmt::format(
             "http://{}:{}/consumers/{}/instances/{}",
             "127.0.0.1",
-            "8082",
+            *proxy_port,
             group_id(),
             member_id()));
         BOOST_REQUIRE_EQUAL(
