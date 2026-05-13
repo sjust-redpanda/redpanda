@@ -9,9 +9,11 @@
  */
 
 #include "cloud_topics/level_zero/stm/ctp_stm_state.h"
+#include "cloud_topics/level_zero/stm/size_estimator.h"
 #include "cloud_topics/types.h"
 #include "model/fundamental.h"
 #include "random/generators.h"
+#include "serde/envelope.h"
 #include "serde/rw/envelope.h"
 #include "serde/rw/optional.h"
 #include "serde/rw/rw.h"
@@ -492,6 +494,126 @@ TEST(ctp_stm_state_test, allowed_local_start_offset_round_trips_through_serde) {
     auto s2 = serde::from_iobuf<ct::ctp_stm_state>(std::move(buf));
     ASSERT_TRUE(s2.get_allowed_local_start_offset().has_value());
     EXPECT_EQ(*s2.get_allowed_local_start_offset(), kafka::offset{1234});
+}
+
+TEST(ctp_stm_state_test, start_ts_import_sets_boundary) {
+    ct::ctp_stm_state state;
+    EXPECT_FALSE(state.get_ts_migration_boundary().has_value());
+
+    state.start_ts_import(kafka::offset{100}, model::offset{200});
+
+    ASSERT_TRUE(state.get_ts_migration_boundary().has_value());
+    EXPECT_EQ(state.get_ts_migration_boundary().value(), kafka::offset{100});
+}
+
+TEST(ctp_stm_state_test, start_ts_import_sets_lrlo) {
+    ct::ctp_stm_state state;
+    EXPECT_FALSE(state.get_last_reconciled_log_offset().has_value());
+
+    state.start_ts_import(kafka::offset{100}, model::offset{200});
+
+    ASSERT_TRUE(state.get_last_reconciled_log_offset().has_value());
+    EXPECT_EQ(
+      state.get_last_reconciled_log_offset().value(), model::offset{200});
+}
+
+TEST(ctp_stm_state_test, start_ts_import_idempotent) {
+    ct::ctp_stm_state state;
+
+    state.start_ts_import(kafka::offset{100}, model::offset{200});
+    state.start_ts_import(kafka::offset{200}, model::offset{300});
+
+    EXPECT_EQ(state.get_ts_migration_boundary().value(), kafka::offset{100});
+    EXPECT_EQ(
+      state.get_last_reconciled_log_offset().value(), model::offset{200});
+}
+
+TEST(ctp_stm_state_test, start_ts_import_advances_lro_from_unset) {
+    ct::ctp_stm_state state;
+    EXPECT_FALSE(state.get_last_reconciled_offset().has_value());
+
+    state.start_ts_import(kafka::offset{100}, model::offset{200});
+
+    ASSERT_TRUE(state.get_last_reconciled_offset().has_value());
+    EXPECT_EQ(state.get_last_reconciled_offset().value(), kafka::offset{100});
+}
+
+TEST(ctp_stm_state_test, start_ts_import_advances_lro_when_lower) {
+    ct::ctp_stm_state state;
+    state.advance_last_reconciled_offset(kafka::offset{50}, model::offset{50});
+
+    state.start_ts_import(kafka::offset{100}, model::offset{200});
+
+    EXPECT_EQ(state.get_last_reconciled_offset().value(), kafka::offset{100});
+}
+
+TEST(ctp_stm_state_test, start_ts_import_preserves_lro_when_higher) {
+    ct::ctp_stm_state state;
+    state.advance_last_reconciled_offset(
+      kafka::offset{150}, model::offset{150});
+
+    state.start_ts_import(kafka::offset{100}, model::offset{200});
+
+    EXPECT_EQ(state.get_last_reconciled_offset().value(), kafka::offset{150});
+}
+
+// Struct that matches the ctp_stm_state serde layout from before
+// _ts_migration_boundary was added (version 0).  Serialising this and
+// deserialising as ctp_stm_state verifies that old snapshots (written by nodes
+// that did not yet have the field) decode cleanly, leaving the new field at
+// its default value (nullopt).
+struct ctp_stm_state_v0
+  : public serde::
+      envelope<ctp_stm_state_v0, serde::version<0>, serde::compat_version<0>> {
+    std::optional<ct::cluster_epoch> max_applied_epoch;
+    std::optional<kafka::offset> last_reconciled_offset;
+    std::optional<model::offset> last_reconciled_log_offset;
+    std::optional<model::offset> current_epoch_window_offset;
+    std::optional<ct::cluster_epoch> min_epoch_lower_bound;
+    std::optional<ct::cluster_epoch> previous_applied_epoch;
+    kafka::offset start_offset{0};
+    ct::size_estimator size_estimator;
+
+    auto serde_fields() {
+        return std::tie(
+          max_applied_epoch,
+          last_reconciled_offset,
+          last_reconciled_log_offset,
+          current_epoch_window_offset,
+          min_epoch_lower_bound,
+          previous_applied_epoch,
+          start_offset,
+          size_estimator);
+    }
+};
+
+TEST(ctp_stm_state_test, start_ts_import_v0_serde_compat) {
+    // A v0 snapshot (no _ts_migration_boundary bytes) must decode with
+    // get_ts_migration_boundary() == nullopt.
+    ctp_stm_state_v0 old_state;
+    old_state.last_reconciled_offset = kafka::offset{42};
+
+    auto buf = serde::to_iobuf(std::move(old_state));
+    auto recovered = serde::from_iobuf<ct::ctp_stm_state>(std::move(buf));
+
+    EXPECT_FALSE(recovered.get_ts_migration_boundary().has_value());
+    EXPECT_EQ(
+      recovered.get_last_reconciled_offset().value(), kafka::offset{42});
+}
+
+TEST(ctp_stm_state_test, start_ts_import_serde_roundtrip) {
+    ct::ctp_stm_state state;
+    state.start_ts_import(kafka::offset{77}, model::offset{150});
+
+    auto buf = serde::to_iobuf(std::move(state));
+    auto recovered = serde::from_iobuf<ct::ctp_stm_state>(std::move(buf));
+
+    ASSERT_TRUE(recovered.get_ts_migration_boundary().has_value());
+    EXPECT_EQ(recovered.get_ts_migration_boundary().value(), kafka::offset{77});
+    EXPECT_EQ(
+      recovered.get_last_reconciled_offset().value(), kafka::offset{77});
+    EXPECT_EQ(
+      recovered.get_last_reconciled_log_offset().value(), model::offset{150});
 }
 
 } // anonymous namespace

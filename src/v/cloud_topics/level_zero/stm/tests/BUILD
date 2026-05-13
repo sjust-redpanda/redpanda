@@ -25,6 +25,7 @@ redpanda_cc_gtest(
         "//src/v/cloud_topics:types",
         "//src/v/cloud_topics/level_zero/stm:ctp_stm_state",
         "//src/v/cloud_topics/level_zero/stm:dl_version",
+        "//src/v/cloud_topics/level_zero/stm:size_estimator",
         "//src/v/model",
         "//src/v/random:generators",
         "//src/v/serde",

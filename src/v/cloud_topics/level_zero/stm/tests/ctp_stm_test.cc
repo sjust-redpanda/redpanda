@@ -1326,6 +1326,80 @@ TEST_F_CORO(ctp_stm_fixture, test_multiple_active_readers) {
     ASSERT_GE_CORO(live_epoch.value(), reader2_epoch.value());
 }
 
+TEST_F_CORO(ctp_stm_fixture, test_start_ts_import) {
+    co_await start();
+    co_await wait_for_leader(raft::default_timeout());
+
+    auto& leader = node(*get_leader());
+    auto leader_api = api(leader);
+
+    ASSERT_FALSE_CORO(leader_api.get_ts_migration_boundary().has_value());
+
+    auto res = co_await leader_api.start_ts_import(
+      kafka::offset{100}, model::offset{200}, model::no_timeout, as);
+    ASSERT_TRUE_CORO(res.has_value());
+
+    ASSERT_TRUE_CORO(leader_api.get_ts_migration_boundary().has_value());
+    ASSERT_EQ_CORO(
+      leader_api.get_ts_migration_boundary().value(), kafka::offset{100});
+
+    // LRO must be at least the boundary so pre-migration reads route correctly.
+    auto stm = get_stm<0>(leader);
+    ASSERT_TRUE_CORO(stm->state().get_last_reconciled_offset().has_value());
+    ASSERT_GE_CORO(
+      stm->state().get_last_reconciled_offset().value(), kafka::offset{100});
+
+    // LRLO must be set to log_boundary so the trimmer can advance immediately.
+    ASSERT_TRUE_CORO(
+      stm->state().get_last_reconciled_log_offset().has_value());
+    ASSERT_EQ_CORO(
+      stm->state().get_last_reconciled_log_offset().value(),
+      model::offset{200});
+}
+
+TEST_F_CORO(ctp_stm_fixture, test_start_ts_import_idempotent) {
+    co_await start();
+    co_await wait_for_leader(raft::default_timeout());
+
+    auto& leader = node(*get_leader());
+    auto leader_api = api(leader);
+
+    auto res1 = co_await leader_api.start_ts_import(
+      kafka::offset{100}, model::offset{200}, model::no_timeout, as);
+    ASSERT_TRUE_CORO(res1.has_value());
+    ASSERT_EQ_CORO(
+      leader_api.get_ts_migration_boundary().value(), kafka::offset{100});
+
+    // Second replication with a different boundary succeeds as a no-op:
+    // the command is applied but the state does not change.
+    auto res2 = co_await leader_api.start_ts_import(
+      kafka::offset{200}, model::offset{300}, model::no_timeout, as);
+    ASSERT_TRUE_CORO(res2.has_value());
+
+    ASSERT_EQ_CORO(
+      leader_api.get_ts_migration_boundary().value(), kafka::offset{100});
+}
+
+TEST_F_CORO(ctp_stm_fixture, test_start_ts_import_snapshot) {
+    co_await start();
+    co_await wait_for_leader(raft::default_timeout());
+
+    auto& leader = node(*get_leader());
+
+    auto res = co_await api(leader).start_ts_import(
+      kafka::offset{50}, model::offset{100}, model::no_timeout, as);
+    ASSERT_TRUE_CORO(res.has_value());
+
+    auto stm = get_stm<0>(leader);
+    ct::ctp_stm_accessor a;
+    auto snapshot = co_await a.take_snapshot(*stm);
+    co_await a.install_snapshot(*stm, std::move(snapshot));
+
+    ASSERT_TRUE_CORO(api(leader).get_ts_migration_boundary().has_value());
+    ASSERT_EQ_CORO(
+      api(leader).get_ts_migration_boundary().value(), kafka::offset{50});
+}
+
 TEST_F_CORO(ctp_stm_fixture, test_reset_state_cmd) {
     // Verify that replicating a reset_state_cmd replaces the STM's in-memory
     // state wholesale. The test first drives the STM into a non-trivial state
