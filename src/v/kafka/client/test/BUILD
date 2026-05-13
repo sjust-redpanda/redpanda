@@ -506,6 +506,7 @@ redpanda_cc_gtest(
         "cluster_test.cc",
     ],
     deps = [
+        "//src/v/config",
         "//src/v/cluster:client_quota_backend",
         "//src/v/cluster:cluster_utils",
         "//src/v/cluster:controller_log_limiter",

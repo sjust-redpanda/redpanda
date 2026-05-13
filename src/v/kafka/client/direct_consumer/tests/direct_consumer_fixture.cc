@@ -354,8 +354,8 @@ void consumer_fixture::wait_for_visible_leadership_shuffle(
 application* consumer_fixture::create_node_application(model::node_id node_id) {
     return cluster_test_fixture::create_node_application(
       node_id,
-      9092,
-      11000,
+      cluster_test_default_kafka_port(),
+      cluster_test_default_rpc_port(),
       std::nullopt,
       std::nullopt,
       configure_node_id::yes,

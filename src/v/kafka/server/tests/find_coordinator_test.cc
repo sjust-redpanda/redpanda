@@ -42,7 +42,7 @@ void test_single_key_success(
     expected_response.error_code = kafka::error_code::none;
     expected_response.node_id = model::node_id(1);
     expected_response.host = "127.0.0.1";
-    expected_response.port = 9092;
+    expected_response.port = config::node().kafka_api()[0].address.port();
 
     test_single_key(fixture, request_type, expected_response);
 }
@@ -107,7 +107,7 @@ void test_multi_key_success(
     expected_response.error_code = kafka::error_code::none;
     expected_response.node_id = model::node_id(1);
     expected_response.host = "127.0.0.1";
-    expected_response.port = 9092;
+    expected_response.port = config::node().kafka_api()[0].address.port();
     test_multi_key(fixture, request_type, expected_response);
 }
 
