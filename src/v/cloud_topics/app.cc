@@ -271,6 +271,18 @@ ss::future<> app::wire_up_notifications() {
               });
         });
     }
+    manager.local().on_ctp_partition_leader(
+      [](
+        const model::ntp&,
+        const model::topic_id_partition&,
+        ss::optimized_optional<ss::lw_shared_ptr<cluster::partition>>&
+          partition) noexcept {
+          if (!partition) {
+              return;
+          }
+          ssx::background = (*partition)->init_ts_ct_migration().handle_exception(
+            [](std::exception_ptr) noexcept {});
+      });
     co_await housekeeper_manager.invoke_on_all([this](auto& hm) {
         manager.local().on_ctp_partition_leader(
           [&hm](
