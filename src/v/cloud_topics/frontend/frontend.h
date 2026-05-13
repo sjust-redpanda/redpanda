@@ -145,6 +145,21 @@ public:
       std::optional<std::reference_wrapper<ss::abort_source>> as,
       ss::shared_ptr<kafka::write_at_offset_stm> stm);
 
+    enum class read_path : int8_t {
+        // start_offset is below the ts_migration_boundary: read pre-migration
+        // data from tiered storage via make_ts_passthrough_reader.
+        ts_passthrough,
+        // start_offset is above any boundary and within the reconciled range:
+        // read from the L1 metastore.
+        l1,
+        // default: read placeholder batches from the local L0 log.
+        l0,
+    };
+
+    /// Determine which read path make_reader will use for the given offset.
+    /// Exposed for testing; production code should call make_reader directly.
+    read_path select_read_path(kafka::offset start_offset) const;
+
     ss::future<storage::translating_reader>
     make_reader(cloud_topic_log_reader_config cfg);
 
