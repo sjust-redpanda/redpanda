@@ -26,10 +26,19 @@ cloud_topics_manager::cloud_topics_manager(
   ss::sharded<cluster::partition_manager>* pm,
   ss::sharded<raft::group_manager>* gm,
   ss::sharded<cluster::topic_table>* tt)
-  : partition_manager_(pm)
-  , topic_table_(tt)
+  : topic_table_(tt)
   , notifier_(
-      cluster::partition_change_notifier_impl::make_default(*gm, *pm, *tt)) {}
+      cluster::partition_change_notifier_impl::make_default(*gm, *pm, *tt))
+  , partition_lookup_([pm](const model::ntp& ntp) {
+      return pm->local().get(ntp);
+  }) {}
+
+cloud_topics_manager::cloud_topics_manager(
+  std::unique_ptr<cluster::partition_change_notifier> notifier,
+  partition_lookup_fn_t partition_lookup)
+  : topic_table_(nullptr)
+  , notifier_(std::move(notifier))
+  , partition_lookup_(std::move(partition_lookup)) {}
 
 void cloud_topics_manager::on_ctp_partition_leader(
   notification_cb_t cb) noexcept {
@@ -140,7 +149,7 @@ void cloud_topics_manager::on_leadership_change(
   bool is_leader) noexcept {
     ss::optimized_optional<ss::lw_shared_ptr<cluster::partition>> partition;
     if (is_leader) {
-        partition = partition_manager_->local().get(ntp);
+        partition = partition_lookup_(ntp);
     }
     if (model::l1_metastore_nt == model::topic_namespace_view(ntp)) {
         for (const auto& cb : l1_callbacks_) {
@@ -159,7 +168,7 @@ void cloud_topics_manager::on_leadership_or_properties_change(
   bool is_leader) noexcept {
     ss::optimized_optional<ss::lw_shared_ptr<cluster::partition>> partition;
     if (is_leader) {
-        partition = partition_manager_->local().get(ntp);
+        partition = partition_lookup_(ntp);
     }
     if (model::l1_metastore_nt != model::topic_namespace_view(ntp)) {
         for (const auto& cb : ctp_prop_change_callbacks_) {
