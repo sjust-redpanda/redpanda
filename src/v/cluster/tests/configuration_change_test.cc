@@ -12,6 +12,7 @@
 #include "cluster/types.h"
 #include "model/metadata.h"
 #include "test_utils/boost_fixture.h"
+#include "test_utils/test_env.h"
 #include "utils/unresolved_address.h"
 
 #include <seastar/core/sstring.hh>
@@ -37,13 +38,15 @@ FIXTURE_TEST(test_updating_node_rpc_ip_address, cluster_test_fixture) {
       .get();
 
     remove_node_application(node_2);
-    // Change RPC port from 11000 to 13000
+    // Change RPC port to a new dynamically allocated port
+    const auto new_rpc_base = static_cast<int>(test_env::find_free_port());
     info("Restarting node {} with changed configuration", node_2);
-    node_app_2 = create_node_application(node_2, 9092, 13000);
+    node_app_2 = create_node_application(
+      node_2, cluster_test_default_kafka_port(), new_rpc_base);
 
     tests::cooperative_spin_wait_with_timeout(
       5s,
-      [this, node_0, node_1, node_2] {
+      [this, node_0, node_1, node_2, new_rpc_base] {
           auto meta = get_local_cache(node_0).get_node_metadata(node_2);
           if (!meta) {
               return false;
@@ -59,7 +62,8 @@ FIXTURE_TEST(test_updating_node_rpc_ip_address, cluster_test_fixture) {
           }
 
           return meta.value().broker.rpc_address()
-                 == net::unresolved_address("127.0.0.1", 13002);
+                 == net::unresolved_address(
+                   "127.0.0.1", new_rpc_base + node_2());
       })
       .get();
 }
@@ -72,17 +76,23 @@ FIXTURE_TEST(test_single_node_update, cluster_test_fixture) {
     wait_for_controller_leadership(node_id).get();
 
     remove_node_application(node_id);
-    // Change kafka port from 9092 to 15000
-    node = create_node_application(node_id, 15000, 13000);
+    // Change kafka port to a new dynamically allocated port
+    const auto new_kafka_base = static_cast<int>(test_env::find_free_port());
+    const auto new_rpc_base2 = static_cast<int>(test_env::find_free_port());
+    node = create_node_application(node_id, new_kafka_base, new_rpc_base2);
 
-    tests::cooperative_spin_wait_with_timeout(5s, [this, node_id] {
-        auto meta = get_local_cache(node_id).get_node_metadata(node_id);
-        info("updated broker {}", meta);
-        if (!meta) {
-            return false;
-        }
+    tests::cooperative_spin_wait_with_timeout(
+      5s,
+      [this, node_id, new_kafka_base] {
+          auto meta = get_local_cache(node_id).get_node_metadata(node_id);
+          info("updated broker {}", meta);
+          if (!meta) {
+              return false;
+          }
 
-        return meta->broker.kafka_advertised_listeners()[0].address
-               == net::unresolved_address("127.0.0.1", 15000);
-    }).get();
+          return meta->broker.kafka_advertised_listeners()[0].address
+                 == net::unresolved_address(
+                   "127.0.0.1", new_kafka_base + node_id());
+      })
+      .get();
 }
