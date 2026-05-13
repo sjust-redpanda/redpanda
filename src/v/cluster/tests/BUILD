@@ -62,6 +62,7 @@ redpanda_test_cc_library(
         "//src/v/redpanda/tests:fixture",
         "//src/v/resource_mgmt:cpu_scheduling",
         "//src/v/test_utils:async",
+        "//src/v/test_utils:test_env",
         "//src/v/test_utils:test_macros",
         "@abseil-cpp//absl/container:flat_hash_map",
         "@seastar",
