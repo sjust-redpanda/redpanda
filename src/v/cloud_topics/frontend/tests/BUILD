@@ -15,6 +15,7 @@ redpanda_cc_gtest(
         "//src/v/cloud_topics/frontend",
         "//src/v/cloud_topics/level_zero/common:extent_meta",
         "//src/v/cloud_topics/level_zero/stm:ctp_stm",
+        "//src/v/cloud_topics/level_zero/stm:ctp_stm_api",
         "//src/v/cluster:data_migration_table",
         "//src/v/cluster:feature_backend",
         "//src/v/cluster:fwd",

@@ -14,6 +14,7 @@
 #include "cloud_topics/frontend/frontend.h"
 #include "cloud_topics/level_zero/common/extent_meta.h"
 #include "cloud_topics/level_zero/stm/ctp_stm.h"
+#include "cloud_topics/level_zero/stm/ctp_stm_api.h"
 #include "gmock/gmock.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
@@ -387,4 +388,89 @@ TEST_F(frontend_fixture, test_advance_epoch) {
     EXPECT_EQ(final_info.max_applied_epoch, cluster_epoch(15));
     EXPECT_EQ(final_info.estimated_inactive_epoch, cluster_epoch(9));
     EXPECT_EQ(final_info, frontend.get_epoch_info());
+}
+
+// Helper: create a tiered_cloud topic and return the leader partition.
+static ss::lw_shared_ptr<cluster::partition>
+make_tiered_cloud_partition(frontend_fixture& fx, const model::topic& topic) {
+    model::ntp ntp(model::kafka_namespace, topic, 0);
+    cluster::topic_properties props;
+    props.storage_mode = model::redpanda_storage_mode::tiered_cloud;
+    props.shadow_indexing = model::shadow_indexing_mode::disabled;
+    fx.add_topic({model::kafka_namespace, topic}, 1, props).get();
+    fx.wait_for_leader(ntp).get();
+    return fx.app.partition_manager.local().get(ntp);
+}
+
+// Without a ts_migration_boundary the passthrough path must not be selected.
+TEST_F(frontend_fixture, passthrough_reader_disabled_without_boundary) {
+    auto partition = make_tiered_cloud_partition(*this, model::topic{"no_bound"});
+    cloud_topics::frontend fe(partition, _data_plane.get());
+
+    // No start_ts_import_cmd replicated: boundary is nullopt.
+    EXPECT_EQ(
+      fe.select_read_path(kafka::offset{0}),
+      cloud_topics::frontend::read_path::l0);
+    EXPECT_EQ(
+      fe.select_read_path(kafka::offset{100}),
+      cloud_topics::frontend::read_path::l0);
+}
+
+// With a boundary set, start_offset <= boundary must route to ts_passthrough.
+TEST_F(frontend_fixture, passthrough_reader_routes_pre_migration_offset) {
+    auto partition = make_tiered_cloud_partition(*this, model::topic{"pre_bound"});
+    cloud_topics::frontend fe(partition, _data_plane.get());
+
+    auto stm
+      = partition->raft()
+          ->stm_manager()
+          ->get<cloud_topics::ctp_stm>();
+    ASSERT_TRUE(stm != nullptr);
+    cloud_topics::ctp_stm_api api{stm};
+    ss::abort_source as;
+    auto res = api
+                 .start_ts_import(
+                   kafka::offset{50},
+                   model::offset::min(),
+                   model::no_timeout,
+                   as)
+                 .get();
+    ASSERT_TRUE(res.has_value()) << "start_ts_import must succeed on leader";
+
+    EXPECT_EQ(
+      fe.select_read_path(kafka::offset{30}),
+      cloud_topics::frontend::read_path::ts_passthrough);
+    EXPECT_EQ(
+      fe.select_read_path(kafka::offset{50}),
+      cloud_topics::frontend::read_path::ts_passthrough);
+}
+
+// With a boundary set, start_offset > boundary must NOT route to passthrough.
+TEST_F(frontend_fixture, passthrough_reader_not_invoked_above_boundary) {
+    auto partition = make_tiered_cloud_partition(
+      *this, model::topic{"above_bound"});
+    cloud_topics::frontend fe(partition, _data_plane.get());
+
+    auto stm
+      = partition->raft()
+          ->stm_manager()
+          ->get<cloud_topics::ctp_stm>();
+    ASSERT_TRUE(stm != nullptr);
+    cloud_topics::ctp_stm_api api{stm};
+    ss::abort_source as;
+    auto res = api
+                 .start_ts_import(
+                   kafka::offset{50},
+                   model::offset::min(),
+                   model::no_timeout,
+                   as)
+                 .get();
+    ASSERT_TRUE(res.has_value()) << "start_ts_import must succeed on leader";
+
+    EXPECT_EQ(
+      fe.select_read_path(kafka::offset{51}),
+      cloud_topics::frontend::read_path::l0);
+    EXPECT_EQ(
+      fe.select_read_path(kafka::offset{100}),
+      cloud_topics::frontend::read_path::l0);
 }
