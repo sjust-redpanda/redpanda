@@ -1079,6 +1079,7 @@ redpanda_cc_btest(
         "//src/v/model",
         "//src/v/raft",
         "//src/v/test_utils:seastar_boost",
+        "//src/v/test_utils:test_env",
         "//src/v/utils:unresolved_address",
         "@boost//:test",
         "@fmt",
