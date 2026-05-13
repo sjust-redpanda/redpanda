@@ -20,6 +20,8 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 
+#include <functional>
+
 namespace cluster {
 class partition;
 class partition_manager;
@@ -55,10 +57,23 @@ public:
       ss::optimized_optional<ss::lw_shared_ptr<cluster::partition>>&
         partition) noexcept>;
 
+    using partition_lookup_fn_t
+      = std::function<ss::lw_shared_ptr<cluster::partition>(const model::ntp&)>;
+
     cloud_topics_manager(
       ss::sharded<cluster::partition_manager>*,
       ss::sharded<raft::group_manager>*,
       ss::sharded<cluster::topic_table>*);
+
+    /// \brief Test-seam constructor: injectable notifier and partition lookup.
+    ///
+    /// Allows unit tests to drive notification dispatch without a real
+    /// partition_manager or topic_table.  Always provide topic_cfg in the
+    /// partition_state passed to the notifier callback to avoid a null
+    /// topic_table_ dereference.
+    cloud_topics_manager(
+      std::unique_ptr<cluster::partition_change_notifier> notifier,
+      partition_lookup_fn_t partition_lookup);
 
     // Register for notifications to kafka namespaced partitions which have
     // cloud topics enabled. These partitions have a l0::ctp_stm attached to
@@ -128,9 +143,9 @@ private:
       const model::topic_id_partition& tidp,
       bool is_leader) noexcept;
 
-    ss::sharded<cluster::partition_manager>* partition_manager_;
     ss::sharded<cluster::topic_table>* topic_table_;
     std::unique_ptr<cluster::partition_change_notifier> notifier_;
+    partition_lookup_fn_t partition_lookup_;
     std::vector<notification_cb_t> ctp_callbacks_;
     std::vector<notification_cb_t> ctp_prop_change_callbacks_;
     std::vector<notification_cb_t> l1_callbacks_;
