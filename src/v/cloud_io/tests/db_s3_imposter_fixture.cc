@@ -19,6 +19,7 @@
 #include "lsm/io/disk_persistence.h"
 #include "lsm/lsm.h"
 #include "ssx/mutex.h"
+#include "test_utils/test_env.h"
 #include "utils/unresolved_address.h"
 
 #include <seastar/net/socket_defs.hh>
@@ -32,7 +33,7 @@ static ss::logger dbfixt_log("db_s3_imposter"); // NOLINT
 
 namespace {
 
-constexpr uint16_t httpd_port = 4442;
+const uint16_t httpd_port = test_env::find_free_port();
 constexpr const char* httpd_host = "localhost";
 constexpr const char* httpd_ip = "127.0.0.1";
 constexpr size_t default_max_keys = 1000;

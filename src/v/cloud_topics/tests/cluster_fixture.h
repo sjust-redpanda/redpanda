@@ -20,6 +20,7 @@
 #include "model/fundamental.h"
 #include "model/namespace.h"
 #include "raft/state_machine_manager.h"
+#include "test_utils/test_env.h"
 
 using tests::kafka_consume_transport;
 using tests::kafka_produce_transport;
@@ -41,25 +42,34 @@ public:
         }
     }
     void add_node(cloud_topics::test_fixture_cfg ct_test_cfg = {}) {
-        static constexpr int kafka_port_base = 9092;
-        static constexpr int rpc_port_base = 11000;
+        auto node_id = next_node_id();
+        auto kafka_port = static_cast<int16_t>(test_env::find_free_port());
+        auto rpc_port = static_cast<int16_t>(test_env::find_free_port());
+        if (node_id == model::node_id{0}) {
+            _seed_rpc_port = rpc_port;
+        }
         auto [s3_conf, a_conf, cs_conf] = get_cloud_storage_configurations(
           httpd_host_name, httpd_port_number());
-        create_node_application(
-          next_node_id(),
-          kafka_port_base,
-          rpc_port_base,
+        std::vector<config::seed_server> seeds;
+        if (node_id != model::node_id{0}) {
+            seeds.push_back(
+              {.addr = net::unresolved_address("127.0.0.1", _seed_rpc_port)});
+        }
+        cluster_test_fixture::add_node(
+          node_id,
+          kafka_port,
+          rpc_port,
           std::nullopt,
           std::nullopt,
+          std::move(seeds),
           configure_node_id::yes,
           empty_seed_starts_cluster::yes,
           s3_conf,
           std::move(*a_conf),
           cs_conf,
-          /*legacy_upload_mode_enabled=*/true,
+          /*enable_legacy_upload_mode=*/true,
           /*iceberg_enabled=*/false,
           /*cluster_linking_enabled=*/false,
-          /*seed_node_id=*/model::node_id{0},
           ct_test_cfg);
     }
 
@@ -105,6 +115,9 @@ public:
         return leader_p->raft()->stm_manager()->get<l1::stm>();
     }
     std::vector<ss::noncopyable_function<void()>> cleanup;
+
+private:
+    int16_t _seed_rpc_port{0};
 };
 
 } // namespace cloud_topics
