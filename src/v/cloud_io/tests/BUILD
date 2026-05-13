@@ -37,6 +37,7 @@ redpanda_test_cc_library(
         "//src/v/container:chunked_vector",
         "//src/v/http:utils",
         "//src/v/http/tests:utils",
+        "//src/v/test_utils:test_env",
         "//src/v/utils:uuid",
         "@abseil-cpp//absl/container:btree",
         "@abseil-cpp//absl/container:flat_hash_set",
@@ -55,6 +56,7 @@ redpanda_test_cc_library(
     implementation_deps = [
         "//src/v/http:utils",
         "//src/v/lsm/io:disk_persistence",
+        "//src/v/test_utils:test_env",
         "//src/v/utils:unresolved_address",
         "@abseil-cpp//absl/container:btree",
     ],

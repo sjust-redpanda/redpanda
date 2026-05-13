@@ -13,6 +13,7 @@
 #include "cloud_storage_clients/client.h"
 #include "http/tests/utils.h"
 #include "http/utils.h"
+#include "test_utils/test_env.h"
 
 #include <seastar/net/socket_defs.hh>
 
@@ -25,7 +26,10 @@ using namespace std::chrono_literals;
 inline ss::logger fixt_log("s3_imposter_fixture"); // NOLINT
 
 /// For http_imposter to run this binary with a unique port
-uint16_t unit_test_httpd_port_number() { return 4442; }
+uint16_t unit_test_httpd_port_number() {
+    static const uint16_t port = test_env::find_free_port();
+    return port;
+}
 
 namespace {
 
