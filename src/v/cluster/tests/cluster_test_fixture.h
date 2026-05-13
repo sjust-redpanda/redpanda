@@ -22,6 +22,7 @@
 #include "redpanda/tests/fixture.h"
 #include "resource_mgmt/cpu_scheduling.h"
 #include "test_utils/async.h"
+#include "test_utils/test_env.h"
 #include "test_utils/test_macros.h"
 
 #include <seastar/core/metrics_api.hh>
@@ -84,6 +85,16 @@ get_cloud_storage_configurations(std::string_view hosthame, uint16_t port) {
       ss::make_lw_shared<archival::configuration>(std::move(a_conf)),
       c_conf);
 }
+
+inline int cluster_test_default_kafka_port() {
+    static const int port = test_env::find_free_port();
+    return port;
+}
+inline int cluster_test_default_rpc_port() {
+    static const int port = test_env::find_free_port();
+    return port;
+}
+
 class cluster_test_fixture {
 public:
     using fixture_ptr = std::unique_ptr<redpanda_thread_fixture>;
@@ -209,8 +220,8 @@ public:
 
     application* create_node_application(
       model::node_id node_id,
-      int kafka_port_base = 9092,
-      int rpc_port_base = 11000,
+      int kafka_port_base = cluster_test_default_kafka_port(),
+      int rpc_port_base = cluster_test_default_rpc_port(),
       std::optional<int> proxy_port_base = std::nullopt,
       std::optional<int> schema_reg_port_base = std::nullopt,
       configure_node_id use_node_id = configure_node_id::yes,
@@ -265,8 +276,8 @@ public:
       std::optional<cloud_storage::configuration> cloud_cfg = std::nullopt) {
         return create_node_application(
           node_id,
-          9092,
-          11000,
+          cluster_test_default_kafka_port(),
+          cluster_test_default_rpc_port(),
           std::nullopt,
           std::nullopt,
           use_node_id,
