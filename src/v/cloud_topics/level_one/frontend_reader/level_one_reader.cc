@@ -48,7 +48,7 @@ level_one_log_reader_impl::level_one_log_reader_impl(
   , _io(io_interface)
   , _probe(probe)
   , _log(cd_log, fmt::format("[{}/{}/{}]", fmt::ptr(this), _ntp, _tidp)) {
-    vlog(_log.debug, "New reader created {}", _config);
+    vlog(_log.info, "New L1 reader created {}", _config);
 }
 
 /*
@@ -234,10 +234,10 @@ ss::future<> level_one_log_reader_impl::fill_lookahead_buffer(
         switch (response.error()) {
         case l1::metastore::errc::out_of_range:
             vlog(
-              _log.debug, "No L1 objects found at offset {} or later", offset);
+              _log.info, "No L1 objects found at offset {} or later", offset);
             co_return;
         case l1::metastore::errc::missing_ntp:
-            vlog(_log.debug, "Partition not tracked in metastore");
+            vlog(_log.info, "Partition {} not tracked in L1 metastore", _tidp);
             co_return;
         default:
             throw std::runtime_error(_log.format(

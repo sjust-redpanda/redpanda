@@ -253,12 +253,31 @@ frontend::select_read_path(kafka::offset start_offset) const {
                             ? _ctp_stm_api->get_ts_migration_boundary()
                             : std::nullopt;
     if (ts_bound.has_value() && start_offset <= *ts_bound) {
+        vlog(
+          cd_log.info,
+          "[{}] select_read_path: start={} ts_bound={} -> ts_passthrough",
+          _partition->ntp(),
+          start_offset,
+          *ts_bound);
         return read_path::ts_passthrough;
     }
     const auto lro = _ctp_stm_api->get_last_reconciled_offset();
     if (lro > kafka::offset::min() && start_offset <= lro) {
+        vlog(
+          cd_log.info,
+          "[{}] select_read_path: start={} lro={} -> l1",
+          _partition->ntp(),
+          start_offset,
+          lro);
         return read_path::l1;
     }
+    vlog(
+      cd_log.info,
+      "[{}] select_read_path: start={} lro={} ts_bound={} -> l0",
+      _partition->ntp(),
+      start_offset,
+      lro,
+      ts_bound ? fmt::to_string(*ts_bound) : "none");
     return read_path::l0;
 }
 
@@ -277,7 +296,7 @@ frontend::make_reader(cloud_topic_log_reader_config cfg) {
     const auto level_one = path == read_path::l1;
 
     vlog(
-      cd_log.debug,
+      cd_log.info,
       "Building {} reader for {} from {} lro {}",
       (level_one ? "L1" : "L0"),
       _partition->ntp(),
@@ -1386,10 +1405,11 @@ frontend::coarse_grained_timequery_result::format_to(fmt::iterator it) const {
 ss::future<storage::translating_reader>
 frontend::make_ts_passthrough_reader(cloud_topic_log_reader_config cfg) const {
     vlog(
-      cd_log.debug,
-      "Building TS passthrough reader for {} from {}",
+      cd_log.info,
+      "Building TS passthrough reader for {} from {} max {}",
       _partition->ntp(),
-      cfg.start_offset);
+      cfg.start_offset,
+      cfg.max_offset);
     cloud_storage::cloud_log_reader_config reader_cfg{
       cfg.start_offset,
       cfg.max_offset,
