@@ -317,11 +317,20 @@ std::expected<std::monostate, stm_update_error> add_objects_update::can_apply(
     chunked_hash_map<model::topic_id_partition, kafka::offset>
       corrected_next_offsets;
     for (const auto& [tidp, extents] : new_extents) {
-        // TODO: maybe we need some mount operation that adopts a partition log
-        // and allows it to start a specific offset.
         auto p_state = state.partition_state(tidp);
+        // For a partition not yet registered in L1, accept the first extents
+        // starting at whatever offset they arrive at. TS-migrated partitions
+        // begin CT data at migration_boundary+1 (a non-zero Kafka offset) and
+        // must be adopted without requiring them to start at 0.
+        if (!p_state) {
+            vlog(
+              cd_log.info,
+              "Registering new partition {} in L1 at base_offset {}",
+              tidp,
+              extents.begin()->base_offset);
+        }
         auto expected_next = p_state ? p_state->get().next_offset
-                                     : kafka::offset{0};
+                                     : extents.begin()->base_offset;
 
         if (extents.begin()->base_offset != expected_next) {
             // If the start of the new extents for this partition aren't
@@ -470,7 +479,7 @@ add_objects_update::apply(state& state) {
     for (const auto& [tidp, extents] : extents_by_tp) {
         auto p_state = state.partition_state(tidp);
         auto expected_next = p_state ? p_state->get().next_offset
-                                     : kafka::offset{0};
+                                     : extents.begin()->base_offset;
         if (extents.begin()->base_offset == expected_next) {
             auto& t_state = state.topic_to_state[tidp.topic_id];
             auto& p_state = t_state.pid_to_state[tidp.partition];
