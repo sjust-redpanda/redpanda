@@ -143,11 +143,12 @@ level_zero_log_reader_impl::read_some(
     auto log_read_metadata = co_await fetch_metadata(log_read_cfg, deadline);
     if (log_read_metadata.empty()) {
         vlog(
-          _log.debug,
+          _log.info,
           "No L0 meta batches fetched from the underlying partition, "
-          "start offset: {}, max offset: {}",
+          "start offset: {}, max offset: {}, committed_kafka: {}",
           log_read_cfg.start_offset,
-          log_read_cfg.max_offset);
+          log_read_cfg.max_offset,
+          committed_kafka);
         set_end_of_stream();
         co_return model::record_batch_reader::storage_t{};
     }
