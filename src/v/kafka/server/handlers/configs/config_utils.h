@@ -357,18 +357,17 @@ struct batch_max_bytes_limits_validator {
 //   tiered -> local: Permitted (with caution)
 //   unset -> local: Permitted (with caution)
 //   unset -> tiered: Permitted
-//   cloud -> tiered_cloud: Permitted
-//   tiered_cloud -> cloud: Permitted
+//   tiered -> cloud: Permitted (TS migration; sets TS import boundary)
+//   tiered -> tiered_cloud: Permitted (TS migration; sets TS import boundary)
+//   cloud <-> tiered_cloud: Permitted
 // Not permitted:
 //   local -> unset: Not permitted
 //   local -> cloud: Not permitted
 //   tiered -> unset: Not permitted
-//   tiered -> cloud: Not permitted
 //   cloud -> local: Not permitted
 //   cloud -> tiered: Not permitted
 //   unset <-> cloud: Not permitted (cloud requires explicit choice)
 //   local -> tiered_cloud: Not permitted
-//   tiered -> tiered_cloud: Not permitted
 //   tiered_cloud -> local: Not permitted
 //   tiered_cloud -> tiered: Not permitted
 //   unset <-> tiered_cloud: Not permitted
@@ -396,6 +395,15 @@ inline bool is_storage_mode_transition_permitted(
         return true;
     }
     if (from == sm::unset && to == sm::tiered) {
+        return true;
+    }
+
+    // tiered -> cloud/tiered_cloud: migration from tiered storage to cloud
+    // topics; the TS import boundary is recorded during the transition.
+    if (from == sm::tiered && to == sm::cloud) {
+        return true;
+    }
+    if (from == sm::tiered && to == sm::tiered_cloud) {
         return true;
     }
 
