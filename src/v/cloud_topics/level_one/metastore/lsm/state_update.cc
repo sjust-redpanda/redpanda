@@ -660,8 +660,6 @@ add_objects_db_update::build_rows(
     chunked_hash_map<model::topic_id_partition, metadata_row_value>
       verified_meta_vals;
     for (const auto& [tidp, extents] : new_extents_by_tp) {
-        // TODO: maybe we need some mount operation that adopts a partition log
-        // and allows it to start a specific offset.
         auto meta_res = co_await state.get_metadata(tidp);
         if (!meta_res.has_value()) {
             co_return std::unexpected(wrap_read_err(
@@ -670,7 +668,12 @@ add_objects_db_update::build_rows(
               tidp));
         }
         auto opt = meta_res.value();
-        auto expected_next = opt ? opt->next_offset : kafka::offset{0};
+        // For a partition not yet registered in L1, accept extents starting at
+        // whatever offset they arrive at. TS-migrated partitions begin CT data
+        // at migration_boundary+1 (a non-zero Kafka offset) and must be adopted
+        // without requiring them to start at 0.
+        auto expected_next = opt ? opt->next_offset
+                                 : extents.begin()->base_offset;
 
         if (extents.begin()->base_offset != expected_next) {
             // If the start of the new extents for this partition aren't
@@ -689,7 +692,8 @@ add_objects_db_update::build_rows(
             extent_size_sum += extent.len;
         }
         verified_meta_vals[tidp] = metadata_row_value{
-          .start_offset = opt ? opt->start_offset : kafka::offset{0},
+          .start_offset = opt ? opt->start_offset
+                              : extents.begin()->base_offset,
           .next_offset = kafka::next_offset(extents.rbegin()->last_offset),
           .compaction_epoch = opt ? opt->compaction_epoch
                                   : partition_state::compaction_epoch_t{0},
