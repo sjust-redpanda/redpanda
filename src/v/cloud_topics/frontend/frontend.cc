@@ -207,7 +207,21 @@ kafka::offset frontend::local_start_offset() const {
 }
 
 kafka::offset frontend::start_offset() const {
-    return _ctp_stm_api->get_start_offset();
+    const auto ct_start = _ctp_stm_api->get_start_offset();
+    const auto ts_bound = _ctp_stm_api->get_ts_migration_boundary();
+    // kafka::offset::min() means "fresh CT partition, no prior TS data":
+    // there is no TS range to expose, so fall through to ct_start.
+    if (!ts_bound.has_value() || *ts_bound == kafka::offset::min()) {
+        return ct_start;
+    }
+    // TS-migrated partition: phase-1 data in object storage is still
+    // accessible via the TS passthrough reader (offsets 0..ts_bound).
+    // The consumer-visible start must reflect the TS range, not just the
+    // CT range, so that Kafka clients can fetch pre-migration records.
+    const auto ts_override = _partition->kafka_start_offset_override();
+    const auto ts_start = ts_override ? model::offset_cast(*ts_override)
+                                      : kafka::offset{0};
+    return std::min(ct_start, ts_start);
 }
 
 ss::future<std::expected<kafka::offset, frontend_errc>>
