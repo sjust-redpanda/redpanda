@@ -12,11 +12,14 @@
 #include "partition_proxy.h"
 
 #include "cloud_topics/frontend/frontend.h"
+#include "cloud_topics/level_zero/stm/ctp_stm.h"
+#include "cloud_topics/level_zero/stm/ctp_stm_api.h"
 #include "cloud_topics/read_replica/stm.h"
 #include "cloud_topics/state_accessors.h"
 #include "cluster/partition_manager.h"
 #include "kafka/data/cloud_topic_partition.h"
 #include "kafka/data/cloud_topic_read_replica.h"
+#include "kafka/data/logger.h"
 #include "kafka/data/replicated_partition.h"
 
 namespace kafka {
@@ -28,7 +31,33 @@ partition_proxy make_with_impl(Args&&... args) {
 
 partition_proxy
 make_partition_proxy(const ss::lw_shared_ptr<cluster::partition>& partition) {
-    auto is_ct = partition->get_ntp_config().cloud_topic_enabled();
+    // Use the replicated ctp_stm migration boundary as the authoritative
+    // signal for CT routing. The local NTP config is an eventually-consistent
+    // projection of controller state: by the time alter-config returns to the
+    // client the config has been applied to the topic_table but the reconcile
+    // fiber may not yet have propagated it to this partition's NTP config, and
+    // a newly-elected replica may not have seen the delta at all.  The STM
+    // boundary, being Raft-replicated, is correct on every replica regardless.
+    //
+    // For partitions created in CT mode from the start (no prior tiered-storage
+    // data) there is no migration and no boundary; fall back to
+    // cloud_topic_enabled() which is stable by the time such a partition exists.
+    auto ctp = partition->raft()->stm_manager()->get<cloud_topics::ctp_stm>();
+    std::optional<kafka::offset> boundary;
+    if (ctp) {
+        boundary = cloud_topics::ctp_stm_api{ctp}.get_ts_migration_boundary();
+    }
+    bool const is_ct = boundary.has_value()
+                       || partition->get_ntp_config().cloud_topic_enabled();
+    vlog(
+      kdlog.info,
+      "[{}] routing: ctp_stm={} migration_boundary={} cloud_topic_enabled={} "
+      "-> is_ct={}",
+      partition->ntp(),
+      ctp ? "present" : "absent",
+      boundary ? fmt::to_string(*boundary) : "none",
+      partition->get_ntp_config().cloud_topic_enabled(),
+      is_ct);
     auto is_rr = partition->is_read_replica_mode_enabled();
     if (is_ct) {
         auto ct_state = partition->get_cloud_topics_state();
