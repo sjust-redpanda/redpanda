@@ -183,7 +183,7 @@ void reconciler<Clock>::attach_source(ss::shared_ptr<source> src) {
         return;
     }
     vlog(
-      lg.debug,
+      lg.info,
       "Attaching partition {} (tidp: {})",
       src->ntp(),
       src->topic_id_partition());
@@ -328,7 +328,7 @@ ss::future<> reconciler<Clock>::reconcile() {
         sources.push_back(src);
     }
     vlog(
-      lg.debug,
+      lg.info,
       "Reconciliation loop tick with {} attached partitions",
       sources.size());
     if (sources.empty()) {
@@ -448,6 +448,15 @@ ss::future<size_t> reconciler<Clock>::reconcile_source_set(
     {
         chunked_vector<ss::shared_ptr<source>> pending;
         for (auto& src : sources) {
+            auto lro = src->last_reconciled_offset();
+            auto lag = src->pending_offset_lag();
+            vlog(
+              lg.info,
+              "Source {}: lro={} lag={} has_pending={}",
+              src->ntp(),
+              lro,
+              lag,
+              src->has_pending_data());
             if (src->has_pending_data()) {
                 pending.push_back(std::move(src));
             }
@@ -455,6 +464,7 @@ ss::future<size_t> reconciler<Clock>::reconcile_source_set(
         sources = std::move(pending);
     }
     if (sources.empty()) {
+        vlog(lg.info, "No sources with pending data, skipping reconciliation");
         co_return 0;
     }
 
@@ -773,10 +783,11 @@ reconciler<Clock>::add_source_to_object(
   ss::shared_ptr<source> src,
   kafka::offset start_offset) {
     vlog(
-      lg.debug,
-      "Processing partition {} with LRO {}",
+      lg.info,
+      "Processing partition {} with LRO {} start_offset {}",
       src->ntp(),
-      src->last_reconciled_offset());
+      src->last_reconciled_offset(),
+      start_offset);
 
     auto reader = co_await src->make_reader(
       source::reader_config{
@@ -789,14 +800,14 @@ reconciler<Clock>::add_source_to_object(
 
     if (!metadata.has_value()) {
         vlog(
-          lg.debug,
+          lg.info,
           "No batches found for partition {}",
           src->topic_id_partition());
         co_return std::nullopt;
     }
 
     vlog(
-      lg.debug,
+      lg.info,
       "Adding partition {} to L1 object with offsets {}~{} starting at offset "
       "{}",
       src->topic_id_partition(),
@@ -923,15 +934,28 @@ reconciler<Clock>::commit_objects(
     if (!add_objects_result.has_value()) {
         // TODO: The objects have been uploaded. The reconciler could
         //       attempt cleanup (or notify a cleanup subsystem).
+        vlog(
+          lg.info,
+          "Failed to add objects to the L1 metastore: {}",
+          add_objects_result.error());
         co_return std::unexpected(reconcile_error(
           "Failed to add objects to the L1 metastore: {}",
           add_objects_result.error()));
     }
 
+    const auto& corr = add_objects_result.value().corrected_next_offsets;
     vlog(
-      lg.debug,
-      "Successfully added {} objects to L1 metastore",
-      objects.size());
+      lg.info,
+      "Successfully added {} objects to L1 metastore, {} corrected offsets",
+      objects.size(),
+      corr.size());
+    for (const auto& [tidp, offset] : corr) {
+        vlog(
+          lg.info,
+          "  corrected_next_offset: tidp={} -> offset={}",
+          tidp,
+          offset);
+    }
 
     // Now update the LRO, taking into account any corrections from
     // the metastore.
@@ -964,7 +988,7 @@ reconciler<Clock>::commit_objects(
             lro, _as);
           if (result.has_value()) {
               vlog(
-                lg.debug,
+                lg.info,
                 "successfully bumped LRO for {} (tidp: {}) to {}",
                 commit->source->ntp(),
                 tidp,
