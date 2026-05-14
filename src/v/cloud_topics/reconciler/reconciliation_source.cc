@@ -132,10 +132,21 @@ public:
             co_return model::make_empty_record_batch_reader();
         }
 
+        auto actual_start = std::max(
+          effective_start.value(), input_cfg.start_offset);
+        auto max_offset = kafka::prev_offset(maybe_lso.value());
+        vlog(
+          cd_log.info,
+          "Reconciler make_reader for {}: effective_start={} lso={} "
+          "actual_start={} max_offset={}",
+          _fe->ntp(),
+          effective_start.value(),
+          maybe_lso.value(),
+          actual_start,
+          max_offset);
         cloud_topic_log_reader_config cfg(
-          /*start_offset=*/std::max(
-            effective_start.value(), input_cfg.start_offset),
-          /*max_offset=*/kafka::prev_offset(maybe_lso.value()),
+          /*start_offset=*/actual_start,
+          /*max_offset=*/max_offset,
           /*min_bytes=*/1,
           /*max_bytes=*/input_cfg.max_bytes,
           /*type_filter=*/std::nullopt,
@@ -145,6 +156,13 @@ public:
           config::shard_local_cfg()
             .cloud_topics_allow_materialization_failure());
         if (cfg.max_offset < cfg.start_offset) {
+            vlog(
+              cd_log.info,
+              "Reconciler make_reader for {}: max_offset {} < start_offset {}, "
+              "returning empty reader",
+              _fe->ntp(),
+              cfg.max_offset,
+              cfg.start_offset);
             co_return model::make_empty_record_batch_reader();
         }
         auto reader = co_await _fe->make_reader(cfg);
