@@ -98,20 +98,34 @@ class TsMigrationTest(RedpandaTest):
             retry_on_exc=True,
         )
 
-        # Promote to cloud/tiered_cloud — records a migration boundary in the
-        # CTP STM; subsequent writes go through the CT pipeline.
-        self.rpk.alter_topic_config(
-            self.TOPIC, TopicSpec.PROPERTY_STORAGE_MODE, storage_mode
-        )
-
-        # Phase 2: produce via CT write path
-        KgoVerifierProducer.oneshot(
+        # Start phase-2 producer before promoting the topic so that produces are
+        # in-flight when the config change lands.
+        producer = KgoVerifierProducer(
             self.test_context,
             self.redpanda,
             self.TOPIC,
             msg_size=self.MSG_SIZE,
             msg_count=self.NUM_PHASE2,
         )
+        try:
+            producer.start()
+
+            # Wait until the producer has acknowledged at least 50 records so
+            # the config change is guaranteed to race with active writes.
+            producer.wait_for_acks(50, timeout_sec=30, backoff_sec=0.5)
+
+            # Promote to cloud/tiered_cloud — records a migration boundary in
+            # the CTP STM.  Some phase-2 records will have been written as
+            # tiered-storage records before this lands; they fall after the
+            # boundary and are served via CT once reconciled.
+            self.rpk.alter_topic_config(
+                self.TOPIC, TopicSpec.PROPERTY_STORAGE_MODE, storage_mode
+            )
+
+            producer.wait(timeout_sec=120)
+        finally:
+            producer.stop()
+            producer.free()
 
         total = self.NUM_PHASE1 + self.NUM_PHASE2
 
