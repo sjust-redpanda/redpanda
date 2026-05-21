@@ -1257,6 +1257,7 @@ ss::future<upload_result> remote::upload_object(upload_request upload_request) {
         upload_request.transfer_details.on_request(fib.retry_count());
 
         auto to_upload = upload_request.payload.copy();
+        const auto put_start = ss::lowres_clock::now();
         auto res = co_await lease.client->put_object(
           bucket_parts->name,
           path,
@@ -1264,6 +1265,14 @@ ss::future<upload_result> remote::upload_object(upload_request upload_request) {
           make_iobuf_input_stream(std::move(to_upload)),
           fib.get_timeout(),
           upload_request.accept_no_content_response);
+        vlog(
+          ctxlog.debug,
+          "put_object {} size {} took {}ms",
+          upload_type,
+          content_length,
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+            ss::lowres_clock::now() - put_start)
+            .count());
 
         if (res) {
             transfer_details.on_success();
