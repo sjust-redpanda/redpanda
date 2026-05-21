@@ -63,6 +63,29 @@ class TsMigrationTest(RedpandaTest):
                 CLOUD_TOPICS_CONFIG_STR: True,
                 "cloud_topics_produce_batching_size_threshold": 65536,
                 "enable_cluster_metadata_upload_loop": False,
+                # Remove cluster-level minimums that would clamp topic-level
+                # segment.bytes and segment.ms to 1 MB / 10 min respectively,
+                # preventing segment rolling in the transactions test.
+                "log_segment_size_min": 1,
+                "log_segment_ms_min": 1000,
+                # Cloud storage housekeeping defaults to 5 minutes; reduce to
+                # 1 second so that local-retention enforcement (which evicts
+                # uploaded segments) runs promptly and the is_log_truncated
+                # wait completes well within the 120-second timeout.
+                "cloud_storage_housekeeping_interval_ms": 1000,
+                # Run log GC every second (default: 10s) so that uploaded
+                # segments are evicted promptly once mark_clean is applied.
+                "log_compaction_interval_ms": 1000,
+                # Enable and run the disk space manager every second.
+                # disk_space_manager::run_loop() skips all work when
+                # _target_size == 0 (i.e. no capacity target is set), so
+                # retention_local_trim_interval alone does nothing.  Setting a
+                # tiny cluster-level capacity target activates the manager,
+                # which calls get_reclaimable_offsets() → set_cloud_gc_offset()
+                # on each cloud/tiered partition — the path that respects
+                # retention.local.target.bytes regardless of strict-mode flags.
+                "retention_local_target_capacity_bytes": 1024,
+                "retention_local_trim_interval": 1000,
             },
         )
         self.rpk = RpkTool(self.redpanda)
@@ -214,6 +237,12 @@ class TsMigrationTest(RedpandaTest):
         # Small segments and tight local retention force the archiver to upload
         # quickly and prefix-truncate the local log, which is the precondition
         # for _rm_stm to drop its abort state for the S3 range.
+        #
+        # segment.ms is used instead of (or in addition to) segment.bytes
+        # because transactional produce batches are large enough (~44 KB each
+        # for msgs_per_transaction=200) to prevent reliable byte-based rolling.
+        # A 1-second time limit guarantees multiple segments even when the
+        # producer finishes before any byte threshold is crossed.
         self.rpk.create_topic(
             self.TOPIC_TX,
             partitions=1,
@@ -221,6 +250,7 @@ class TsMigrationTest(RedpandaTest):
             config={
                 TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED,
                 "segment.bytes": str(32 * 1024),
+                "segment.ms": "1000",
                 "retention.local.target.bytes": str(64 * 1024),
             },
         )
