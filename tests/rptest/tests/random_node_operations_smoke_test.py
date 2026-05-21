@@ -11,6 +11,7 @@ import math
 import random
 import re
 import threading
+import time
 from enum import Enum
 from typing import Any
 from logging import Logger
@@ -179,12 +180,19 @@ class RandomNodeOperationsBase(PreallocNodesTest):
             self.msg_size = 1024  # 1KiB
             self.rate_limit = 100 * 1024 * 1024  # 100 MBps
             self.total_data = 5 * 1024 * 1024 * 1024
+            # Cloud topics require a synchronous S3 PUT per produce ack, which
+            # limits throughput to roughly max_buffered_records / s3_ack_latency
+            # (~2600 msg/s on AWS). Use a smaller data volume so cloud topics
+            # producers finish well within the node-operations window (~27 min)
+            # rather than timing out at verify() time.
+            self.cloud_topics_total_data = 512 * 1024 * 1024  # 512 MiB
         else:
             self.producer_throughput = 1000 if self.debug_mode else 10000
             self.node_operations = 10
             self.msg_size = 128
             self.rate_limit = 1024 * 1024
             self.total_data = 50 * 1024 * 1024
+            self.cloud_topics_total_data = 10 * 1024 * 1024  # 10 MiB
 
         # if we are in smoke_test mode, reduce the scale of the test by a lot
         # to make it go fast, primarily by dropping the number of partitions
@@ -205,6 +213,8 @@ class RandomNodeOperationsBase(PreallocNodesTest):
         assert self.consumers_count > 0
         self.msg_count = int(self.total_data / self.msg_size)
         assert self.msg_count > 0
+        self.cloud_topics_msg_count = int(self.cloud_topics_total_data / self.msg_size)
+        assert self.cloud_topics_msg_count > 0
 
         self.logger.info(
             f"running test with: [message_size {self.msg_size},  total_bytes: {self.total_data}, message_count: {self.msg_count}, rate_limit: {self.rate_limit}, cluster_operations: {self.node_operations}]"
@@ -465,6 +475,48 @@ class RandomNodeOperationsBase(PreallocNodesTest):
                 topic_name, TopicSpec.PROPERTY_ICEBERG_MODE, "key_value"
             )
 
+    def _log_s3_latency(self) -> None:
+        import boto3
+
+        si = self._si_settings
+        s3 = boto3.client(
+            "s3",
+            region_name=si.cloud_storage_region,
+            aws_access_key_id=si.cloud_storage_access_key,
+            aws_secret_access_key=si.cloud_storage_secret_key,
+            endpoint_url=si.endpoint_url,
+        )
+        # Each S3 PUT from Redpanda carries a full batch of up to max_buf
+        # messages, so probe with that payload size for a fair comparison.
+        max_buf = 1024  # kgo-verifier default max_buffered_records
+        probe_size = self.msg_size * max_buf
+        payload = b"x" * probe_size
+        timings_ms = []
+        for i in range(10):
+            key = f"latency-probe/{i}"
+            t0 = time.monotonic()
+            s3.put_object(
+                Bucket=si.cloud_storage_bucket, Key=key, Body=payload
+            )
+            timings_ms.append((time.monotonic() - t0) * 1000)
+            s3.delete_object(Bucket=si.cloud_storage_bucket, Key=key)
+
+        timings_ms.sort()
+        p50, p90, p99 = timings_ms[4], timings_ms[8], timings_ms[9]
+        self.logger.info(
+            f"S3 PUT latency probe ({probe_size // 1024}KiB x10): "
+            f"p50={p50:.0f}ms p90={p90:.0f}ms p99={p99:.0f}ms"
+        )
+
+        throughput = max_buf / (p50 / 1000)
+        eta = self.cloud_topics_msg_count / throughput
+        verdict = "WILL TIMEOUT" if eta > self.producer_timeout else "should finish in time"
+        self.logger.info(
+            f"Cloud topics throughput estimate: ~{throughput:.0f} msg/s "
+            f"-> {self.cloud_topics_msg_count} msgs in ~{eta:.0f}s "
+            f"(producer_timeout={self.producer_timeout}s: {verdict})"
+        )
+
     def _do_test_node_operations(
         self,
         enable_failures: bool,
@@ -528,6 +580,9 @@ class RandomNodeOperationsBase(PreallocNodesTest):
         )
 
         self.redpanda.set_cluster_config({"controller_snapshot_max_age_sec": 1})
+
+        if with_cloud_topics:
+            self._log_s3_latency()
 
         if with_iceberg:
             self.redpanda.set_cluster_config(
@@ -665,7 +720,7 @@ class RandomNodeOperationsBase(PreallocNodesTest):
             nodes=[self.preallocated_nodes[2]],
             msg_size=self.msg_size,
             rate_limit_bps=self.rate_limit,
-            msg_count=self.msg_count,
+            msg_count=self.cloud_topics_msg_count,
             consumers_count=self.consumers_count,
             compaction_enabled=False,
             iceberg_enabled=with_iceberg,
@@ -680,7 +735,7 @@ class RandomNodeOperationsBase(PreallocNodesTest):
             nodes=[self.preallocated_nodes[2]],
             msg_size=self.msg_size,
             rate_limit_bps=self.rate_limit,
-            msg_count=self.msg_count,
+            msg_count=self.cloud_topics_msg_count,
             consumers_count=self.consumers_count,
             compaction_enabled=True,
             iceberg_enabled=with_iceberg,
@@ -954,6 +1009,7 @@ class RandomNodeOperationsBase(PreallocNodesTest):
             f"total_data={getattr(self, 'total_data', None)!r}",
             f"consumers_count={getattr(self, 'consumers_count', None)!r}",
             f"msg_count={getattr(self, 'msg_count', None)!r}",
+            f"cloud_topics_msg_count={getattr(self, 'cloud_topics_msg_count', None)!r}",
             f"redpanda={getattr(self, 'redpanda', None)!r}",
         ]
         return f"<RandomNodeOperationsBase {', '.join(fields)}>"
