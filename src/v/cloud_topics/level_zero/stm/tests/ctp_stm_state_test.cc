@@ -32,7 +32,7 @@ TEST(ctp_stm_state_test, initial_state) {
     EXPECT_FALSE(state.get_max_seen_epoch(model::term_id(1)).has_value());
     EXPECT_FALSE(state.get_last_reconciled_offset().has_value());
     EXPECT_FALSE(state.get_last_reconciled_log_offset().has_value());
-    EXPECT_EQ(state.get_max_collectible_offset(), model::offset::min());
+    EXPECT_EQ(state.get_max_collectible_offset(), model::offset::max());
 }
 
 TEST(ctp_stm_state_test, advance_max_seen_epoch) {
@@ -109,8 +109,31 @@ TEST(ctp_stm_state_test, advance_last_reconciled_offset) {
 TEST(ctp_stm_state_test, get_max_collectible_offset) {
     ct::ctp_stm_state state;
 
+    // No migration boundary and no applied placeholder batches: ctp_stm is a
+    // passenger on a TS partition and must not constrain truncation.
+    EXPECT_EQ(state.get_max_collectible_offset(), model::offset::max());
+
+    // Once a placeholder batch is applied, CT data is in flight: block
+    // truncation until the reconciler catches up.
+    state.advance_epoch(ct::cluster_epoch(1), model::offset(10));
     EXPECT_EQ(state.get_max_collectible_offset(), model::offset::min());
 
+    model::offset log_offset(500);
+    state.advance_last_reconciled_offset(kafka::offset(300), log_offset);
+    EXPECT_EQ(state.get_max_collectible_offset(), log_offset);
+}
+
+TEST(ctp_stm_state_test, get_max_collectible_offset_after_migration_boundary) {
+    ct::ctp_stm_state state;
+
+    // After start_ts_import both _ts_migration_boundary and
+    // _last_reconciled_log_offset are set atomically, so the function
+    // returns the boundary log offset immediately (Case 1: LRO governs).
+    model::offset boundary_log_offset(200);
+    state.start_ts_import(kafka::offset(100), boundary_log_offset);
+    EXPECT_EQ(state.get_max_collectible_offset(), boundary_log_offset);
+
+    // Once the reconciler advances LRO past the boundary it governs.
     model::offset log_offset(500);
     state.advance_last_reconciled_offset(kafka::offset(300), log_offset);
     EXPECT_EQ(state.get_max_collectible_offset(), log_offset);
