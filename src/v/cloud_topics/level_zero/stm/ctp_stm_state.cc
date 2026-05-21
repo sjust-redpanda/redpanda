@@ -148,10 +148,21 @@ ctp_stm_state::get_max_seen_epoch(model::term_id term) const noexcept {
 }
 
 model::offset ctp_stm_state::get_max_collectible_offset() const noexcept {
+    // In order to support ts->ct migrations, all partitions include both
+    // archival_stm and ctp_stm instances.  A consequence of this is that we
+    // need to avoid constraining collection if the ctp_stm isn't actually
+    // active.
+    //
+    // We detect this by requiring that either a migration boundary has been
+    // recorded or at least one placeholder batch has been applied — either
+    // signals that CT data is actually in flight and needs protection.
     if (_last_reconciled_log_offset.has_value()) {
         return _last_reconciled_log_offset.value();
     }
-    // Truncation is impossible without LRO
+
+    if (!_ts_migration_boundary.has_value() && !_max_applied_epoch.has_value()) {
+        return model::offset::max();
+    }
     return model::offset::min();
 }
 
