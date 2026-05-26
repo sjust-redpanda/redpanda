@@ -45,8 +45,15 @@ class TsMigrationTest(RedpandaTest):
     # Parameters for the transactional migration test.
     # msgs_per_transaction is intentionally large so that when migration fires
     # mid-stream, at least one in-flight transaction straddles the boundary.
+    #
+    # NUM_TX_MSGS_PHASE1 must be large enough that the total log volume for
+    # phase 1 exceeds log_segment_size (1 MB, see extra_rp_conf below).
+    # disk_space_manager::manage_data_disk() skips reclaim when
+    # real_target_excess <= log_segment_size().  With TX_MSGS_PER_TXN=200 and
+    # MSG_SIZE=128 each transactional batch is ~44 KB, so 50 transactions
+    # (~10 000 messages) produce ~2.2 MB — well above the 1 MB threshold.
     TOPIC_TX = "ts-migration-tx-test"
-    NUM_TX_MSGS_PHASE1 = 1500
+    NUM_TX_MSGS_PHASE1 = 10000
     NUM_TX_MSGS_PHASE2 = 1000
     TX_MSGS_PER_TXN = 200
     TX_ABORT_RATE = 0.3
@@ -69,6 +76,14 @@ class TsMigrationTest(RedpandaTest):
                 # preventing segment rolling in the transactions test.
                 "log_segment_size_min": 1,
                 "log_segment_ms_min": 1000,
+                # Set log_segment_size to its minimum (1 MB).
+                # disk_space_manager::manage_data_disk() skips reclaim when
+                # real_target_excess <= log_segment_size().  The default is
+                # 128 MB which would never be exceeded by a small test log.
+                # Setting it to 1 MB (the minimum allowed by bounded_property)
+                # reduces the threshold to 1 MB; NUM_TX_MSGS_PHASE1 is sized
+                # so that the phase-1 log (~2.2 MB) comfortably exceeds it.
+                "log_segment_size": 1048576,
                 # Cloud storage housekeeping defaults to 5 minutes; reduce to
                 # 1 second so that local-retention enforcement (which evicts
                 # uploaded segments) runs promptly and the is_log_truncated
