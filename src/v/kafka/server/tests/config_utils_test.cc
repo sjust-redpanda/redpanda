@@ -136,6 +136,34 @@ BOOST_AUTO_TEST_CASE(parse_and_set_topic_replication_factor_test) {
     BOOST_REQUIRE_EQUAL(property.value.has_value(), false);
 }
 
+BOOST_AUTO_TEST_CASE(storage_mode_validator_tiered_to_cloud_permitted) {
+    using sm = model::redpanda_storage_mode;
+    kafka::storage_mode_validator v{sm::tiered, /*is_compacted=*/false};
+    BOOST_CHECK(!v("", sm::cloud));
+    BOOST_CHECK(!v("", sm::tiered_cloud));
+}
+
+BOOST_AUTO_TEST_CASE(
+  storage_mode_validator_tiered_to_cloud_rejected_when_compacted) {
+    using sm = model::redpanda_storage_mode;
+    kafka::storage_mode_validator v{sm::tiered, /*is_compacted=*/true};
+    auto err_cloud = v("", sm::cloud);
+    BOOST_REQUIRE(err_cloud.has_value());
+    BOOST_CHECK(err_cloud->contains("compacted"));
+    auto err_tc = v("", sm::tiered_cloud);
+    BOOST_REQUIRE(err_tc.has_value());
+    BOOST_CHECK(err_tc->contains("compacted"));
+}
+
+BOOST_AUTO_TEST_CASE(
+  storage_mode_validator_cloud_to_tiered_cloud_permitted_when_compacted) {
+    // cloud <-> tiered_cloud transitions are not TS migrations; compaction
+    // flag must not block them.
+    using sm = model::redpanda_storage_mode;
+    kafka::storage_mode_validator v{sm::cloud, /*is_compacted=*/true};
+    BOOST_CHECK(!v("", sm::tiered_cloud));
+}
+
 BOOST_AUTO_TEST_CASE(test_min_replication_factor) {
     using namespace kafka;
     cluster::property_update<std::optional<cluster::replication_factor>>
