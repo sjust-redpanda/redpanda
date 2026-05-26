@@ -46,7 +46,8 @@ class TsMigrationTest(RedpandaTest):
     # msgs_per_transaction is intentionally large so that when migration fires
     # mid-stream, at least one in-flight transaction straddles the boundary.
     TOPIC_TX = "ts-migration-tx-test"
-    NUM_TX_MSGS = 1500
+    NUM_TX_MSGS_PHASE1 = 1500
+    NUM_TX_MSGS_PHASE2 = 1000
     TX_MSGS_PER_TXN = 200
     TX_ABORT_RATE = 0.3
 
@@ -255,19 +256,19 @@ class TsMigrationTest(RedpandaTest):
             },
         )
 
-        producer = KgoVerifierProducer(
+        phase1_producer = KgoVerifierProducer(
             self.test_context,
             self.redpanda,
             self.TOPIC_TX,
             msg_size=self.MSG_SIZE,
-            msg_count=self.NUM_TX_MSGS,
+            msg_count=self.NUM_TX_MSGS_PHASE1,
             use_transactions=True,
             transaction_abort_rate=self.TX_ABORT_RATE,
             msgs_per_transaction=self.TX_MSGS_PER_TXN,
         )
 
         try:
-            producer.start()
+            phase1_producer.start()
 
             # Wait for at least one TS segment to reach S3.
             def has_ts_segment() -> bool:
@@ -309,17 +310,77 @@ class TsMigrationTest(RedpandaTest):
                 self.TOPIC_TX, TopicSpec.PROPERTY_STORAGE_MODE, storage_mode
             )
 
-            producer.wait(timeout_sec=120)
+            phase1_producer.wait(timeout_sec=120)
         finally:
-            producer.stop()
-            producer.free()
+            phase1_producer.stop()
+            phase1_producer.free()
 
-        total_committed = producer.produce_status.acked
+        total_committed = (
+            phase1_producer.produce_status.acked
+            - phase1_producer.produce_status.aborted_transaction_messages
+        )
+
+        # Phase 2: produce post-migration transactional records via the CT
+        # write path.  This is required for two reasons:
+        #   1. The CT reconciler only registers the NTP in the metastore when
+        #      it processes its first L0 batch.  Without phase-2 data there is
+        #      nothing to reconcile and is_reconciled would time out with
+        #      metastore::errc::not_found.
+        #   2. Phase-2 records exercise read_committed semantics for
+        #      transactions written entirely in CT mode alongside phase-1
+        #      records served via the TS passthrough reader.
+        phase2_producer = KgoVerifierProducer(
+            self.test_context,
+            self.redpanda,
+            self.TOPIC_TX,
+            msg_size=self.MSG_SIZE,
+            msg_count=self.NUM_TX_MSGS_PHASE2,
+            use_transactions=True,
+            transaction_abort_rate=self.TX_ABORT_RATE,
+            msgs_per_transaction=self.TX_MSGS_PER_TXN,
+        )
+        try:
+            phase2_producer.start()
+            phase2_producer.wait(timeout_sec=120)
+        finally:
+            phase2_producer.stop()
+            phase2_producer.free()
+
+        # Sentinel: one non-transactional record appended after the phase-2
+        # transactional producer.  The CT reconciler uses read_committed_reader
+        # internally and cannot advance LRO past a trailing all-aborted range
+        # (read_committed_reader returns no batches for a range composed
+        # entirely of aborted-transaction records).  By guaranteeing a
+        # committed record at the very end of the log the sentinel ensures LRO
+        # can always reach HWM, making the is_reconciled check reliable.
+        sentinel_producer = KgoVerifierProducer(
+            self.test_context,
+            self.redpanda,
+            self.TOPIC_TX,
+            msg_size=self.MSG_SIZE,
+            msg_count=1,
+        )
+        try:
+            sentinel_producer.start()
+            sentinel_producer.wait(timeout_sec=30)
+        finally:
+            sentinel_producer.stop()
+            sentinel_producer.free()
+
+        # Committed record count: acked includes both committed and aborted
+        # data records; subtract the aborted ones.  Add 1 for the sentinel.
+        total_committed += (
+            phase2_producer.produce_status.acked
+            - phase2_producer.produce_status.aborted_transaction_messages
+            + 1
+        )
 
         # Wait for the CT reconciler to process all post-migration records.
         # The HWM covers the full Kafka offset space (data + aborted records +
         # control batches), so next_offset >= HWM confirms the reconciler has
-        # caught up to the end of the log.
+        # caught up to the end of the log.  The sentinel guarantees at least
+        # one committed record at the tail so LRO can advance to HWM even when
+        # all phase-2 transactions are aborted.
         def is_reconciled() -> bool:
             partitions = list(self.rpk.describe_topic(self.TOPIC_TX))
             if not partitions:
@@ -346,6 +407,13 @@ class TsMigrationTest(RedpandaTest):
         # appears in key order and that no records from aborted transactions are
         # present.
         #
+        # loop=False causes kgo-verifier to read to the current LSO once and
+        # exit rather than looping indefinitely.  This avoids the deadlock
+        # where max_offsets_consumed can never reach max_offsets_produced when
+        # the last produced transaction was aborted (aborted records are
+        # filtered by read_committed, so the consumer never consumes their
+        # offsets).
+        #
         # The expected failure mode for the known bug: invalid_reads > 0
         # because frontend::aborted_transactions returns empty for pre-migration
         # S3 offsets (it queries _rm_stm, which has already discarded abort
@@ -356,8 +424,8 @@ class TsMigrationTest(RedpandaTest):
             self.redpanda,
             self.TOPIC_TX,
             msg_size=self.MSG_SIZE,
-            producer=producer,
             use_transactions=True,
+            loop=False,
         )
 
         try:
@@ -368,15 +436,15 @@ class TsMigrationTest(RedpandaTest):
             consumer.free()
 
         status = consumer.consumer_status
-        assert status.invalid_reads == 0, (
-            f"invalid_reads={status.invalid_reads}: records from aborted "
+        assert status.validator.invalid_reads == 0, (
+            f"invalid_reads={status.validator.invalid_reads}: records from aborted "
             f"transactions appeared under read_committed isolation. "
             f"This indicates frontend::aborted_transactions returned empty for "
             f"pre-migration S3 offsets because _rm_stm discarded abort state "
             f"for those offsets during prefix truncation. "
-            f"valid_reads={status.valid_reads}, committed={total_committed}"
+            f"valid_reads={status.validator.valid_reads}, committed={total_committed}"
         )
-        assert status.valid_reads == total_committed, (
-            f"valid_reads={status.valid_reads} != committed={total_committed}: "
+        assert status.validator.valid_reads == total_committed, (
+            f"valid_reads={status.validator.valid_reads} != committed={total_committed}: "
             f"some committed records were not returned under read_committed isolation"
         )
