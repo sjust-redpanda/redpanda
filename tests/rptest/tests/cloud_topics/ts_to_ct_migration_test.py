@@ -558,7 +558,10 @@ class TsMigrationTest(RedpandaTest):
                 f"GC check: start_offset={start_offset}, "
                 f"segments={segments}/{segments_before}"
             )
-            return start_offset > 0
+            # start_offset is reset to 0 when no segments remain
+            # (partition_manifest::truncate() clears it when empty), so check
+            # segment count instead.
+            return segments < segments_before
 
         wait_until(
             ts_segments_gc_d,
@@ -566,7 +569,7 @@ class TsMigrationTest(RedpandaTest):
             backoff_sec=5,
             err_msg=(
                 "Archival STM did not GC pre-migration TS segments within 60s "
-                "after storage mode change. start_offset did not advance, "
+                "after storage mode change. Segment count did not decrease, "
                 "indicating the ntp_archiver is not running housekeeping "
                 "after the tiered->cloud storage mode transition."
             ),
