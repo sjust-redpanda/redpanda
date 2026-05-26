@@ -424,6 +424,7 @@ inline bool is_storage_mode_transition_permitted(
 /// permitted.
 struct storage_mode_validator {
     std::optional<model::redpanda_storage_mode> current_mode;
+    bool is_compacted = false;
 
     std::optional<ss::sstring>
     operator()(const ss::sstring&, const model::redpanda_storage_mode& value) {
@@ -439,6 +440,18 @@ struct storage_mode_validator {
               *current_mode,
               value);
         }
+
+        using sm = model::redpanda_storage_mode;
+        if (
+          is_compacted && *current_mode == sm::tiered
+          && (value == sm::cloud || value == sm::tiered_cloud)) {
+            return fmt::format(
+              "Cannot alter redpanda.storage.mode from {} to {} on a compacted "
+              "topic",
+              *current_mode,
+              value);
+        }
+
         return std::nullopt;
     }
 };
