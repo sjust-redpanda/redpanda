@@ -439,6 +439,7 @@ inline bool is_storage_mode_transition_permitted(
 struct storage_mode_validator {
     std::optional<model::redpanda_storage_mode> current_mode;
     bool is_compacted = false;
+    bool has_infinite_retention = false;
 
     std::optional<ss::sstring>
     operator()(const ss::sstring&, const model::redpanda_storage_mode& value) {
@@ -456,12 +457,20 @@ struct storage_mode_validator {
         }
 
         using sm = model::redpanda_storage_mode;
-        if (
-          is_compacted && *current_mode == sm::tiered
-          && (value == sm::cloud || value == sm::tiered_cloud)) {
+        const bool is_ts_migration = *current_mode == sm::tiered
+                                     && (value == sm::cloud
+                                         || value == sm::tiered_cloud);
+        if (is_ts_migration && is_compacted) {
             return fmt::format(
               "Cannot alter redpanda.storage.mode from {} to {} on a compacted "
               "topic",
+              *current_mode,
+              value);
+        }
+        if (is_ts_migration && has_infinite_retention) {
+            return fmt::format(
+              "Cannot alter redpanda.storage.mode from {} to {} on a topic "
+              "with infinite retention (retention.ms=-1)",
               *current_mode,
               value);
         }
