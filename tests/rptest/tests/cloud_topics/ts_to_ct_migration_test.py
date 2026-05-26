@@ -52,6 +52,8 @@ class TsMigrationTest(RedpandaTest):
     # real_target_excess <= log_segment_size().  With TX_MSGS_PER_TXN=200 and
     # MSG_SIZE=128 each transactional batch is ~44 KB, so 50 transactions
     # (~10 000 messages) produce ~2.2 MB — well above the 1 MB threshold.
+    TOPIC_GC = "ts-migration-gc-test"
+
     TOPIC_TX = "ts-migration-tx-test"
     NUM_TX_MSGS_PHASE1 = 10000
     NUM_TX_MSGS_PHASE2 = 1000
@@ -462,4 +464,123 @@ class TsMigrationTest(RedpandaTest):
         assert status.validator.valid_reads == total_committed, (
             f"valid_reads={status.validator.valid_reads} != committed={total_committed}: "
             f"some committed records were not returned under read_committed isolation"
+        )
+
+    @cluster(num_nodes=2)
+    @matrix(storage_mode=[
+        TopicSpec.STORAGE_MODE_CLOUD,
+        TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+    ])
+    def test_ts_to_ct_migration_gc(self, storage_mode: str):
+        """
+        Verify that the archival STM continues to GC pre-migration TS segments
+        after a topic is promoted from tiered to cloud/tiered_cloud.
+
+        After migration the ntp_archiver must continue running housekeeping so
+        that apply_retention() + garbage_collect() advance start_offset and
+        delete aged-out TS objects from S3.  The test sets a short retention.ms
+        so that all uploaded segments are eligible for deletion immediately after
+        the retention window elapses, then waits for start_offset to advance in
+        the archival metadata STM manifest.
+
+        NOTE: This test is expected to fail until the ntp_archiver (or an
+        equivalent driver) is kept alive after the storage mode transition.
+        """
+        if storage_mode == TopicSpec.STORAGE_MODE_TIERED_CLOUD:
+            self.redpanda.set_feature_active(
+                "tiered_cloud_topics", True, timeout_sec=30
+            )
+
+        # Short retention: all uploaded segments should be eligible for GC
+        # well within the 60-second wait below.
+        RETENTION_MS = 10_000  # 10 s
+
+        self.rpk.create_topic(
+            self.TOPIC_GC,
+            partitions=1,
+            replicas=1,
+            config={
+                TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED,
+                "segment.bytes": str(32 * 1024),
+                "segment.ms": "1000",
+                "retention.ms": str(RETENTION_MS),
+                "retention.local.target.bytes": str(64 * 1024),
+            },
+        )
+
+        # Produce enough data that several segments are uploaded to S3.
+        KgoVerifierProducer.oneshot(
+            self.test_context,
+            self.redpanda,
+            self.TOPIC_GC,
+            msg_size=self.MSG_SIZE,
+            msg_count=2000,
+        )
+
+        # Wait for at least two TS segments to be uploaded so there is
+        # something eligible for GC.
+        def has_ts_segments() -> bool:
+            manifest = self.admin.get_partition_manifest(self.TOPIC_GC, 0)
+            return len(manifest.get("segments", {})) >= 2
+
+        wait_until(
+            has_ts_segments,
+            timeout_sec=120,
+            backoff_sec=5,
+            err_msg="Fewer than 2 TS segments uploaded within 120s",
+            retry_on_exc=True,
+        )
+
+        manifest_before = self.admin.get_partition_manifest(self.TOPIC_GC, 0)
+        segments_before = len(manifest_before.get("segments", {}))
+        self.logger.info(
+            f"Before migration: {segments_before} segments in manifest, "
+            f"start_offset={manifest_before.get('start_offset', 0)}"
+        )
+
+        # Promote the topic to cloud/tiered_cloud.
+        self.rpk.alter_topic_config(
+            self.TOPIC_GC, TopicSpec.PROPERTY_STORAGE_MODE, storage_mode
+        )
+
+        # The archival STM should continue running housekeeping after the
+        # storage mode change.  Once the retention window elapses,
+        # apply_retention() advances start_offset and garbage_collect() deletes
+        # the stale TS objects.  cloud_storage_housekeeping_interval_ms=1s
+        # (set in __init__) means the loop runs frequently; the 60-second
+        # timeout gives it ample time to fire several times after RETENTION_MS
+        # has elapsed.
+        def ts_segments_gc_d() -> bool:
+            manifest = self.admin.get_partition_manifest(self.TOPIC_GC, 0)
+            start_offset = manifest.get("start_offset", 0)
+            segments = len(manifest.get("segments", {}))
+            self.logger.info(
+                f"GC check: start_offset={start_offset}, "
+                f"segments={segments}/{segments_before}"
+            )
+            return start_offset > 0
+
+        wait_until(
+            ts_segments_gc_d,
+            timeout_sec=60,
+            backoff_sec=5,
+            err_msg=(
+                "Archival STM did not GC pre-migration TS segments within 60s "
+                "after storage mode change. start_offset did not advance, "
+                "indicating the ntp_archiver is not running housekeeping "
+                "after the tiered->cloud storage mode transition."
+            ),
+            retry_on_exc=True,
+        )
+
+        manifest_after = self.admin.get_partition_manifest(self.TOPIC_GC, 0)
+        segments_after = len(manifest_after.get("segments", {}))
+        self.logger.info(
+            f"After GC: {segments_after} segments remain "
+            f"(was {segments_before}), "
+            f"start_offset={manifest_after.get('start_offset', 0)}"
+        )
+        assert segments_after < segments_before, (
+            f"Expected segments to decrease after GC: "
+            f"before={segments_before}, after={segments_after}"
         )
