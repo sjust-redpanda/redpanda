@@ -159,6 +159,7 @@ redpanda_cc_gtest(
         ":cluster_fixture",
         "//src/v/cloud_topics/level_zero/stm:ctp_stm",
         "//src/v/cloud_topics/level_zero/stm:ctp_stm_api",
+        "//src/v/cluster",
         "//src/v/cluster:fwd",
         "//src/v/cluster:inventory_service",
         "//src/v/cluster:leader_balancer_strategy",
