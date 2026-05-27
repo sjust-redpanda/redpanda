@@ -11,6 +11,7 @@
 #include "cloud_topics/level_zero/stm/ctp_stm.h"
 #include "cloud_topics/level_zero/stm/ctp_stm_api.h"
 #include "cloud_topics/tests/cluster_fixture.h"
+#include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/types.h"
 #include "model/fundamental.h"
 #include "test_utils/async.h"
@@ -19,6 +20,7 @@
 #include <gtest/gtest.h>
 
 using namespace std::chrono_literals;
+using tests::kv_t;
 
 namespace {
 
@@ -48,6 +50,25 @@ public:
           /*partitions=*/1,
           /*replication_factor=*/1,
           props);
+    }
+
+    // Produce records, explicitly seal the segment via force_roll(), then wait
+    // until the archiver has uploaded it and recorded a non-null
+    // last_kafka_offset in the archival_metadata_stm manifest.
+    // init_ts_ct_migration() requires a non-empty manifest to set the TS
+    // migration boundary, so this must happen before set_storage_mode.
+    ss::future<> produce_and_wait_for_ts_upload(
+      ss::lw_shared_ptr<cluster::partition>& leader_p) {
+        auto* producer = co_await make_producer(model::node_id{0});
+        co_await producer->produce_to_partition(
+          test_topic, model::partition_id{0}, kv_t::sequence(0, 1));
+        co_await leader_p->log()->force_roll();
+
+        RPTEST_REQUIRE_EVENTUALLY_CORO(30s, [&] {
+            auto stm = leader_p->archival_meta_stm();
+            return stm
+                   && stm->manifest().get_last_kafka_offset().has_value();
+        });
     }
 
     ss::future<> set_storage_mode(model::redpanda_storage_mode mode) {
@@ -107,6 +128,7 @@ TEST_F(TsImportBoundaryTest, BoundarySetOnStorageModePromotion) {
 
     ss::lw_shared_ptr<cluster::partition> leader_p;
     wait_for_leader(leader_p).get();
+    produce_and_wait_for_ts_upload(leader_p).get();
 
     set_storage_mode(model::redpanda_storage_mode::tiered_cloud).get();
     wait_for_migration_boundary(leader_p).get();
@@ -125,6 +147,7 @@ TEST_F(TsImportBoundaryTest, BoundarySetOnStorageModePromotionToCloud) {
 
     ss::lw_shared_ptr<cluster::partition> leader_p;
     wait_for_leader(leader_p).get();
+    produce_and_wait_for_ts_upload(leader_p).get();
 
     set_storage_mode(model::redpanda_storage_mode::cloud).get();
     wait_for_migration_boundary(leader_p).get();
@@ -145,6 +168,7 @@ TEST_F(TsImportBoundaryTest, BoundaryStableAfterDoublePromotion) {
 
     ss::lw_shared_ptr<cluster::partition> leader_p;
     wait_for_leader(leader_p).get();
+    produce_and_wait_for_ts_upload(leader_p).get();
 
     set_storage_mode(model::redpanda_storage_mode::tiered_cloud).get();
     wait_for_migration_boundary(leader_p).get();
