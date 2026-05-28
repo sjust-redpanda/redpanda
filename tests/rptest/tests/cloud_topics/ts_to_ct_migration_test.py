@@ -20,7 +20,7 @@ from rptest.services.kgo_verifier_services import (
     KgoVerifierProducer,
     KgoVerifierSeqConsumer,
 )
-from rptest.services.redpanda import SISettings, CLOUD_TOPICS_CONFIG_STR
+from rptest.services.redpanda import SISettings
 from rptest.tests.redpanda_test import RedpandaTest
 
 
@@ -70,7 +70,6 @@ class TsMigrationTest(RedpandaTest):
             num_brokers=1,
             si_settings=si_settings,
             extra_rp_conf={
-                CLOUD_TOPICS_CONFIG_STR: True,
                 "cloud_topics_produce_batching_size_threshold": 65536,
                 "enable_cluster_metadata_upload_loop": False,
                 # Remove cluster-level minimums that would clamp topic-level

@@ -5,7 +5,7 @@ redpanda_cc_gtest(
     timeout = "short",
     srcs = ["manager_notification_test.cc"],
     deps = [
-        "//src/v/cloud_topics/manager:manager",
+        "//src/v/cloud_topics/manager",
         "//src/v/cluster",
         "//src/v/cluster:notification",
         "//src/v/cluster:topic_configuration",
