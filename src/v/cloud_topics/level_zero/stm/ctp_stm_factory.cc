@@ -24,7 +24,7 @@ bool ctp_stm_factory::is_applicable_for(
     if (ntp_cfg.cloud_topic_enabled()) {
         return true;
     }
-    return config::shard_local_cfg().cloud_topics_enabled()
+    return config::shard_local_cfg().cloud_storage_enabled()
            && ntp_cfg.is_archival_enabled();
 }
 
