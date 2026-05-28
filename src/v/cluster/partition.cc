@@ -1045,6 +1045,14 @@ ss::future<> partition::init_ts_ct_migration() {
     }
 }
 
+std::optional<kafka::offset> partition::ts_migration_boundary() const {
+    auto ctp = _raft->stm_manager()->get<cloud_topics::ctp_stm>();
+    if (!ctp) {
+        return std::nullopt;
+    }
+    return ctp->state().get_ts_migration_boundary();
+}
+
 std::optional<model::offset>
 partition::get_term_last_offset(model::term_id term) const {
     auto o = _raft->log()->get_term_last_offset(term);

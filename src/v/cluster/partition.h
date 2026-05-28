@@ -376,6 +376,11 @@ public:
     ss::shared_ptr<cloud_storage::async_manifest_view>
     get_cloud_storage_manifest_view();
 
+    /// Return the TS→CT migration boundary offset if this partition has been
+    /// migrated from tiered storage to cloud topics, or nullopt otherwise.
+    /// Derived from ctp_stm raft state, so ordered w.r.t. raft operations.
+    std::optional<kafka::offset> ts_migration_boundary() const;
+
     ss::future<result<model::offset>> set_writes_disabled(
       partition_properties_stm::writes_disabled disable,
       model::timeout_clock::time_point deadline,
