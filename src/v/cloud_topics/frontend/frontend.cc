@@ -9,6 +9,8 @@
  */
 #include "cloud_topics/frontend/frontend.h"
 
+#include "cloud_storage/async_manifest_view.h"
+#include "cloud_storage/partition_manifest.h"
 #include "cloud_storage/types.h"
 #include "cloud_topics/data_plane_api.h"
 #include "cloud_topics/frontend/errc.h"
@@ -345,6 +347,97 @@ ss::future<std::vector<cluster::tx::tx_range>> frontend::aborted_transactions(
       .begin_rp = base_rp,
       .end_rp = last_rp,
     };
+    const auto ts_bound = _ctp_stm_api->get_ts_migration_boundary();
+    if (ts_bound.has_value() && base <= *ts_bound) {
+        // TS passthrough read: the requested range is in the pre-migration TS
+        // data.  The local rm_stm may have discarded (or the local log been
+        // prefix-truncated past) the raft offsets that cover this range, so
+        // translating rm_stm results via the local offset-translator would
+        // throw.  Use the cloud-storage abort index instead, which reads the
+        // per-segment .tx files from S3.
+        //
+        // .tx files store raft offsets.  The cloud OT state (built from batch
+        // headers actually read during this fetch) only covers the raft range
+        // of the current fetch window.  For abort-control batches beyond that
+        // window, OT extrapolation underestimates the delta because it has not
+        // seen non-data (archival-metadata) batches written to the TS raft log
+        // after the window end.  To get an accurate translation we look up the
+        // segment containing range.last in the STM manifest and use its
+        // delta_offset_end, which is the cumulative non-data count through the
+        // end of that segment.  This is a conservative upper bound on the
+        // actual delta at range.last, so the resulting kafka_last is <=
+        // kafka_last_actual — committed records are never over-filtered.
+        auto source = co_await _partition->aborted_transactions_cloud(offsets);
+        std::vector<cluster::tx::tx_range> target;
+        target.reserve(source.size());
+
+        // Grab the STM manifest once for all translations.
+        const cloud_storage::partition_manifest* stm_manifest = nullptr;
+        auto manifest_view = _partition->get_cloud_storage_manifest_view();
+        if (manifest_view) {
+            stm_manifest = &manifest_view->stm_manifest();
+        }
+
+        vlog(
+          cd_log.info,
+          "aborted_transactions_cloud: base={} last={} begin_rp={} end_rp={} "
+          "ts_bound={} source_count={}",
+          base,
+          last,
+          offsets.begin_rp,
+          offsets.end_rp,
+          *ts_bound,
+          source.size());
+        for (const auto& range : source) {
+            // tx_range uses model::offset for its first/last fields, but those
+            // fields hold Kafka-space values (i.e. the result of
+            // from_log_offset(), which translates raft→kafka).  The variables
+            // below follow the same convention: they are model::offset in type
+            // but represent Kafka offsets after offset-translation.
+            model::offset translated_last;
+            if (range.last <= offsets.end_rp) {
+                // Within the OT state coverage: use exact translation.
+                translated_last = ot_state->from_log_offset(range.last);
+            } else {
+                // Beyond OT state coverage.  Use the manifest segment delta
+                // if available; fall back to OT extrapolation.
+                translated_last = ot_state->from_log_offset(range.last);
+                if (stm_manifest) {
+                    auto seg_it = stm_manifest->segment_containing(range.last);
+                    if (seg_it != stm_manifest->end()) {
+                        const auto& meta = *seg_it;
+                        if (
+                          meta.delta_offset_end
+                          != model::offset_delta::min()) {
+                            // model::offset - model::offset_delta = kafka::offset
+                            translated_last = kafka::offset_cast(
+                              range.last - meta.delta_offset_end);
+                        }
+                    }
+                }
+                // Cap at ts_bound for transactions straddling the TS→CT
+                // boundary (abort ctrl in CT raft space).
+                if (translated_last > kafka::offset_cast(*ts_bound)) {
+                    translated_last = kafka::offset_cast(*ts_bound);
+                }
+            }
+            auto translated_first = ot_state->from_log_offset(
+              std::max(offsets.begin_rp, range.first));
+            vlog(
+              cd_log.info,
+              "  tx pid={} range.first={} range.last={} -> "
+              "translated_first={} translated_last={} (begin_rp={} end_rp={})",
+              range.pid,
+              range.first,
+              range.last,
+              translated_first,
+              translated_last,
+              offsets.begin_rp,
+              offsets.end_rp);
+            target.emplace_back(range.pid, translated_first, translated_last);
+        }
+        co_return target;
+    }
     co_return co_await get_aborted_transactions_local(*_partition, offsets);
 }
 
@@ -1453,6 +1546,17 @@ frontend::coarse_grained_timequery_result::format_to(fmt::iterator it) const {
 
 ss::future<storage::translating_reader>
 frontend::make_ts_passthrough_reader(cloud_topic_log_reader_config cfg) const {
+    // Cap max_offset at ts_bound.  After migration the TS archiver may archive
+    // CT-phase raft segments (which contain ctp_placeholder batches) alongside
+    // the original TS data.  ctp_placeholder is not raft_data, so the remote
+    // segment reader skips those batches — committed CT records would silently
+    // disappear.  Capping here keeps the TS reader within the pre-migration
+    // range; the consumer's next fetch starts at ts_bound+1, which
+    // select_read_path routes to L1 (pre-filtered, committed-only CT data).
+    const auto ts_bound = _ctp_stm_api->get_ts_migration_boundary();
+    if (ts_bound.has_value() && cfg.max_offset > *ts_bound) {
+        cfg.max_offset = *ts_bound;
+    }
     vlog(
       cd_log.debug,
       "Building TS passthrough reader for {} from {}",
