@@ -143,6 +143,14 @@ ss::future<> ctp_stm::prefix_truncate_below_lro() {
               std::current_exception());
         }
         auto target = prefix_truncate_target();
+        if (target == model::offset::min()) {
+            // LRO has not yet been set (ctp_stm just recorded a migration
+            // boundary with no prior TS data, or is a fresh passenger STM).
+            // snapshot_and_truncate_log(min) would attempt to snapshot before
+            // the start of the log; skip this iteration and wait for LRO to
+            // advance to a real offset.
+            continue;
+        }
         auto snapshot_index = _raft->last_snapshot_index();
         vlog(
           _log.trace,

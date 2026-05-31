@@ -353,9 +353,6 @@ ctp_stm_api::start_ts_import(
   model::offset log_boundary,
   model::timeout_clock::time_point deadline,
   ss::abort_source& as) {
-    if (_stm->state().get_ts_migration_boundary().has_value()) {
-        co_return std::monostate{};
-    }
     storage::record_batch_builder builder(
       model::record_batch_type::ctp_stm_command, model::offset{0});
     builder.add_raw_kv(
