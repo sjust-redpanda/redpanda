@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
+import time
+
 from ducktape.mark import matrix
 from ducktape.tests.test import TestContext
 from ducktape.utils.util import wait_until
@@ -54,6 +56,7 @@ class TsMigrationTest(RedpandaTest):
     # (~10 000 messages) produce ~2.2 MB — well above the 1 MB threshold.
     TOPIC_GC = "ts-migration-gc-test"
 
+    TOPIC_NO_UPLOAD = "ts-migration-no-upload-test"
     TOPIC_TX = "ts-migration-tx-test"
     NUM_TX_MSGS_PHASE1 = 10000
     NUM_TX_MSGS_PHASE2 = 1000
@@ -585,4 +588,144 @@ class TsMigrationTest(RedpandaTest):
         assert segments_after < segments_before, (
             f"Expected segments to decrease after GC: "
             f"before={segments_before}, after={segments_after}"
+        )
+
+    @cluster(num_nodes=2)
+    @matrix(storage_mode=[
+        TopicSpec.STORAGE_MODE_CLOUD,
+        TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+    ])
+    def test_no_ts_uploads_after_migration(self, storage_mode: str):
+        """
+        Verify that the TS archiver does NOT upload new segments after a topic
+        is promoted from tiered to cloud/tiered_cloud.
+
+        Once the CTP STM records a migration boundary, the ntp_archiver must
+        stop uploading raft-log data as new TS segments.  All post-migration
+        data flows through the CT write path and is reconciled by the CT
+        reconciler, not the TS archiver.
+
+        Failure mode without the fix: the archiver continues its upload loop
+        after migration and new TS segment objects appear in the archival
+        manifest for records that were written via the CT path.
+        """
+        if storage_mode == TopicSpec.STORAGE_MODE_TIERED_CLOUD:
+            self.redpanda.set_feature_active(
+                "tiered_cloud_topics", True, timeout_sec=30
+            )
+
+        # cloud_storage_segment_max_upload_interval_sec=10 (set by fast_uploads).
+        # One full upload cycle is the unit of time used throughout this test.
+        UPLOAD_INTERVAL_SEC = 10
+
+        self.rpk.create_topic(
+            self.TOPIC_NO_UPLOAD,
+            partitions=1,
+            replicas=1,
+            config={
+                TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED,
+                "segment.bytes": str(32 * 1024),
+                "segment.ms": "1000",
+            },
+        )
+
+        # Phase 1: produce enough data for several TS segments so the manifest
+        # is non-trivial and any subsequent upload is unambiguously new.
+        KgoVerifierProducer.oneshot(
+            self.test_context,
+            self.redpanda,
+            self.TOPIC_NO_UPLOAD,
+            msg_size=self.MSG_SIZE,
+            msg_count=2000,
+        )
+
+        def has_ts_segments() -> bool:
+            manifest = self.admin.get_partition_manifest(self.TOPIC_NO_UPLOAD, 0)
+            return len(manifest.get("segments", {})) >= 2
+
+        wait_until(
+            has_ts_segments,
+            timeout_sec=120,
+            backoff_sec=5,
+            err_msg="Fewer than 2 TS segments uploaded within 120s",
+            retry_on_exc=True,
+        )
+
+        # Promote to cloud/tiered_cloud — records the migration boundary.
+        self.rpk.alter_topic_config(
+            self.TOPIC_NO_UPLOAD, TopicSpec.PROPERTY_STORAGE_MODE, storage_mode
+        )
+
+        # Allow two upload cycles for any segment that was mid-upload at
+        # promotion time to complete, then record the settled manifest state.
+        # After this point no further TS uploads should occur.
+        time.sleep(2 * UPLOAD_INTERVAL_SEC)
+
+        def manifest_state() -> tuple[int, int]:
+            m = self.admin.get_partition_manifest(self.TOPIC_NO_UPLOAD, 0)
+            return (len(m.get("segments", {})), m.get("last_offset", 0))
+
+        baseline_count, baseline_last_offset = manifest_state()
+        self.logger.info(
+            f"Settled manifest after migration: {baseline_count} segments, "
+            f"last_offset={baseline_last_offset}"
+        )
+
+        # Phase 2: produce data via the CT write path.  This gives the
+        # archiver new log content to upload if it were not suppressed.
+        KgoVerifierProducer.oneshot(
+            self.test_context,
+            self.redpanda,
+            self.TOPIC_NO_UPLOAD,
+            msg_size=self.MSG_SIZE,
+            msg_count=2000,
+        )
+
+        # Wait for CT reconciliation: confirms phase-2 records were written
+        # and the reconciler has processed them, so the data definitely exists
+        # in the raft log for the archiver to find.
+        def is_reconciled() -> bool:
+            partitions = list(self.rpk.describe_topic(self.TOPIC_NO_UPLOAD))
+            if not partitions:
+                return False
+            hwm = partitions[0].high_watermark
+            metastore = self.admin_v2.metastore()
+            req = metastore_pb.GetOffsetsRequest(
+                partition=ntp_pb.TopicPartition(
+                    topic=self.TOPIC_NO_UPLOAD, partition=0
+                )
+            )
+            return metastore.get_offsets(req=req).offsets.next_offset >= hwm
+
+        wait_until(
+            is_reconciled,
+            timeout_sec=120,
+            backoff_sec=5,
+            err_msg="CT reconciler did not process phase-2 records within 120s",
+            retry_on_exc=True,
+        )
+
+        # Wait 3 upload cycles.  An unsuppressed archiver runs every
+        # UPLOAD_INTERVAL_SEC and would have uploaded the phase-2 records as
+        # new TS segments multiple times over by now.
+        time.sleep(3 * UPLOAD_INTERVAL_SEC)
+
+        final_count, final_last_offset = manifest_state()
+        self.logger.info(
+            f"Final manifest state: {final_count} segments, "
+            f"last_offset={final_last_offset} "
+            f"(baseline: {baseline_count}, {baseline_last_offset})"
+        )
+
+        assert final_count == baseline_count, (
+            f"TS archiver uploaded {final_count - baseline_count} new segment(s) "
+            f"after CT migration (storage_mode={storage_mode}). "
+            f"baseline_count={baseline_count}, final_count={final_count}. "
+            f"Post-migration TS uploads indicate the archiver was not suppressed "
+            f"after the tiered→CT storage mode transition."
+        )
+        assert final_last_offset == baseline_last_offset, (
+            f"manifest last_offset advanced from {baseline_last_offset} to "
+            f"{final_last_offset} after CT migration, confirming post-migration "
+            f"TS segment uploads occurred."
         )
