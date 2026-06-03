@@ -4614,3 +4614,81 @@ class ShadowLinkingCloudTopicReplicationTests(ShadowLinkPreAllocTestBase):
 
         with self.producer_consumer(topic=topic.name, msg_size=128, msg_cnt=10000):
             self.verify()
+
+    @cluster(num_nodes=7)
+    @matrix(
+        storage_mode=[
+            TopicSpec.STORAGE_MODE_CLOUD,
+            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+        ],
+    )
+    def test_replication_across_destination_migration(self, storage_mode):
+        """
+        A shadow-link destination must keep mirroring correctly while it is
+        itself migrated from tiered storage to cloud topics.
+
+        Mirrored data arrives via exact-offset (write-at-offset) replication.
+        While the destination partition is mid TS->CT migration it is a
+        composite, and those writes route through it to the cloud-topics write
+        path (the write_at_offset_stm is present regardless of storage mode, so
+        the exact-offset replicator stays available). Starting the source -- and
+        therefore the mirror -- as tiered storage and switching it to
+        cloud/tiered_cloud mid-stream drives the destination through its own
+        TS->CT migration, since storage mode is a synced topic property.
+        verify() then confirms the target matches the source offset-for-offset
+        across the migration boundary (no gap, duplicate, or stall).
+        """
+        if storage_mode == TopicSpec.STORAGE_MODE_TIERED_CLOUD:
+            self.source_cluster_service.set_feature_active(
+                "tiered_cloud_topics", True, timeout_sec=30
+            )
+            self.target_cluster.service.set_feature_active(
+                "tiered_cloud_topics", True, timeout_sec=30
+            )
+
+        topic = TopicSpec(
+            name="ct-migration-topic",
+            partition_count=3,
+            replication_factor=1,
+        )
+
+        # Start the source topic (and the mirror) as tiered storage.
+        self.create_source_topic(topic, TopicSpec.STORAGE_MODE_TIERED)
+        self.create_link("test-link")
+
+        self.target_cluster.service.wait_until(
+            lambda: self.topic_partitions_exists_in_target(topic),
+            timeout_sec=30,
+            backoff_sec=1,
+            err_msg=f"Topic {topic.name} not found in target cluster",
+        )
+
+        target_admin = Admin(self.target_cluster.service)
+
+        with self.producer_consumer(topic=topic.name, msg_size=128, msg_cnt=100000):
+            # Let mirroring run as tiered storage until the destination has
+            # uploaded a TS segment, so the migration sets a real boundary (an
+            # empty manifest would make the transition a no-op).
+            def target_has_ts_segments() -> bool:
+                try:
+                    m = target_admin.get_partition_manifest(topic.name, 0)
+                except Exception:
+                    return False
+                return len(m.get("segments", {})) >= 1
+
+            wait_until(
+                target_has_ts_segments,
+                timeout_sec=120,
+                backoff_sec=5,
+                err_msg="destination mirror did not upload TS segments",
+                retry_on_exc=True,
+            )
+
+            # Migrate the source topic. Storage mode is a synced property, so
+            # the destination mirror topic migrates TS->CT while exact-offset
+            # replication continues across the boundary.
+            self.source_cluster_rpk.alter_topic_config(
+                topic.name, TopicSpec.PROPERTY_STORAGE_MODE, storage_mode
+            )
+
+            self.verify()
