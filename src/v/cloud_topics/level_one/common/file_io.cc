@@ -524,6 +524,17 @@ file_io::open_object(object_extent extent, ss::abort_source* as) {
           index_path.native(), as);
         if (index_iobuf.has_value()) {
             ts_index.from_iobuf(std::move(*index_iobuf));
+        } else if (index_iobuf.error() != io::errc::cloud_missing_object) {
+            // A genuinely absent index (notfound) is fine: fall back to a
+            // full-segment scan with an empty index. Any other error (timeout
+            // or transient failure) must propagate -- previously it was
+            // silently masked as an empty-index full scan.
+            vlog(
+              cd_log.warn,
+              "Failed to download index for imported segment {}: {}",
+              extent.imported->ts_path,
+              index_iobuf.error());
+            co_return std::unexpected(index_iobuf.error());
         }
         auto idx = std::make_unique<ts_segment_index>(
           std::move(ts_index),
