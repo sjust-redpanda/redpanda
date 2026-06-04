@@ -20,10 +20,39 @@
 
 namespace cloud_topics::l1 {
 
+namespace {
+
+// Whether `batch` belongs to one of the aborted transactions in `aborted`,
+// matched by producer identity and (inclusive) log-offset range.
+//
+// This mirrors kafka::is_aborted (kafka/utils/txn_reader.cc), the canonical
+// read_committed matcher. It is replicated here -- rather than depending on
+// kafka/utils -- to keep this transitional TS-import code contained within
+// cloud_topics and to avoid a build cycle (kafka/utils -> kafka/data ->
+// cloud_topics). The set must be ordered with std::greater for the lookup.
+bool is_aborted(
+  const model::record_batch& batch,
+  const absl::btree_set<model::tx_range, std::greater<>>& aborted) {
+    model::producer_identity pid{
+      batch.header().producer_id, batch.header().producer_epoch};
+    auto it = aborted.lower_bound(
+      model::tx_range{pid, batch.base_offset(), model::offset::max()});
+    if (it == aborted.end()) {
+        return false;
+    }
+    return it->pid == pid && batch.base_offset() >= it->first
+           && batch.last_offset() <= it->last;
+}
+
+} // namespace
+
 tiered_storage_object_reader::tiered_storage_object_reader(
-  ss::input_stream<char> stream, model::offset_delta delta)
+  ss::input_stream<char> stream,
+  model::offset_delta delta,
+  absl::btree_set<model::tx_range, std::greater<>> aborted)
   : _stream(std::move(stream))
-  , _running_delta(delta) {}
+  , _running_delta(delta)
+  , _aborted(std::move(aborted)) {}
 
 ss::future<> tiered_storage_object_reader::close() {
     return _stream.close();
@@ -103,12 +132,20 @@ tiered_storage_object_reader::fetch_next_translated() {
         if (header.attrs.is_control()) {
             continue;
         }
-        header.base_offset = model::offset{
-          header.base_offset() - _running_delta()};
-        co_return model::record_batch(
-          header,
-          std::move(records_buf),
-          model::record_batch::tag_ctor_ng{});
+        auto batch = model::record_batch(
+          header, std::move(records_buf), model::record_batch::tag_ctor_ng{});
+        // Drop aborted transactional data so the imported region is
+        // committed-only, matching native CT L1 (where L0->L1 reconciliation
+        // strips aborts). Matched in raw log-offset space -- where the .tx
+        // ranges live -- before the base offset is translated. Like a control
+        // batch, an aborted batch consumes a Kafka offset (leaving a gap) but
+        // does not move the delta.
+        if (header.attrs.is_transactional() && is_aborted(batch, _aborted)) {
+            continue;
+        }
+        batch.header().base_offset = model::offset{
+          batch.header().base_offset() - _running_delta()};
+        co_return batch;
     }
 }
 

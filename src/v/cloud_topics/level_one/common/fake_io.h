@@ -11,8 +11,10 @@
 #pragma once
 
 #include "absl/container/btree_map.h"
+#include "absl/container/btree_set.h"
 #include "bytes/iobuf.h"
 #include "cloud_topics/level_one/common/abstract_io.h"
+#include "model/record.h"
 
 namespace cloud_topics::l1 {
 
@@ -59,7 +61,8 @@ public:
       iobuf segment_bytes,
       kafka::offset base_kafka_offset,
       kafka::offset last_kafka_offset,
-      model::offset_delta delta_offset);
+      model::offset_delta delta_offset,
+      absl::btree_set<model::tx_range, std::greater<>> aborted = {});
 
 private:
     struct ts_segment_fixture {
@@ -67,6 +70,7 @@ private:
         kafka::offset base_kafka_offset;
         kafka::offset last_kafka_offset;
         model::offset_delta delta_offset;
+        absl::btree_set<model::tx_range, std::greater<>> aborted;
     };
 
     absl::btree_map<object_id, iobuf> _storage;

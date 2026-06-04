@@ -15,6 +15,7 @@
 #include "cloud_io/remote.h"
 #include "cloud_storage/remote_segment.h"
 #include "cloud_storage/remote_segment_index.h"
+#include "cloud_storage/tx_range_manifest.h"
 #include "cloud_storage_clients/client.h"
 #include "cloud_topics/level_one/common/abstract_io.h"
 #include "cloud_topics/level_one/common/object.h"
@@ -27,6 +28,8 @@
 
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
+
+#include <absl/container/btree_set.h>
 
 #include <algorithm>
 #include <memory>
@@ -218,12 +221,14 @@ public:
       cloud_io::remote* remote,
       cloud_storage_clients::bucket_name bucket,
       cloud_io::cache* cache,
-      std::unique_ptr<ts_segment_index> index)
+      std::unique_ptr<ts_segment_index> index,
+      absl::btree_set<model::tx_range, std::greater<>> aborted)
       : _extent(std::move(extent))
       , _remote(remote)
       , _bucket(std::move(bucket))
       , _cache(cache)
-      , _index(std::move(index)) {}
+      , _index(std::move(index))
+      , _aborted(std::move(aborted)) {}
 
     const object_index& index() const override { return *_index; }
 
@@ -237,7 +242,7 @@ public:
             co_return std::unexpected(stream_result.error());
         }
         co_return std::make_unique<tiered_storage_object_reader>(
-          std::move(*stream_result), delta);
+          std::move(*stream_result), delta, _aborted);
     }
 
 private:
@@ -342,6 +347,7 @@ private:
     cloud_storage_clients::bucket_name _bucket;
     cloud_io::cache* _cache;
     std::unique_ptr<ts_segment_index> _index;
+    absl::btree_set<model::tx_range, std::greater<>> _aborted;
 };
 
 } // namespace
@@ -542,8 +548,36 @@ file_io::open_object(object_extent extent, ss::abort_source* as) {
           extent.imported->last_kafka_offset,
           extent.imported->delta_offset,
           extent.size);
+
+        // Aborted-transaction ranges for this segment, so the reader can strip
+        // aborted data and make the imported region committed-only (like native
+        // CT L1). Ranges are in raw log-offset space, as the reader needs.
+        absl::btree_set<model::tx_range, std::greater<>> aborted;
+        cloud_storage::remote_segment_path seg_path{
+          std::filesystem::path{extent.imported->ts_path}};
+        auto tx_path = cloud_storage::generate_remote_tx_path(seg_path);
+        auto tx_iobuf = co_await download_raw_iobuf(tx_path().native(), as);
+        if (tx_iobuf.has_value()) {
+            cloud_storage::tx_range_manifest manifest(seg_path);
+            co_await manifest.update(
+              make_iobuf_input_stream(std::move(*tx_iobuf)));
+            for (auto& r : std::move(manifest).get_tx_range()) {
+                aborted.insert(r);
+            }
+        } else if (tx_iobuf.error() != io::errc::cloud_missing_object) {
+            // Absent .tx (notfound) means no aborted transactions -- the common
+            // case. Any other error must propagate rather than silently produce
+            // an empty set, which would leak aborted data into the read path.
+            vlog(
+              cd_log.warn,
+              "Failed to download tx manifest for imported segment {}: {}",
+              extent.imported->ts_path,
+              tx_iobuf.error());
+            co_return std::unexpected(tx_iobuf.error());
+        }
+
         co_return std::make_unique<tiered_storage_object_handle>(
-          extent, _remote, _ts_bucket, _cache, std::move(idx));
+          extent, _remote, _ts_bucket, _cache, std::move(idx), std::move(aborted));
     }
 
     auto read_result = co_await read_object_as_iobuf(extent, as);

@@ -118,9 +118,13 @@ private:
 
 class fake_ts_object_handle final : public object_handle {
 public:
-    fake_ts_object_handle(iobuf bytes, fake_ts_index index)
+    fake_ts_object_handle(
+      iobuf bytes,
+      fake_ts_index index,
+      absl::btree_set<model::tx_range, std::greater<>> aborted)
       : _bytes(std::move(bytes))
-      , _index(std::move(index)) {}
+      , _index(std::move(index))
+      , _aborted(std::move(aborted)) {}
 
     const object_index& index() const override { return _index; }
 
@@ -130,12 +134,13 @@ public:
           _bytes.share(seek.file_position, seek.length));
         auto delta = seek.delta.value_or(model::offset_delta{0});
         co_return std::make_unique<tiered_storage_object_reader>(
-          std::move(stream), delta);
+          std::move(stream), delta, _aborted);
     }
 
 private:
     iobuf _bytes;
     fake_ts_index _index;
+    absl::btree_set<model::tx_range, std::greater<>> _aborted;
 };
 
 } // anonymous namespace
@@ -249,7 +254,8 @@ void fake_io::put_ts_segment(
   iobuf segment_bytes,
   kafka::offset base_kafka_offset,
   kafka::offset last_kafka_offset,
-  model::offset_delta delta_offset) {
+  model::offset_delta delta_offset,
+  absl::btree_set<model::tx_range, std::greater<>> aborted) {
     _ts_storage.insert_or_assign(
       std::move(ts_path),
       ts_segment_fixture{
@@ -257,6 +263,7 @@ void fake_io::put_ts_segment(
         .base_kafka_offset = base_kafka_offset,
         .last_kafka_offset = last_kafka_offset,
         .delta_offset = delta_offset,
+        .aborted = std::move(aborted),
       });
 }
 
@@ -272,7 +279,9 @@ fake_io::open_object(object_extent extent, ss::abort_source* as) {
         fake_ts_index idx{
           segment_size, fixture.delta_offset, fixture.last_kafka_offset};
         co_return std::make_unique<fake_ts_object_handle>(
-          fixture.bytes.share(0, segment_size), std::move(idx));
+          fixture.bytes.share(0, segment_size),
+          std::move(idx),
+          fixture.aborted);
     }
     auto stream_result = co_await read_object(extent, as);
     if (!stream_result.has_value()) {

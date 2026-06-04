@@ -14,12 +14,14 @@
 #include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
 #include "model/fundamental.h"
+#include "model/record.h"
 #include "model/record_batch_types.h"
 #include "model/tests/random_batch.h"
 #include "storage/record_batch_utils.h"
 
 #include <seastar/util/defer.hh>
 
+#include <absl/container/btree_set.h>
 #include <gtest/gtest.h>
 
 using namespace cloud_topics::l1;
@@ -224,6 +226,23 @@ model::record_batch make_control_batch(model::offset base, int count) {
         .count = count,
         .bt = model::record_batch_type::raft_data,
         .is_control = true,
+        .record_sizes = record_sizes,
+      });
+}
+
+// Build a transactional raft_data batch at a given LOG offset, with the given
+// producer identity (so it can be matched against an aborted tx range).
+model::record_batch make_txn_log_batch(
+  model::offset base, int count, int64_t producer_id, int16_t producer_epoch) {
+    std::vector<size_t> record_sizes(static_cast<size_t>(count), 100);
+    return model::test::make_random_batch(
+      model::test::record_batch_spec{
+        .offset = base,
+        .count = count,
+        .bt = model::record_batch_type::raft_data,
+        .producer_id = producer_id,
+        .producer_epoch = producer_epoch,
+        .is_transactional = true,
         .record_sizes = record_sizes,
       });
 }
@@ -474,6 +493,108 @@ TEST(OpenObjectTsTest, ReadImportedExtentDropsControlBatches) {
     EXPECT_EQ(got[0].last_offset(), kafka::offset_cast(2_o));
     EXPECT_EQ(got[1].base_offset(), kafka::offset_cast(4_o));
     EXPECT_EQ(got[1].last_offset(), kafka::offset_cast(5_o));
+}
+
+// Aborted-transaction data must be stripped so the imported region is
+// committed-only (like native CT L1). Committed transactional data survives.
+// Layout (log offsets, delta 0), all transactional:
+//   pid 99 @ [0,2]  committed -> kafka [0,2]
+//   pid 42 @ [3,4]  ABORTED   -> dropped (kafka gap at 3,4)
+//   pid 99 @ [5,5]  committed -> kafka [5,5]
+// Aborted range: {pid 42, [3,4]}.
+TEST(OpenObjectTsTest, ReadImportedExtentStripsAbortedData) {
+    fake_io fio;
+    const ss::sstring ts_path = "00000000000000000000-5-v1.log";
+
+    std::vector<model::record_batch> batches;
+    batches.push_back(make_txn_log_batch(model::offset{0}, 3, 99, 0));
+    batches.push_back(make_txn_log_batch(model::offset{3}, 2, 42, 0));
+    batches.push_back(make_txn_log_batch(model::offset{5}, 1, 99, 0));
+    auto segment = make_ts_segment_multi(std::move(batches));
+    size_t sz = segment.size_bytes();
+
+    absl::btree_set<model::tx_range, std::greater<>> aborted;
+    aborted.insert(model::tx_range{
+      model::producer_identity{42, 0}, model::offset{3}, model::offset{4}});
+    fio.put_ts_segment(
+      ts_path, std::move(segment), 0_o, 5_o, model::offset_delta{0},
+      std::move(aborted));
+
+    auto tidp = model::topic_id_partition{
+      model::topic_id(uuid_t::create()), model::partition_id{0}};
+    ss::abort_source as;
+    object_extent extent{
+      .id = create_object_id(),
+      .position = 0,
+      .size = sz,
+      .imported = make_imported_info(ts_path, 0_o, 5_o, model::offset_delta{0}),
+    };
+    auto handle_result = fio.open_object(extent, &as).get();
+    ASSERT_TRUE(handle_result.has_value());
+    auto& handle = *handle_result;
+
+    auto seek = handle->index().seek_to_offset(tidp, 0_o);
+    ASSERT_TRUE(seek.has_value());
+    auto reader_result = handle->open_reader(*seek, &as).get();
+    ASSERT_TRUE(reader_result.has_value());
+    auto& reader = *reader_result;
+    auto _r = ss::defer([&reader] { reader->close().get(); });
+
+    std::vector<model::record_batch> got;
+    while (true) {
+        auto item = reader->read_next().get();
+        if (std::holds_alternative<object_reader::eof>(item)) {
+            break;
+        }
+        ASSERT_TRUE(std::holds_alternative<model::record_batch>(item));
+        got.push_back(std::move(std::get<model::record_batch>(item)));
+    }
+
+    ASSERT_EQ(got.size(), 2u) << "aborted batch must be stripped";
+    EXPECT_EQ(got[0].base_offset(), kafka::offset_cast(0_o));
+    EXPECT_EQ(got[0].last_offset(), kafka::offset_cast(2_o));
+    EXPECT_EQ(got[1].base_offset(), kafka::offset_cast(5_o));
+    EXPECT_EQ(got[1].last_offset(), kafka::offset_cast(5_o));
+}
+
+// An extent whose data is entirely aborted yields no batches.
+TEST(OpenObjectTsTest, ReadImportedExtentAllAborted) {
+    fake_io fio;
+    const ss::sstring ts_path = "00000000000000000000-6-v1.log";
+
+    auto segment = make_ts_segment(make_txn_log_batch(model::offset{0}, 5, 7, 0));
+    size_t sz = segment.size_bytes();
+
+    absl::btree_set<model::tx_range, std::greater<>> aborted;
+    aborted.insert(model::tx_range{
+      model::producer_identity{7, 0}, model::offset{0}, model::offset{4}});
+    fio.put_ts_segment(
+      ts_path, std::move(segment), 0_o, 4_o, model::offset_delta{0},
+      std::move(aborted));
+
+    auto tidp = model::topic_id_partition{
+      model::topic_id(uuid_t::create()), model::partition_id{0}};
+    ss::abort_source as;
+    object_extent extent{
+      .id = create_object_id(),
+      .position = 0,
+      .size = sz,
+      .imported = make_imported_info(ts_path, 0_o, 4_o, model::offset_delta{0}),
+    };
+    auto handle_result = fio.open_object(extent, &as).get();
+    ASSERT_TRUE(handle_result.has_value());
+    auto& handle = *handle_result;
+
+    auto seek = handle->index().seek_to_offset(tidp, 0_o);
+    ASSERT_TRUE(seek.has_value());
+    auto reader_result = handle->open_reader(*seek, &as).get();
+    ASSERT_TRUE(reader_result.has_value());
+    auto& reader = *reader_result;
+    auto _r = ss::defer([&reader] { reader->close().get(); });
+
+    auto item = reader->read_next().get();
+    EXPECT_TRUE(std::holds_alternative<object_reader::eof>(item))
+      << "all data aborted: reader must yield no batches";
 }
 
 // open_object with an imported extent whose ts_path was never injected must

@@ -111,6 +111,7 @@ redpanda_cc_library(
     deps = [
         ":object",
         "//src/v/model",
+        "@abseil-cpp//absl/container:btree",
         "@seastar",
     ],
 )
@@ -128,6 +129,7 @@ redpanda_cc_library(
         ":ts_reader",
         "//src/v/bytes:iostream",
         "//src/v/cloud_storage",
+        "@abseil-cpp//absl/container:btree",
     ],
     deps = [
         ":abstract_io",
@@ -162,6 +164,7 @@ redpanda_cc_library(
         "//src/v/bytes:iobuf",
         "//src/v/bytes:iostream",
         "//src/v/cloud_storage_clients",
+        "//src/v/model",
         "@abseil-cpp//absl/container:btree",
         "@seastar",
     ],
