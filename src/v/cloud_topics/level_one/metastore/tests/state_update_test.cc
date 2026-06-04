@@ -273,6 +273,27 @@ protected:
     }
 
     std::expected<std::monostate, stm_update_error>
+    apply_import_objects(import_objects_update update) {
+        // Imported objects are created directly, not preregistered.
+        if (GetParam() == state_backend::simple) {
+            return update.apply(state_);
+        }
+        import_objects_db_update db_update{
+          .new_objects = std::move(update.new_objects),
+          .new_terms = std::move(update.new_terms),
+        };
+        auto reader = state_reader(db_->create_snapshot());
+        chunked_vector<write_batch_row> rows;
+        auto result = db_update.build_rows(reader, rows).get();
+        if (!result.has_value()) {
+            return std::unexpected(
+              stm_update_error{fmt::format("{}", result.error())});
+        }
+        apply_rows_to_db(rows);
+        return std::monostate{};
+    }
+
+    std::expected<std::monostate, stm_update_error>
     can_apply_add_objects(add_objects_update update) {
         if (GetParam() == state_backend::simple) {
             return update.can_apply(state_);
@@ -587,6 +608,78 @@ TEST_P(StateUpdateParamTest, TestStartAfterZero) {
     EXPECT_EQ(1, s.objects.size());
     auto& added_obj = s.objects.at(oid1);
     EXPECT_EQ(added_obj.removed_data_size, added_obj.total_data_size);
+}
+
+// End-to-end on both backends: adopt a TS-migrating partition at a non-zero CT
+// base, then import the pre-migration region below it. Verifies the prepend,
+// start lowering, and term seam are identical across backends.
+TEST_P(StateUpdateParamTest, ImportPrependsBelowAdoptedCtData) {
+    auto tp = model::topic_id_partition::from(tidp_a);
+
+    // Adopt: CT data [10..14], elected term 5 starting exactly at the CT base
+    // (the term_start == base migration signal -- adopted cleanly on both
+    // backends; the term_start < base signal instead reports a correction and
+    // the lsm backend skips the term, a separate phase-1 divergence).
+    {
+        auto update = add_objects_builder()
+                        .add(new_obj_builder(oid1, 100, 1100)
+                               .add(tidp_a, 10_o, 14_o, 1999_t, 0, 50)
+                               .build())
+                        .add_term_start(tidp_a, 5_tm, 10_o)
+                        .build();
+        ASSERT_TRUE(apply_add_objects(std::move(update)).has_value());
+        auto pr = get_state().partition_state(tp);
+        ASSERT_TRUE(pr.has_value());
+        // Adopted start is the CT base on both backends (after the start_offset
+        // fix to the simple backend).
+        EXPECT_EQ(pr->get().start_offset, 10_o);
+    }
+
+    // Import the pre-migration region [0..9] as two segments, all term 3 (an
+    // older term than the boundary term 5).
+    {
+        import_objects_update upd;
+        upd.new_objects.push_back(
+          new_obj_builder(oid2, 0, 40)
+            .add(tidp_a, 0_o, 4_o, 40_t, 0, 40)
+            .build());
+        upd.new_objects.push_back(
+          new_obj_builder(oid3, 0, 40)
+            .add(tidp_a, 5_o, 9_o, 90_t, 0, 40)
+            .build());
+        upd.new_terms[tp].push_back(
+          term_start{.term_id = 3_tm, .start_offset = 0_o});
+        ASSERT_TRUE(apply_import_objects(std::move(upd)).has_value());
+    }
+
+    auto pr = get_state().partition_state(tp);
+    ASSERT_TRUE(pr.has_value());
+    const auto& ps = pr->get();
+
+    // Extents tile [0..14] contiguously.
+    ASSERT_EQ(ps.extents.size(), 3u);
+    auto it = ps.extents.begin();
+    EXPECT_EQ(it->base_offset, 0_o);
+    EXPECT_EQ(it->last_offset, 4_o);
+    ++it;
+    EXPECT_EQ(it->base_offset, 5_o);
+    EXPECT_EQ(it->last_offset, 9_o);
+    ++it;
+    EXPECT_EQ(it->base_offset, 10_o);
+    EXPECT_EQ(it->last_offset, 14_o);
+
+    // Start lowered to the imported base; tail unchanged.
+    EXPECT_EQ(ps.start_offset, 0_o);
+    EXPECT_EQ(ps.next_offset, 15_o);
+
+    // Lower term 3 prepended; boundary term 5 (at the CT base) retained.
+    ASSERT_EQ(ps.term_starts.size(), 2u);
+    auto t = ps.term_starts.begin();
+    EXPECT_EQ(t->term_id, 3_tm);
+    EXPECT_EQ(t->start_offset, 0_o);
+    ++t;
+    EXPECT_EQ(t->term_id, 5_tm);
+    EXPECT_EQ(t->start_offset, 10_o);
 }
 
 TEST_P(StateUpdateParamTest, TestDuplicateObject) {

@@ -60,6 +60,23 @@ struct add_objects_db_update {
     term_state_update_t new_terms;
 };
 
+// LSM twin of import_objects_update (see state_update.h): registers extents
+// below an adopted partition's existing CT data, lowering start_offset, for the
+// TS->CT import driver. Mirrors add_objects_db_update but prepends instead of
+// appending.
+struct import_objects_db_update {
+    ss::future<std::expected<void, db_update_error>>
+    build_rows(state_reader&, chunked_vector<write_batch_row>&) const;
+
+    // Validates the update is well-formed:
+    // - There are new objects.
+    // - Per partition the extents are in order and contiguous.
+    std::expected<void, db_update_error> validate_inputs() const;
+
+    chunked_vector<new_object> new_objects;
+    term_state_update_t new_terms;
+};
+
 struct replace_objects_db_update {
     ss::future<std::expected<void, db_update_error>>
     build_rows(state_reader&, chunked_vector<write_batch_row>&) const;

@@ -940,6 +940,189 @@ add_objects_db_update::validate_inputs() const {
 }
 
 ss::future<std::expected<void, db_update_error>>
+import_objects_db_update::build_rows(
+  state_reader& state, chunked_vector<write_batch_row>& out) const {
+    auto validate_res = validate_inputs();
+    if (!validate_res.has_value()) {
+        co_return std::unexpected(std::move(validate_res.error()));
+    }
+    sorted_extents_by_tidp_t new_extents_by_tp;
+    for (const auto& o : new_objects) {
+        o.collect_extents_by_tidp(&new_extents_by_tp);
+    }
+
+    // Imported objects are created directly (not preregistered); their data
+    // size is the sum of their extents.
+    chunked_hash_map<object_id, size_t> total_by_oid;
+    for (const auto& [tidp, extents] : new_extents_by_tp) {
+        for (const auto& e : extents) {
+            total_by_oid[e.oid] += e.len;
+        }
+    }
+    for (const auto& o : new_objects) {
+        auto total_it = total_by_oid.find(o.oid);
+        out.emplace_back(
+          write_batch_row{
+            .key = object_row_key::encode(o.oid),
+            .value = serde::to_iobuf(
+              object_row_value{
+                .object = object_entry{
+                  .total_data_size = total_it != total_by_oid.end()
+                                       ? total_it->second
+                                       : 0,
+                  .removed_data_size = 0,
+                  .footer_pos = o.footer_pos,
+                  .object_size = o.object_size,
+                  .last_updated = model::timestamp::now(),
+                  .is_preregistration = false,
+                }}),
+          });
+    }
+
+    for (const auto& [tidp, extents] : new_extents_by_tp) {
+        auto meta_res = co_await state.get_metadata(tidp);
+        if (!meta_res.has_value()) {
+            co_return std::unexpected(wrap_read_err(
+              std::move(meta_res.error()),
+              "Error getting metadata for {}",
+              tidp));
+        }
+        auto opt = meta_res.value();
+        if (!opt) {
+            co_return std::unexpected(db_update_error(
+              invalid_update,
+              fmt::format("import_objects into unadopted partition {}", tidp)));
+        }
+        // The batch must connect immediately below the lowest existing extent.
+        auto first_res = co_await state.get_extent_ge(tidp, kafka::offset{0});
+        if (!first_res.has_value()) {
+            co_return std::unexpected(wrap_read_err(
+              std::move(first_res.error()),
+              "Error reading first extent for {}",
+              tidp));
+        }
+        if (!first_res.value().has_value()) {
+            co_return std::unexpected(db_update_error(
+              invalid_update,
+              fmt::format(
+                "import_objects into partition {} with no existing extents",
+                tidp)));
+        }
+        const auto connect_to = first_res.value()->base_offset;
+        const auto batch_top_next = kafka::next_offset(
+          extents.rbegin()->last_offset);
+        if (batch_top_next != connect_to) {
+            co_return std::unexpected(db_update_error(
+              invalid_update,
+              fmt::format(
+                "import_objects batch top {} does not connect to partition {} "
+                "extents starting at {}",
+                batch_top_next,
+                tidp,
+                connect_to)));
+        }
+        const auto batch_base = extents.begin()->base_offset;
+
+        size_t size_sum = 0;
+        for (const auto& e : extents) {
+            size_sum += e.len;
+            out.emplace_back(
+              write_batch_row{
+                .key = extent_row_key::encode(tidp, e.base_offset),
+                .value = serde::to_iobuf(
+                  extent_row_value{
+                    .last_offset = e.last_offset,
+                    .max_timestamp = e.max_timestamp,
+                    .filepos = e.filepos,
+                    .len = e.len,
+                    .oid = e.oid,
+                  }),
+              });
+        }
+        // Lower start_offset to the imported base (if it sat above); next_offset
+        // is unchanged. Accumulate size and extent count.
+        out.emplace_back(
+          write_batch_row{
+            .key = metadata_row_key::encode(tidp),
+            .value = serde::to_iobuf(
+              metadata_row_value{
+                .start_offset = std::min(opt->start_offset, batch_base),
+                .next_offset = opt->next_offset,
+                .compaction_epoch = opt->compaction_epoch,
+                .size = opt->size + size_sum,
+                .num_extents = opt->num_extents + extents.size(),
+              }),
+          });
+
+        // Prepend term_starts for terms strictly below the current minimum term
+        // (the boundary term covering the lowest existing offset is already
+        // anchored by adoption).
+        auto terms_it = new_terms.find(tidp);
+        if (terms_it != new_terms.end() && !terms_it->second.empty()) {
+            auto cur_min_res = co_await state.get_term_le(tidp, connect_to);
+            if (!cur_min_res.has_value()) {
+                co_return std::unexpected(wrap_read_err(
+                  std::move(cur_min_res.error()),
+                  "Error reading minimum term for {}",
+                  tidp));
+            }
+            const auto cur_min = cur_min_res.value();
+            for (const auto& ts : terms_it->second) {
+                if (!cur_min.has_value() || ts.term_id < cur_min->term_id) {
+                    out.emplace_back(
+                      write_batch_row{
+                        .key = term_row_key::encode(tidp, ts.term_id),
+                        .value = serde::to_iobuf(
+                          term_row_value{
+                            .term_start_offset = ts.start_offset,
+                          }),
+                      });
+                }
+            }
+        }
+    }
+    co_return std::expected<void, db_update_error>{};
+}
+
+std::expected<void, db_update_error>
+import_objects_db_update::validate_inputs() const {
+    if (new_objects.empty()) {
+        return std::unexpected(
+          db_update_error(invalid_input, "No objects requested"));
+    }
+    sorted_extents_by_tidp_t new_extents;
+    for (const auto& o : new_objects) {
+        o.collect_extents_by_tidp(&new_extents);
+    }
+    for (const auto& [tidp, extents] : new_extents) {
+        auto expected_next = extents.begin()->base_offset;
+        for (const auto& extent : extents) {
+            if (extent.base_offset > extent.last_offset) {
+                return std::unexpected(db_update_error(
+                  invalid_input,
+                  fmt::format(
+                    "import_objects inverted extent for {}: {} > {}",
+                    tidp,
+                    extent.base_offset,
+                    extent.last_offset)));
+            }
+            if (extent.base_offset != expected_next) {
+                return std::unexpected(db_update_error(
+                  invalid_input,
+                  fmt::format(
+                    "import_objects non-contiguous batch for {}: expected {}, "
+                    "got {}",
+                    tidp,
+                    expected_next,
+                    extent.base_offset)));
+            }
+            expected_next = kafka::next_offset(extent.last_offset);
+        }
+    }
+    return std::expected<void, db_update_error>{};
+}
+
+ss::future<std::expected<void, db_update_error>>
 compact_objects_db_update::build_rows(
   state_reader& state, chunked_vector<write_batch_row>& out) const {
     auto validate_res = validate_inputs();
