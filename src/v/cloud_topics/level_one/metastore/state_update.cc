@@ -517,6 +517,7 @@ add_objects_update::apply(state& state) {
     }
     for (const auto& [tidp, extents] : extents_by_tp) {
         auto p_state = state.partition_state(tidp);
+        const bool is_new_partition = !p_state.has_value();
         kafka::offset expected_next;
         if (p_state) {
             expected_next = p_state->get().next_offset;
@@ -543,6 +544,13 @@ add_objects_update::apply(state& state) {
         if (extents.begin()->base_offset == expected_next) {
             auto& t_state = state.topic_to_state[tidp.topic_id];
             auto& p_state = t_state.pid_to_state[tidp.partition];
+            // A new partition's log starts at its first extent's base. This
+            // matters for a TS-migrated partition adopted at a non-zero CT base:
+            // without this the start would default to 0. Matches the lsm backend
+            // (lsm/state_update.cc, new-partition start_offset = base).
+            if (is_new_partition) {
+                p_state.start_offset = extents.begin()->base_offset;
+            }
             // We've validated that all extents form a contiguous offset space.
             // Accept them all.
             for (const auto& e : extents) {
