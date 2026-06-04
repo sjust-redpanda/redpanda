@@ -214,6 +214,20 @@ make_log_batch(model::offset base, int count, model::record_batch_type bt) {
       });
 }
 
+// Build a transaction control batch (raft_data + control attr) at a given
+// LOG offset.
+model::record_batch make_control_batch(model::offset base, int count) {
+    std::vector<size_t> record_sizes(static_cast<size_t>(count), 100);
+    return model::test::make_random_batch(
+      model::test::record_batch_spec{
+        .offset = base,
+        .count = count,
+        .bt = model::record_batch_type::raft_data,
+        .is_control = true,
+        .record_sizes = record_sizes,
+      });
+}
+
 // Concatenate batches into a single TS segment (on-disk format).
 iobuf make_ts_segment_multi(std::vector<model::record_batch> batches) {
     iobuf out;
@@ -398,6 +412,68 @@ TEST(OpenObjectTsTest, ReadImportedExtentEmitsOnlyRaftData) {
     EXPECT_EQ(got[0].header().type, model::record_batch_type::raft_data);
     EXPECT_EQ(got[0].base_offset(), kafka::offset_cast(1_o));
     EXPECT_EQ(got[0].last_offset(), kafka::offset_cast(3_o));
+}
+
+// Transaction control batches (commit/abort markers) are raft_data with the
+// control attribute set. They must never be surfaced to Kafka clients (native
+// CT L1 strips them at reconciliation). A control batch still consumes a Kafka
+// offset, leaving a gap. Layout (log offsets, delta 0):
+//   raft_data         @ [0,2]  -> kafka [0,2]
+//   control           @ [3]    -> dropped (kafka gap at 3)
+//   raft_data         @ [4,5]  -> kafka [4,5]
+TEST(OpenObjectTsTest, ReadImportedExtentDropsControlBatches) {
+    fake_io fio;
+    const ss::sstring ts_path = "00000000000000000000-4-v1.log";
+
+    std::vector<model::record_batch> batches;
+    batches.push_back(
+      make_log_batch(model::offset{0}, 3, model::record_batch_type::raft_data));
+    batches.push_back(make_control_batch(model::offset{3}, 1));
+    batches.push_back(
+      make_log_batch(model::offset{4}, 2, model::record_batch_type::raft_data));
+    auto segment = make_ts_segment_multi(std::move(batches));
+    size_t sz = segment.size_bytes();
+    fio.put_ts_segment(
+      ts_path, std::move(segment), 0_o, 5_o, model::offset_delta{0});
+
+    auto tidp = model::topic_id_partition{
+      model::topic_id(uuid_t::create()), model::partition_id{0}};
+    ss::abort_source as;
+    object_extent extent{
+      .id = create_object_id(),
+      .position = 0,
+      .size = sz,
+      .imported = make_imported_info(ts_path, 0_o, 5_o, model::offset_delta{0}),
+    };
+    auto handle_result = fio.open_object(extent, &as).get();
+    ASSERT_TRUE(handle_result.has_value());
+    auto& handle = *handle_result;
+
+    auto seek = handle->index().seek_to_offset(tidp, 0_o);
+    ASSERT_TRUE(seek.has_value());
+    auto reader_result = handle->open_reader(*seek, &as).get();
+    ASSERT_TRUE(reader_result.has_value());
+    auto& reader = *reader_result;
+    auto _r = ss::defer([&reader] { reader->close().get(); });
+
+    std::vector<model::record_batch> got;
+    while (true) {
+        auto item = reader->read_next().get();
+        if (std::holds_alternative<object_reader::eof>(item)) {
+            break;
+        }
+        ASSERT_TRUE(std::holds_alternative<model::record_batch>(item));
+        got.push_back(std::move(std::get<model::record_batch>(item)));
+    }
+
+    ASSERT_EQ(got.size(), 2u) << "control batch must not surface";
+    for (const auto& b : got) {
+        EXPECT_FALSE(b.header().attrs.is_control());
+    }
+    EXPECT_EQ(got[0].base_offset(), kafka::offset_cast(0_o));
+    EXPECT_EQ(got[0].last_offset(), kafka::offset_cast(2_o));
+    EXPECT_EQ(got[1].base_offset(), kafka::offset_cast(4_o));
+    EXPECT_EQ(got[1].last_offset(), kafka::offset_cast(5_o));
 }
 
 // open_object with an imported extent whose ts_path was never injected must

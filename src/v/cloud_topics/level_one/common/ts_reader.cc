@@ -95,6 +95,14 @@ tiered_storage_object_reader::fetch_next_translated() {
         if (header.type != model::record_batch_type::raft_data) {
             continue;
         }
+        // Drop transaction control batches (commit/abort markers). They are
+        // never surfaced to Kafka clients -- native CT L1 strips them during
+        // L0->L1 reconciliation -- so imported reads must do the same. Like an
+        // aborted data batch, a control batch consumes a Kafka offset (leaving
+        // a gap) but does not move the delta.
+        if (header.attrs.is_control()) {
+            continue;
+        }
         header.base_offset = model::offset{
           header.base_offset() - _running_delta()};
         co_return model::record_batch(
