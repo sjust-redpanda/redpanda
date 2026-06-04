@@ -30,6 +30,7 @@ enum class update_key : uint8_t {
     preregister_objects = 5,
     expire_preregistered_objects = 6,
     replace_objects = 7,
+    import_objects = 8,
 };
 
 using stm_update_error = named_type<ss::sstring, struct update_error_tag>;
@@ -92,6 +93,33 @@ struct add_objects_update
     std::expected<std::monostate, stm_update_error> can_apply(
       const state&,
       chunked_hash_map<model::topic_id_partition, kafka::offset>* = nullptr);
+    std::expected<std::monostate, stm_update_error> apply(state&);
+
+    chunked_vector<new_object> new_objects;
+    term_state_update_t new_terms;
+};
+
+// Registers extents that lie *below* the partition's current start_offset --
+// used by the TS->CT migration import driver to bring tiered-storage segments
+// into L1 by reference. Unlike add_objects (which appends forward from
+// next_offset), import_objects prepends a contiguous batch whose top connects to
+// the current start_offset, lowers start_offset to the batch base, and prepends
+// term_starts for terms below the current minimum. next_offset is unchanged.
+//
+// The partition must already exist (adopted at the CT base via add_objects).
+// Re-applying a batch already below start_offset is a no-op (idempotent).
+struct import_objects_update
+  : public serde::envelope<
+      import_objects_update,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    friend bool operator==(
+      const import_objects_update&, const import_objects_update&)
+      = default;
+    auto serde_fields() { return std::tie(new_objects, new_terms); }
+
+    static constexpr auto key{update_key::import_objects};
+
     std::expected<std::monostate, stm_update_error> apply(state&);
 
     chunked_vector<new_object> new_objects;
@@ -336,6 +364,8 @@ struct fmt::formatter<cloud_topics::l1::update_key> final
               "expire_preregistered_objects", ctx);
         case cloud_topics::l1::update_key::replace_objects:
             return formatter<string_view>::format("replace_objects", ctx);
+        case cloud_topics::l1::update_key::import_objects:
+            return formatter<string_view>::format("import_objects", ctx);
         }
     }
 };

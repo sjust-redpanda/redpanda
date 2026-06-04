@@ -605,6 +605,96 @@ add_objects_update::apply(state& state) {
 }
 
 std::expected<std::monostate, stm_update_error>
+import_objects_update::apply(state& state) {
+    sorted_extents_by_tidp_t extents_by_tp;
+    for (const auto& o : new_objects) {
+        o.collect_extents_by_tidp(&extents_by_tp);
+        state.objects[o.oid] = object_entry{
+          .total_data_size = 0,
+          .removed_data_size = 0,
+          .footer_pos = o.footer_pos,
+          .object_size = o.object_size,
+          .last_updated = model::timestamp::now(),
+          .is_preregistration = false,
+        };
+    }
+    for (const auto& [tidp, extents] : extents_by_tp) {
+        if (extents.empty()) {
+            continue;
+        }
+        auto p_ref = state.partition_state(tidp);
+        if (!p_ref.has_value() || p_ref->get().extents.empty()) {
+            // Import prepends below an adopted partition's CT data; there must
+            // be existing extents to connect to.
+            return std::unexpected(stm_update_error{fmt::format(
+              "import_objects into partition {} with no existing extents",
+              tidp)});
+        }
+        // Validate the batch is internally contiguous and that its top connects
+        // to the lowest existing extent (it sits immediately below the CT data).
+        // TODO(import): make a re-applied batch a no-op for resumption.
+        kafka::offset expected = extents.begin()->base_offset;
+        for (const auto& e : extents) {
+            if (e.base_offset > e.last_offset) {
+                return std::unexpected(stm_update_error{fmt::format(
+                  "import_objects inverted extent for {}: {} > {}",
+                  tidp,
+                  e.base_offset,
+                  e.last_offset)});
+            }
+            if (e.base_offset != expected) {
+                return std::unexpected(stm_update_error{fmt::format(
+                  "import_objects non-contiguous batch for {}: expected {}, "
+                  "got {}",
+                  tidp,
+                  expected,
+                  e.base_offset)});
+            }
+            expected = kafka::next_offset(e.last_offset);
+        }
+        const auto connect_to = p_ref->get().extents.begin()->base_offset;
+        if (expected != connect_to) {
+            return std::unexpected(stm_update_error{fmt::format(
+              "import_objects batch top {} does not connect to partition {} "
+              "extents starting at {}",
+              expected,
+              tidp,
+              connect_to)});
+        }
+
+        auto& t_state = state.topic_to_state[tidp.topic_id];
+        auto& p_state = t_state.pid_to_state[tidp.partition];
+        for (const auto& e : extents) {
+            p_state.extents.emplace(e);
+            state.objects[e.oid].total_data_size += e.len;
+        }
+        // Lower the partition start to the bottom of the imported batch if it
+        // sat above it. next_offset (the tail) is unchanged. (Backends differ
+        // on the adopted start: lsm uses the CT base, simple leaves 0; min()
+        // is correct for both.)
+        p_state.start_offset = std::min(
+          p_state.start_offset, extents.begin()->base_offset);
+
+        // Prepend term_starts for terms strictly below the current minimum
+        // term. The boundary term is already anchored by adoption, so terms at
+        // or above the current minimum are skipped.
+        auto terms_it = new_terms.find(tidp);
+        if (terms_it != new_terms.end()) {
+            const bool has_terms = !p_state.term_starts.empty();
+            const auto cur_min = has_terms
+                                   ? p_state.term_starts.begin()->term_id
+                                   : model::term_id{};
+            for (const auto& ts : terms_it->second) {
+                if (!has_terms || ts.term_id < cur_min) {
+                    p_state.term_starts.insert(ts);
+                }
+            }
+        }
+    }
+    return std::monostate{};
+}
+
+std::expected<std::monostate, stm_update_error>
 replace_objects_update::can_apply(const state& state) {
     auto layout_res = validate_new_objects_layout(state, new_objects);
     if (!layout_res.has_value()) {

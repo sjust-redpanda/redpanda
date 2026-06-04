@@ -2611,3 +2611,97 @@ TEST(AddObjectsUpdateTest, RejectsUnregisteredObject) {
     auto result = add_objects_update::build(s, std::move(objs), {});
     EXPECT_FALSE(result.has_value());
 }
+
+namespace {
+// An adopted, mid-migration partition: CT data [10..14] with the boundary term
+// (5) anchored below the CT base, simulating the post-Slice-7 state. start is
+// set to the CT base (the lsm-backend adoption value) so the import lowering is
+// exercised.
+state adopted_migrating_state(const model::topic_id_partition& tp) {
+    state s;
+    auto& p = s.topic_to_state[tp.topic_id].pid_to_state[tp.partition];
+    p.extents.emplace(extent{
+      .base_offset = 10_o,
+      .last_offset = 14_o,
+      .max_timestamp = 100_t,
+      .filepos = 0,
+      .len = 50,
+      .oid = oid1});
+    p.start_offset = 10_o;
+    p.next_offset = 15_o;
+    p.term_starts.insert(term_start{.term_id = 5_tm, .start_offset = 5_o});
+    return s;
+}
+} // namespace
+
+// import_objects prepends pre-migration extents below the CT data, lowers the
+// start offset, and prepends only genuinely-lower terms (the boundary term,
+// already anchored by adoption, is not duplicated).
+TEST(ImportObjectsUpdateTest, PrependsBelowStartLowersStartAndAddsLowerTerm) {
+    auto tp = model::topic_id_partition::from(tidp_a);
+    auto s = adopted_migrating_state(tp);
+
+    // Import [0..9] as two segments: [0..4] term 3 (new lower term -> added),
+    // [5..9] term 5 (already anchored at 5 -> skipped).
+    import_objects_update upd;
+    upd.new_objects.push_back(
+      new_obj_builder(oid2, 0, 40).add(tidp_a, 0_o, 4_o, 40_t, 0, 40).build());
+    upd.new_objects.push_back(
+      new_obj_builder(oid3, 0, 40).add(tidp_a, 5_o, 9_o, 90_t, 0, 40).build());
+    upd.new_terms[tp].push_back(
+      term_start{.term_id = 3_tm, .start_offset = 0_o});
+    upd.new_terms[tp].push_back(
+      term_start{.term_id = 5_tm, .start_offset = 5_o});
+
+    auto res = upd.apply(s);
+    ASSERT_TRUE(res.has_value()) << fmt::format("{}", res.error());
+
+    auto pr = s.partition_state(tp);
+    ASSERT_TRUE(pr.has_value());
+    const auto& ps = pr->get();
+
+    // Extents now tile [0..14] contiguously.
+    ASSERT_EQ(ps.extents.size(), 3u);
+    auto it = ps.extents.begin();
+    EXPECT_EQ(it->base_offset, 0_o);
+    EXPECT_EQ(it->last_offset, 4_o);
+    ++it;
+    EXPECT_EQ(it->base_offset, 5_o);
+    EXPECT_EQ(it->last_offset, 9_o);
+    ++it;
+    EXPECT_EQ(it->base_offset, 10_o);
+    EXPECT_EQ(it->last_offset, 14_o);
+
+    // Start lowered to the imported base; the tail (next_offset) is unchanged.
+    EXPECT_EQ(ps.start_offset, 0_o);
+    EXPECT_EQ(ps.next_offset, 15_o);
+
+    // term_starts: the lower term 3 is prepended; the boundary term 5 is not
+    // duplicated.
+    ASSERT_EQ(ps.term_starts.size(), 2u);
+    auto t = ps.term_starts.begin();
+    EXPECT_EQ(t->term_id, 3_tm);
+    EXPECT_EQ(t->start_offset, 0_o);
+    ++t;
+    EXPECT_EQ(t->term_id, 5_tm);
+    EXPECT_EQ(t->start_offset, 5_o);
+}
+
+// A batch whose top does not connect to the existing CT data (leaves a gap) is
+// rejected -- the no-gap invariant is preserved.
+TEST(ImportObjectsUpdateTest, RejectsNonConnectingBatch) {
+    auto tp = model::topic_id_partition::from(tidp_a);
+    auto s = adopted_migrating_state(tp);
+
+    // [0..8] tops out at 8; 8+1=9 != 10 (the CT data base) -> gap at 9.
+    import_objects_update upd;
+    upd.new_objects.push_back(
+      new_obj_builder(oid2, 0, 40).add(tidp_a, 0_o, 8_o, 40_t, 0, 40).build());
+    upd.new_terms[tp].push_back(
+      term_start{.term_id = 3_tm, .start_offset = 0_o});
+
+    auto res = upd.apply(s);
+    ASSERT_FALSE(res.has_value());
+    EXPECT_THAT(
+      fmt::format("{}", res.error()), testing::HasSubstr("does not connect"));
+}
