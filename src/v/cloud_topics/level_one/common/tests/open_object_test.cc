@@ -14,6 +14,7 @@
 #include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
 #include "model/fundamental.h"
+#include "model/record_batch_types.h"
 #include "model/tests/random_batch.h"
 #include "storage/record_batch_utils.h"
 
@@ -200,6 +201,28 @@ iobuf make_ts_segment(model::record_batch batch) {
     return batch_to_disk_iobuf(std::move(batch));
 }
 
+// Build a batch of a given type starting at a given LOG offset.
+model::record_batch
+make_log_batch(model::offset base, int count, model::record_batch_type bt) {
+    std::vector<size_t> record_sizes(static_cast<size_t>(count), 100);
+    return model::test::make_random_batch(
+      model::test::record_batch_spec{
+        .offset = base,
+        .count = count,
+        .bt = bt,
+        .record_sizes = record_sizes,
+      });
+}
+
+// Concatenate batches into a single TS segment (on-disk format).
+iobuf make_ts_segment_multi(std::vector<model::record_batch> batches) {
+    iobuf out;
+    for (auto& b : batches) {
+        out.append(batch_to_disk_iobuf(std::move(b)));
+    }
+    return out;
+}
+
 imported_segment_info make_imported_info(
   const ss::sstring& ts_path,
   kafka::offset base,
@@ -314,6 +337,67 @@ TEST(OpenObjectTsTest, ReadBatchesWithDeltaTranslation) {
     const auto& got = std::get<model::record_batch>(item);
     EXPECT_EQ(got.base_offset(), kafka::offset_cast(10_o));
     EXPECT_EQ(got.last_offset(), kafka::offset_cast(14_o));
+}
+
+// A TS segment is a raw redpanda log: besides raft_data it can hold
+// offset-translator batches (e.g. raft_configuration) and other non-data
+// batches (e.g. tx_fence). The reader must surface ONLY raft_data, advancing
+// the running delta for offset-translator batches by their offset span and
+// dropping everything else without moving the delta. Layout (log offsets):
+//   raft_configuration @ [0,1]  delta 0 -> 2   (translator: advances delta)
+//   tx_fence           @ [2]    dropped, delta stays 2 (leaves a kafka gap)
+//   raft_data          @ [3,5]  kafka [1,3]    (3 - delta 2 .. 5 - delta 2)
+TEST(OpenObjectTsTest, ReadImportedExtentEmitsOnlyRaftData) {
+    fake_io fio;
+    const ss::sstring ts_path = "00000000000000000000-3-v1.log";
+
+    std::vector<model::record_batch> batches;
+    batches.push_back(make_log_batch(
+      model::offset{0}, 2, model::record_batch_type::raft_configuration));
+    batches.push_back(
+      make_log_batch(model::offset{2}, 1, model::record_batch_type::tx_fence));
+    batches.push_back(
+      make_log_batch(model::offset{3}, 3, model::record_batch_type::raft_data));
+    auto segment = make_ts_segment_multi(std::move(batches));
+    size_t sz = segment.size_bytes();
+    fio.put_ts_segment(
+      ts_path, std::move(segment), 0_o, 3_o, model::offset_delta{0});
+
+    auto tidp = model::topic_id_partition{
+      model::topic_id(uuid_t::create()), model::partition_id{0}};
+    ss::abort_source as;
+    object_extent extent{
+      .id = create_object_id(),
+      .position = 0,
+      .size = sz,
+      .imported = make_imported_info(ts_path, 0_o, 3_o, model::offset_delta{0}),
+    };
+    auto handle_result = fio.open_object(extent, &as).get();
+    ASSERT_TRUE(handle_result.has_value());
+    auto& handle = *handle_result;
+
+    auto seek = handle->index().seek_to_offset(tidp, 0_o);
+    ASSERT_TRUE(seek.has_value());
+
+    auto reader_result = handle->open_reader(*seek, &as).get();
+    ASSERT_TRUE(reader_result.has_value());
+    auto& reader = *reader_result;
+    auto _r = ss::defer([&reader] { reader->close().get(); });
+
+    std::vector<model::record_batch> got;
+    while (true) {
+        auto item = reader->read_next().get();
+        if (std::holds_alternative<object_reader::eof>(item)) {
+            break;
+        }
+        ASSERT_TRUE(std::holds_alternative<model::record_batch>(item));
+        got.push_back(std::move(std::get<model::record_batch>(item)));
+    }
+
+    ASSERT_EQ(got.size(), 1u) << "only the raft_data batch should surface";
+    EXPECT_EQ(got[0].header().type, model::record_batch_type::raft_data);
+    EXPECT_EQ(got[0].base_offset(), kafka::offset_cast(1_o));
+    EXPECT_EQ(got[0].last_offset(), kafka::offset_cast(3_o));
 }
 
 // open_object with an imported extent whose ts_path was never injected must

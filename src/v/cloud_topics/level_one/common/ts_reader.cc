@@ -81,8 +81,18 @@ tiered_storage_object_reader::fetch_next_translated() {
               records_size,
               records_buf.size_bytes()));
         }
+        // Non-data batches that the offset translator strips: advance the
+        // running delta by the number of log offsets they consume (matching
+        // raft::offset_translator) and skip them.
         if (std::ranges::contains(translator_types, header.type)) {
-            _running_delta += static_cast<int64_t>(header.record_count);
+            _running_delta += static_cast<int64_t>(header.last_offset_delta + 1);
+            continue;
+        }
+        // Emit only raft_data, like the production cloud read path. Any other
+        // batch type (e.g. tx_fence) still consumes a Kafka offset -- leaving a
+        // gap -- but is never surfaced to the fetch path, and does not move the
+        // delta (it is not an offset-translator type).
+        if (header.type != model::record_batch_type::raft_data) {
             continue;
         }
         header.base_offset = model::offset{
