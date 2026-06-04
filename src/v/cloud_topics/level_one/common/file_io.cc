@@ -236,6 +236,16 @@ public:
     open_reader(const seek_result& seek, ss::abort_source* as) override {
         vassert(_extent.imported.has_value(), "missing imported info");
         auto delta = seek.delta.value_or(_extent.imported->delta_offset);
+        // This downloads the whole segment suffix [file_position, segment_end)
+        // up front, even when the fetch stops early (max_offset/max_bytes).
+        // Bounding the download to the fetch window was considered and
+        // deferred: it is a perf refinement (the native L1 path downloads
+        // seek..end the same way), and a naive length cap is a data-loss bug --
+        // the reader would hit EOF early and level_one_reader would treat the
+        // object as finished, skipping the un-downloaded tail. A correct bound
+        // needs either a windowed/lazy data_source here (so EOF still only
+        // happens at the true segment end) or a read bound plumbed through the
+        // shared open_reader/object_index interface.
         auto stream_result = co_await download_ts_range(
           _extent.imported->ts_path, seek.file_position, seek.length, as);
         if (!stream_result.has_value()) {
