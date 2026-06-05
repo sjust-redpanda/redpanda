@@ -262,6 +262,45 @@ TEST_F(GarbageCollectorTest, TestGarbageCollectIODeleteFailure) {
     EXPECT_EQ(objects_before_gc, stm->state().objects.size());
 }
 
+// detach mode removes the metastore rows but must not delete the backing
+// objects: it succeeds even when the io layer would fail a delete, and the
+// cloud objects remain.
+TEST_F(GarbageCollectorTest, TestRemoveObjectsDetachSkipsIoDelete) {
+    initialize_state_machines(1).get();
+    wait_for_leader(5s).get();
+    auto stm = get_stm<0>(*nodes().begin()->second);
+
+    constexpr auto partitions_count = 3;
+    add_objects(stm.get(), partitions_count, 999).get();
+    for (int i = 0; i < partitions_count; ++i) {
+        set_start_offset(stm.get(), make_tp(i), o{1000}).get();
+    }
+    ASSERT_EQ(partitions_count, count_objects());
+
+    chunked_vector<object_location> to_remove;
+    for (const auto& [oid, entry] : stm->state().objects) {
+        to_remove.push_back(
+          object_location{
+            .id = oid,
+            .ts_path = entry.imported_ts_location.transform(
+              [](const imported_ts_object_location& loc) {
+                  return loc.ts_path;
+              })});
+    }
+    ASSERT_FALSE(to_remove.empty());
+
+    // A failing io would fail a real delete; detach must not call it.
+    failing_io fail_io(&_io);
+    garbage_collector gc(stm.get(), &fail_io);
+    auto res = gc.remove_objects(
+                   std::move(to_remove), removal_mode::detach, &never_abort)
+                 .get();
+    ASSERT_TRUE(res.has_value());
+    // Metastore rows gone, but the backing cloud objects are left untouched.
+    EXPECT_EQ(0, stm->state().objects.size());
+    EXPECT_EQ(partitions_count, count_objects());
+}
+
 TEST_F(GarbageCollectorTest, TestNonLeaderFails) {
     initialize_state_machines(3).get();
     auto leader_id = wait_for_leader(5s).get();

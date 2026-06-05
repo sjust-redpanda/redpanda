@@ -10,6 +10,8 @@
 #pragma once
 
 #include "base/seastarx.h"
+#include "cloud_topics/level_one/common/object_id.h"
+#include "container/chunked_vector.h"
 #include "utils/named_type.h"
 
 #include <seastar/core/abort_source.hh>
@@ -29,6 +31,16 @@ public:
     using error = named_type<ss::sstring, struct gc_error_tag>;
     ss::future<std::expected<void, error>>
     remove_unreferenced_objects(ss::abort_source*);
+
+    // Removes the given objects' metastore rows. In `gc` mode the backing
+    // objects are first deleted from object storage (for an imported segment,
+    // also its .tx and .index); in `detach` mode the backing objects are left
+    // untouched (their storage is owned elsewhere -- e.g. by the archiver while
+    // a tiered->cloud migration is in progress).
+    ss::future<std::expected<void, error>> remove_objects(
+      chunked_vector<object_location> to_remove,
+      removal_mode mode,
+      ss::abort_source*);
 
 private:
     // Callers are expected to ensure this object outlives the stm and io.
