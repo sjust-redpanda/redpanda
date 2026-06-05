@@ -226,6 +226,36 @@ FIXTURE_TEST(test_archival_stm_happy_path, archival_metadata_stm_fixture) {
       == cluster::archival_metadata_stm::state_dirty::clean);
 }
 
+// The tiered->cloud migration flag is settable and idempotent, and is cleared
+// by reset_metadata at cutover.
+FIXTURE_TEST(test_migration_state_flag, archival_metadata_stm_fixture) {
+    wait_for_confirmed_leader();
+
+    // Not migrating initially.
+    BOOST_REQUIRE(!archival_stm->is_migrating());
+
+    // Set the flag.
+    BOOST_REQUIRE(
+      !archival_stm
+         ->set_migration_state(true, ss::lowres_clock::now() + 10s, never_abort)
+         .get());
+    BOOST_REQUIRE(archival_stm->is_migrating());
+
+    // Setting it again is a harmless no-op.
+    BOOST_REQUIRE(
+      !archival_stm
+         ->set_migration_state(true, ss::lowres_clock::now() + 10s, never_abort)
+         .get());
+    BOOST_REQUIRE(archival_stm->is_migrating());
+
+    // reset_metadata (cutover) clears the flag.
+    auto batcher = archival_stm->batch_start(
+      ss::lowres_clock::now() + 10s, never_abort);
+    batcher.reset_metadata();
+    batcher.replicate().get();
+    BOOST_REQUIRE(!archival_stm->is_migrating());
+}
+
 FIXTURE_TEST(
   test_archival_stm_update_lco_when_compacted_segment_added,
   archival_metadata_stm_fixture) {
