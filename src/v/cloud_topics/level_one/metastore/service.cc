@@ -45,6 +45,12 @@ ss::future<set_start_offset_reply> service::set_start_offset(
       std::move(request), leader_router::local_only::yes);
 }
 
+ss::future<set_migration_phase_reply> service::set_migration_phase(
+  set_migration_phase_request request, ::rpc::streaming_context&) {
+    return _leader_router->local().set_migration_phase(
+      std::move(request), leader_router::local_only::yes);
+}
+
 ss::future<remove_topics_reply> service::remove_topics(
   remove_topics_request request, ::rpc::streaming_context&) {
     return _leader_router->local().remove_topics(

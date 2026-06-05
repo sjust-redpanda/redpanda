@@ -82,6 +82,10 @@ public:
         return _set_start_offset.auto_measure();
     }
 
+    std::unique_ptr<hist_t::measurement> auto_measure_set_migration_phase() {
+        return _set_migration_phase.auto_measure();
+    }
+
     std::unique_ptr<hist_t::measurement> auto_measure_remove_topics() {
         return _remove_topics.auto_measure();
     }
@@ -119,6 +123,7 @@ private:
     hist_t _get_term_for_offset;
     hist_t _get_end_offset_for_term;
     hist_t _set_start_offset;
+    hist_t _set_migration_phase;
     hist_t _remove_topics;
     hist_t _get_compaction_infos;
     hist_t _get_extent_metadata;

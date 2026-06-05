@@ -322,6 +322,47 @@ protected:
         return std::monostate{};
     }
 
+    std::expected<std::monostate, stm_update_error> apply_set_migration_phase(
+      const model::topic_id_partition& tp, migration_phase phase) {
+        if (GetParam() == state_backend::simple) {
+            auto update = set_migration_phase_update::build(state_, tp, phase);
+            if (!update.has_value()) {
+                return std::unexpected(
+                  stm_update_error{fmt::format("{}", update.error())});
+            }
+            return update->apply(state_);
+        }
+        set_migration_phase_db_update db_update{
+          .tp = tp,
+          .phase = phase,
+        };
+        auto reader = state_reader(db_->create_snapshot());
+        chunked_vector<write_batch_row> rows;
+        auto result = db_update.build_rows(reader, rows).get();
+        if (!result.has_value()) {
+            return std::unexpected(
+              stm_update_error{fmt::format("{}", result.error())});
+        }
+        apply_rows_to_db(rows);
+        return std::monostate{};
+    }
+
+    // Reads the partition's migration_phase from whichever backend is active,
+    // defaulting to `none` when the partition has no state yet.
+    migration_phase read_migration_phase(const model::topic_id_partition& tp) {
+        if (GetParam() == state_backend::simple) {
+            auto prt = state_.partition_state(tp);
+            return prt.has_value() ? prt->get().migration_phase
+                                   : migration_phase::none;
+        }
+        auto reader = state_reader(db_->create_snapshot());
+        auto meta = reader.get_metadata(tp).get();
+        if (!meta.has_value() || !meta->has_value()) {
+            return migration_phase::none;
+        }
+        return (*meta)->migration_phase;
+    }
+
     std::expected<std::monostate, stm_update_error>
     apply_remove_topics(std::initializer_list<model::topic_id> topics_list) {
         chunked_vector<model::topic_id> topics;
@@ -540,6 +581,60 @@ TEST_P(StateUpdateParamTest, TestAddBasic) {
         EXPECT_TRUE(res.has_value());
         EXPECT_EQ(3, get_state().topic_to_state.size());
     }
+}
+
+TEST_P(StateUpdateParamTest, TestSetMigrationPhaseCreatesOnAbsentPartition) {
+    auto tp = model::topic_id_partition::from(tidp_a);
+    // Setting `migrating` on a partition with no prior state creates it.
+    EXPECT_EQ(read_migration_phase(tp), migration_phase::none);
+    auto res = apply_set_migration_phase(tp, migration_phase::migrating);
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(read_migration_phase(tp), migration_phase::migrating);
+}
+
+TEST_P(StateUpdateParamTest, TestSetMigrationPhaseMonotonicForward) {
+    auto tp = model::topic_id_partition::from(tidp_a);
+    ASSERT_TRUE(
+      apply_set_migration_phase(tp, migration_phase::migrating).has_value());
+    ASSERT_TRUE(
+      apply_set_migration_phase(tp, migration_phase::complete).has_value());
+    EXPECT_EQ(read_migration_phase(tp), migration_phase::complete);
+}
+
+TEST_P(StateUpdateParamTest, TestSetMigrationPhaseRejectsBackward) {
+    auto tp = model::topic_id_partition::from(tidp_a);
+    ASSERT_TRUE(
+      apply_set_migration_phase(tp, migration_phase::complete).has_value());
+    // A backward transition (complete -> migrating) is rejected and leaves the
+    // phase unchanged.
+    auto res = apply_set_migration_phase(tp, migration_phase::migrating);
+    EXPECT_FALSE(res.has_value());
+    EXPECT_EQ(read_migration_phase(tp), migration_phase::complete);
+}
+
+TEST_P(StateUpdateParamTest, TestSetMigrationPhaseIdempotent) {
+    auto tp = model::topic_id_partition::from(tidp_a);
+    ASSERT_TRUE(
+      apply_set_migration_phase(tp, migration_phase::migrating).has_value());
+    // Re-setting the current phase is a no-op success.
+    auto res = apply_set_migration_phase(tp, migration_phase::migrating);
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(read_migration_phase(tp), migration_phase::migrating);
+}
+
+TEST_P(StateUpdateParamTest, TestSetMigrationPhasePreservedAcrossAddObjects) {
+    auto tp = model::topic_id_partition::from(tidp_a);
+    ASSERT_TRUE(
+      apply_set_migration_phase(tp, migration_phase::migrating).has_value());
+    auto update = add_objects_builder()
+                    .add(new_obj_builder(oid1, 100, 1100)
+                           .add(tidp_a, 0_o, 10_o, 1999_t, 0, 99)
+                           .build())
+                    .add_term_start(tidp_a, 0_tm, 0_o)
+                    .build();
+    ASSERT_TRUE(apply_add_objects(std::move(update)).has_value());
+    // Adding objects must not clobber the migration phase.
+    EXPECT_EQ(read_migration_phase(tp), migration_phase::migrating);
 }
 
 TEST_P(StateUpdateParamTest, TestDuplicateAddSingleUpdate) {

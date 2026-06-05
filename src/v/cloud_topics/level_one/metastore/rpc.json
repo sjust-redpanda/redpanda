@@ -72,6 +72,11 @@
             "output_type": "set_start_offset_reply"
         },
         {
+            "name": "set_migration_phase",
+            "input_type": "set_migration_phase_request",
+            "output_type": "set_migration_phase_reply"
+        },
+        {
             "name": "remove_topics",
             "input_type": "remove_topics_request",
             "output_type": "remove_topics_reply"

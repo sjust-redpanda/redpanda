@@ -94,6 +94,9 @@ public:
     ss::future<rpc::set_start_offset_reply> set_start_offset(
       rpc::set_start_offset_request, local_only = local_only::no);
 
+    ss::future<rpc::set_migration_phase_reply> set_migration_phase(
+      rpc::set_migration_phase_request, local_only = local_only::no);
+
     ss::future<rpc::remove_topics_reply>
       remove_topics(rpc::remove_topics_request, local_only = local_only::no);
 
@@ -208,6 +211,11 @@ private:
 
     ss::future<rpc::set_start_offset_reply> set_start_offset_locally(
       rpc::set_start_offset_request,
+      const model::ntp& metastore_ntp,
+      ss::shard_id);
+
+    ss::future<rpc::set_migration_phase_reply> set_migration_phase_locally(
+      rpc::set_migration_phase_request,
       const model::ntp& metastore_ntp,
       ss::shard_id);
 

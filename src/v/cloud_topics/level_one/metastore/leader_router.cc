@@ -162,6 +162,17 @@ ss::future<rpc::set_start_offset_reply> do_set_start_offset(
     co_return co_await domain_mgr->set_start_offset(std::move(req));
 }
 
+ss::future<rpc::set_migration_phase_reply> do_set_migration_phase(
+  domain_supervisor& domain_supervisor,
+  const model::ntp& ntp,
+  rpc::set_migration_phase_request req) {
+    auto domain_mgr = domain_supervisor.get(ntp);
+    if (!domain_mgr) {
+        co_return rpc::set_migration_phase_reply{.ec = rpc::errc::not_leader};
+    }
+    co_return co_await domain_mgr->set_migration_phase(std::move(req));
+}
+
 ss::future<rpc::remove_topics_reply> do_remove_topics(
   domain_supervisor& domain_supervisor,
   const model::ntp& ntp,
@@ -437,6 +448,14 @@ template ss::future<rpc::set_start_offset_reply> leader_router::process<
   &leader_router::set_start_offset_locally,
   &leader_router::client::set_start_offset>(
   rpc::set_start_offset_request, bool);
+
+template ss::future<rpc::set_migration_phase_reply>
+  leader_router::remote_dispatch<&leader_router::client::set_migration_phase>(
+    rpc::set_migration_phase_request, model::node_id);
+template ss::future<rpc::set_migration_phase_reply> leader_router::process<
+  &leader_router::set_migration_phase_locally,
+  &leader_router::client::set_migration_phase>(
+  rpc::set_migration_phase_request, bool);
 
 template ss::future<rpc::flush_domain_reply>
   leader_router::remote_dispatch<&leader_router::client::flush_domain>(
@@ -775,6 +794,28 @@ ss::future<rpc::set_start_offset_reply> leader_router::set_start_offset(
     co_return co_await process<
       &leader_router::set_start_offset_locally,
       &client::set_start_offset>(std::move(request), bool(local_only_exec));
+}
+
+ss::future<rpc::set_migration_phase_reply>
+leader_router::set_migration_phase_locally(
+  rpc::set_migration_phase_request request,
+  const model::ntp& metastore_ntp,
+  ss::shard_id shard) {
+    auto m = _probe.auto_measure_set_migration_phase();
+    co_return co_await container().invoke_on(
+      shard,
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+          return do_set_migration_phase(
+            *(fe._domain_supervisor), metastore_ntp, std::move(req));
+      });
+}
+
+ss::future<rpc::set_migration_phase_reply> leader_router::set_migration_phase(
+  rpc::set_migration_phase_request request, local_only local_only_exec) {
+    auto holder = _gate.hold();
+    co_return co_await process<
+      &leader_router::set_migration_phase_locally,
+      &client::set_migration_phase>(std::move(request), bool(local_only_exec));
 }
 
 ss::future<rpc::remove_topics_reply> leader_router::remove_topics_locally(
