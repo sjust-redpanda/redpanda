@@ -938,6 +938,62 @@ set_start_offset_update::apply(state& state) {
     return std::monostate{};
 }
 
+std::expected<set_migration_phase_update, stm_update_error>
+set_migration_phase_update::build(
+  const state& state,
+  const model::topic_id_partition& tp,
+  migration_phase phase,
+  bool* is_no_op) {
+    set_migration_phase_update update{
+      .tp = tp,
+      .phase = phase,
+    };
+    auto allowed = update.can_apply(state, is_no_op);
+    if (!allowed.has_value()) {
+        return std::unexpected(allowed.error());
+    }
+    return update;
+}
+
+std::expected<std::monostate, stm_update_error>
+set_migration_phase_update::can_apply(const state& state, bool* is_no_op) {
+    // An absent partition has the default phase `none`; setting migrating or
+    // complete creates it (the migrating marker may be the partition's first
+    // write).
+    auto prt_ref = state.partition_state(tp);
+    auto current = prt_ref.has_value() ? prt_ref->get().migration_phase
+                                       : migration_phase::none;
+    using underlying = std::underlying_type_t<migration_phase>;
+    if (static_cast<underlying>(phase) < static_cast<underlying>(current)) {
+        return std::unexpected(stm_update_error(
+          fmt::format(
+            "Migration phase transition for {} is not monotonic: {} -> {}",
+            tp,
+            static_cast<underlying>(current),
+            static_cast<underlying>(phase))));
+    }
+    if (is_no_op) {
+        *is_no_op = phase == current;
+    }
+    return std::monostate{};
+}
+
+std::expected<std::monostate, stm_update_error>
+set_migration_phase_update::apply(state& state) {
+    bool is_no_op = false;
+    auto allowed = can_apply(state, &is_no_op);
+    if (!allowed.has_value()) {
+        return std::unexpected(allowed.error());
+    }
+    if (is_no_op) {
+        return std::monostate{};
+    }
+    auto& p_state
+      = state.topic_to_state[tp.topic_id].pid_to_state[tp.partition];
+    p_state.migration_phase = phase;
+    return std::monostate{};
+}
+
 std::expected<remove_objects_update, stm_update_error>
 remove_objects_update::build(
   const state& state, chunked_vector<object_id> objects) {

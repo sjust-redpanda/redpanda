@@ -17,6 +17,7 @@
 #include "model/fundamental.h"
 #include "model/timestamp.h"
 #include "serde/envelope.h"
+#include "serde/rw/enum.h"
 #include "serde/rw/envelope.h"
 #include "serde/rw/optional.h"
 #include "serde/rw/set.h"
@@ -283,11 +284,29 @@ public:
     tombstone_range_set_t cleaned_ranges_with_tombstones;
 };
 
+// Classifies a partition as mid-migration vs. cloud topic for offline/remote
+// consumers (cluster recovery, read-replica), which cannot observe the live
+// archival-STM routing signal. Durable, per-partition, flushed to the bucket
+// and restored. Monotonic: none -> migrating -> complete. The default `none`
+// is what an old snapshot without the field decodes to -- correct, since
+// pre-feature data is a native cloud topic.
+enum class migration_phase : uint8_t {
+    // Never migrated: native cloud topic, or pre-trigger. Serve as a cloud
+    // topic.
+    none = 0,
+    // Tiered->cloud in progress. Authoritative data is in tiered storage; L1
+    // holds the (possibly incomplete) imported mirror. Serve as tiered storage.
+    migrating = 1,
+    // Cut over. Authoritative data is in L1 (including imported extents). Serve
+    // as a cloud topic. Distinguished from `none` only for observability.
+    complete = 2,
+};
+
 // State tracked per Kafka partition. The extents added to this state must have
 // no overlaps and no gaps in order to ensure there is no data loss.
 struct partition_state
   : public serde::
-      envelope<partition_state, serde::version<0>, serde::compat_version<0>> {
+      envelope<partition_state, serde::version<1>, serde::compat_version<0>> {
     friend bool
     operator==(const partition_state&, const partition_state&) = default;
     auto serde_fields() {
@@ -297,7 +316,8 @@ struct partition_state
           next_offset,
           compaction_state,
           compaction_epoch,
-          term_starts);
+          term_starts,
+          migration_phase);
     }
 
     partition_state copy() const;
@@ -357,6 +377,11 @@ struct partition_state
     // has been prefix truncated to be empty. I.e. this list should never be
     // empty once there has been data in the log.
     absl::btree_set<term_start> term_starts;
+
+    // Migration classification for offline/remote consumers. Defaults to
+    // `none` (value-initialized to 0), so a snapshot predating this field
+    // restores as a native cloud topic. See `migration_phase`.
+    enum migration_phase migration_phase {};
 };
 
 // Tracks the state managed for each partition of a Kafka topic.

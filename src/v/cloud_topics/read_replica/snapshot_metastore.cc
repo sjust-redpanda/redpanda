@@ -171,6 +171,7 @@ snapshot_metastore::get_offsets(const model::topic_id_partition& tidp) {
     co_return offsets_response{
       .start_offset = metadata.start_offset,
       .next_offset = metadata.next_offset,
+      .migration_phase = metadata.migration_phase,
     };
 }
 
@@ -209,6 +210,12 @@ snapshot_metastore::replace_objects(
 ss::future<std::expected<void, l1::metastore::errc>>
 snapshot_metastore::set_start_offset(
   const model::topic_id_partition&, kafka::offset) {
+    co_return std::unexpected(errc::invalid_request);
+}
+
+ss::future<std::expected<void, l1::metastore::errc>>
+snapshot_metastore::set_migration_phase(
+  const model::topic_id_partition&, l1::migration_phase) {
     co_return std::unexpected(errc::invalid_request);
 }
 
