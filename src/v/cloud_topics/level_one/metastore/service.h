@@ -29,6 +29,9 @@ public:
     ss::future<add_objects_reply>
     add_objects(add_objects_request, ::rpc::streaming_context&) override;
 
+    ss::future<append_imported_objects_reply> append_imported_objects(
+      append_imported_objects_request, ::rpc::streaming_context&) override;
+
     ss::future<replace_objects_reply> replace_objects_no_compact(
       replace_objects_request, ::rpc::streaming_context&) override;
 

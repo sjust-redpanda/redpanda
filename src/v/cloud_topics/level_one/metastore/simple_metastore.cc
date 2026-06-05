@@ -18,6 +18,8 @@
 #include "container/chunked_vector.h"
 #include "model/fundamental.h"
 
+#include <map>
+
 namespace cloud_topics::l1 {
 
 namespace {
@@ -32,6 +34,47 @@ term_state_update_t make_terms_update(const metastore::term_offset_map_t& m) {
         ret[tp] = std::move(term_updates);
     }
     return ret;
+}
+
+// Convert imported-segment descriptors into new_objects (each a single-extent
+// imported object) and per-tidp term_starts (one per distinct term at its
+// lowest offset, since term_starts must have unique, monotonic term ids).
+void build_import_parts(
+  chunked_vector<metastore::imported_object> objs,
+  chunked_vector<new_object>& new_objects,
+  term_state_update_t& new_terms) {
+    chunked_hash_map<
+      model::topic_id_partition,
+      std::map<model::term_id, kafka::offset>>
+      term_min;
+    for (auto& o : objs) {
+        new_object no;
+        no.oid = create_object_id();
+        no.footer_pos = 0;
+        no.object_size = o.size_bytes;
+        no.extent_metas[o.tidp.topic_id][o.tidp.partition]
+          = new_object::metadata{
+            .base_offset = o.base_kafka_offset,
+            .last_offset = o.imported.last_kafka_offset,
+            .max_timestamp = o.max_timestamp,
+            .filepos = 0,
+            .len = o.size_bytes,
+          };
+        no.imported = o.imported;
+        new_objects.push_back(std::move(no));
+
+        auto& tmap = term_min[o.tidp];
+        auto it = tmap.find(o.term);
+        if (it == tmap.end() || o.base_kafka_offset < it->second) {
+            tmap[o.term] = o.base_kafka_offset;
+        }
+    }
+    for (auto& [tidp, tmap] : term_min) {
+        auto& terms = new_terms[tidp];
+        for (const auto& [term, off] : tmap) {
+            terms.push_back(term_start{.term_id = term, .start_offset = off});
+        }
+    }
 }
 } // namespace
 
@@ -327,6 +370,27 @@ simple_metastore::set_start_offset(
       apply_res.has_value(),
       "Apply must succeed if can_apply() is true: {}",
       apply_res.error());
+    co_return std::expected<void, metastore::errc>{};
+}
+
+ss::future<std::expected<void, metastore::errc>>
+simple_metastore::append_imported_objects(
+  chunked_vector<metastore::imported_object> objs) {
+    if (objs.empty()) {
+        co_return std::expected<void, metastore::errc>{};
+    }
+    chunked_vector<new_object> new_objects;
+    term_state_update_t new_terms;
+    build_import_parts(std::move(objs), new_objects, new_terms);
+    append_imported_objects_update update{
+      .new_objects = std::move(new_objects),
+      .new_terms = std::move(new_terms),
+    };
+    auto res = update.apply(state_);
+    if (!res.has_value()) {
+        vlog(cd_log.warn, "Failed to append imported objects: {}", res.error());
+        co_return std::unexpected(metastore::errc::invalid_request);
+    }
     co_return std::expected<void, metastore::errc>{};
 }
 

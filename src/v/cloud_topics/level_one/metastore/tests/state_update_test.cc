@@ -363,6 +363,64 @@ protected:
         return (*meta)->migration_phase;
     }
 
+    // Reads (start_offset, next_offset) for a partition from whichever backend
+    // is active.
+    std::pair<kafka::offset, kafka::offset>
+    read_offsets(const model::topic_id_partition& tp) {
+        if (GetParam() == state_backend::simple) {
+            auto prt = state_.partition_state(tp);
+            if (!prt.has_value()) {
+                return {kafka::offset{}, kafka::offset{}};
+            }
+            return {prt->get().start_offset, prt->get().next_offset};
+        }
+        auto reader = state_reader(db_->create_snapshot());
+        auto meta = reader.get_metadata(tp).get();
+        if (!meta.has_value() || !meta->has_value()) {
+            return {kafka::offset{}, kafka::offset{}};
+        }
+        return {(*meta)->start_offset, (*meta)->next_offset};
+    }
+
+    std::expected<std::monostate, stm_update_error> apply_append_imported(
+      chunked_vector<new_object> objs, term_state_update_t terms) {
+        if (GetParam() == state_backend::simple) {
+            append_imported_objects_update update{
+              .new_objects = std::move(objs),
+              .new_terms = std::move(terms),
+            };
+            return update.apply(state_);
+        }
+        append_imported_objects_db_update db_update{
+          .new_objects = std::move(objs),
+          .new_terms = std::move(terms),
+        };
+        auto reader = state_reader(db_->create_snapshot());
+        chunked_vector<write_batch_row> rows;
+        auto result = db_update.build_rows(reader, rows).get();
+        if (!result.has_value()) {
+            return std::unexpected(
+              stm_update_error{fmt::format("{}", result.error())});
+        }
+        apply_rows_to_db(rows);
+        return std::monostate{};
+    }
+
+    // Builds a single-extent imported new_object covering [base, last].
+    static new_object make_imported_object(
+      object_id oid,
+      std::string_view tidp_sv,
+      kafka::offset base,
+      kafka::offset last) {
+        auto o = new_obj_builder(oid, 0, 100)
+                   .add(tidp_sv, base, last, model::timestamp{1}, 0, 100)
+                   .build();
+        o.imported = imported_ts_info{
+          .ts_path = fmt::format("seg-{}-{}.log", base(), last()),
+        };
+        return o;
+    }
+
     std::expected<std::monostate, stm_update_error>
     apply_remove_topics(std::initializer_list<model::topic_id> topics_list) {
         chunked_vector<model::topic_id> topics;
@@ -635,6 +693,67 @@ TEST_P(StateUpdateParamTest, TestSetMigrationPhasePreservedAcrossAddObjects) {
     ASSERT_TRUE(apply_add_objects(std::move(update)).has_value());
     // Adding objects must not clobber the migration phase.
     EXPECT_EQ(read_migration_phase(tp), migration_phase::migrating);
+}
+
+// append_imported_objects seeds a fresh partition's start/next at the first
+// imported extent's base (a non-zero migration start) and marks it migrating.
+TEST_P(StateUpdateParamTest, TestAppendImportedSeedsNonZeroStart) {
+    auto tp = model::topic_id_partition::from(tidp_a);
+    chunked_vector<new_object> objs;
+    objs.push_back(make_imported_object(oid1, tidp_a, 100_o, 104_o));
+    term_state_update_t terms;
+    terms[tp].push_back(term_start{.term_id = 0_tm, .start_offset = 100_o});
+    ASSERT_TRUE(
+      apply_append_imported(std::move(objs), std::move(terms)).has_value());
+
+    auto [start, next] = read_offsets(tp);
+    EXPECT_EQ(start, 100_o);
+    EXPECT_EQ(next, 105_o);
+    EXPECT_EQ(read_migration_phase(tp), migration_phase::migrating);
+}
+
+// Successive imported batches forward-append at the tail.
+TEST_P(StateUpdateParamTest, TestAppendImportedForwardAppends) {
+    auto tp = model::topic_id_partition::from(tidp_a);
+    {
+        chunked_vector<new_object> objs;
+        objs.push_back(make_imported_object(oid1, tidp_a, 100_o, 104_o));
+        term_state_update_t terms;
+        terms[tp].push_back(term_start{.term_id = 0_tm, .start_offset = 100_o});
+        ASSERT_TRUE(
+          apply_append_imported(std::move(objs), std::move(terms)).has_value());
+    }
+    {
+        chunked_vector<new_object> objs;
+        objs.push_back(make_imported_object(oid2, tidp_a, 105_o, 109_o));
+        term_state_update_t terms;
+        terms[tp].push_back(term_start{.term_id = 0_tm, .start_offset = 105_o});
+        ASSERT_TRUE(
+          apply_append_imported(std::move(objs), std::move(terms)).has_value());
+    }
+    auto [start, next] = read_offsets(tp);
+    EXPECT_EQ(start, 100_o);
+    EXPECT_EQ(next, 110_o);
+}
+
+// A batch that does not connect at the tail is rejected (the mirror is
+// ordered).
+TEST_P(StateUpdateParamTest, TestAppendImportedRejectsNonContiguous) {
+    auto tp = model::topic_id_partition::from(tidp_a);
+    {
+        chunked_vector<new_object> objs;
+        objs.push_back(make_imported_object(oid1, tidp_a, 100_o, 104_o));
+        term_state_update_t terms;
+        terms[tp].push_back(term_start{.term_id = 0_tm, .start_offset = 100_o});
+        ASSERT_TRUE(
+          apply_append_imported(std::move(objs), std::move(terms)).has_value());
+    }
+    chunked_vector<new_object> objs;
+    objs.push_back(make_imported_object(oid2, tidp_a, 200_o, 204_o));
+    term_state_update_t terms;
+    terms[tp].push_back(term_start{.term_id = 0_tm, .start_offset = 200_o});
+    auto res = apply_append_imported(std::move(objs), std::move(terms));
+    EXPECT_FALSE(res.has_value());
 }
 
 TEST_P(StateUpdateParamTest, TestDuplicateAddSingleUpdate) {

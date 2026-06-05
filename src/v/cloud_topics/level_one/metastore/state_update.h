@@ -31,6 +31,7 @@ enum class update_key : uint8_t {
     expire_preregistered_objects = 6,
     replace_objects = 7,
     set_migration_phase = 8,
+    append_imported_objects = 9,
 };
 
 using stm_update_error = named_type<ss::sstring, struct update_error_tag>;
@@ -100,6 +101,33 @@ struct add_objects_update
     std::expected<std::monostate, stm_update_error> can_apply(
       const state&,
       chunked_hash_map<model::topic_id_partition, kafka::offset>* = nullptr);
+    std::expected<std::monostate, stm_update_error> apply(state&);
+
+    chunked_vector<new_object> new_objects;
+    term_state_update_t new_terms;
+};
+
+// Registers tiered-storage segments as imported L1 extents by reference (the
+// TS->CT migration mirror). Like add_objects it appends forward from the
+// partition's tail, sharing the contiguity/term/next_offset core; unlike
+// add_objects it seeds a *fresh* partition's start/next at the first imported
+// extent's base (a non-zero migration start rather than 0), threads the
+// imported location (ts_path) onto each object and the segment descriptor onto
+// each extent, and marks the partition migrating. The objects are external
+// (footer_pos 0) and not preregistered.
+struct append_imported_objects_update
+  : public serde::envelope<
+      append_imported_objects_update,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    friend bool operator==(
+      const append_imported_objects_update&,
+      const append_imported_objects_update&) = default;
+    auto serde_fields() { return std::tie(new_objects, new_terms); }
+
+    static constexpr auto key{update_key::append_imported_objects};
+
+    std::expected<std::monostate, stm_update_error> can_apply(const state&);
     std::expected<std::monostate, stm_update_error> apply(state&);
 
     chunked_vector<new_object> new_objects;
@@ -375,6 +403,9 @@ struct fmt::formatter<cloud_topics::l1::update_key> final
             return formatter<string_view>::format("replace_objects", ctx);
         case cloud_topics::l1::update_key::set_migration_phase:
             return formatter<string_view>::format("set_migration_phase", ctx);
+        case cloud_topics::l1::update_key::append_imported_objects:
+            return formatter<string_view>::format(
+              "append_imported_objects", ctx);
         }
     }
 };
