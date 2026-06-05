@@ -60,6 +60,18 @@ public:
       model::timestamp prereg_expiry_cutoff,
       model::timestamp deletion_delay_cutoff);
 
+    // Removes the given objects' metastore rows. In `gc` mode the backing
+    // objects are first deleted from object storage (for an imported segment,
+    // also its .tx and .index); in `detach` mode the backing objects are left
+    // untouched (their storage is owned elsewhere -- e.g. by the archiver while
+    // a tiered->cloud migration is in progress). Used by the migration mirror's
+    // head-prune (detach) and the normal collector (gc).
+    ss::future<std::expected<void, error>> remove_objects(
+      replicated_database*,
+      chunked_vector<object_extent> to_remove,
+      removal_mode mode,
+      ss::abort_source*);
+
 private:
     // Removes the given batch size worth of objects, evaluating objects
     // starting from the given object. Returns the next object that needs to be
