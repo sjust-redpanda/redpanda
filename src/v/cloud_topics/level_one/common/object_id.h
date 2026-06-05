@@ -81,4 +81,15 @@ struct object_extent {
     fmt::iterator format_to(fmt::iterator it) const;
 };
 
+/// How a removal disposes of an object's backing storage.
+enum class removal_mode : uint8_t {
+    /// Drop the object's metastore rows only, leaving the backing object in
+    /// object storage untouched. Used while a tiered->cloud migration owns the
+    /// tiered-storage segment (the archiver, not L1, deletes it).
+    detach = 0,
+    /// Delete the backing object (for an imported segment, also its .tx and
+    /// .index) and drop its metastore rows. The post-migration / native path.
+    gc = 1,
+};
+
 } // namespace cloud_topics::l1

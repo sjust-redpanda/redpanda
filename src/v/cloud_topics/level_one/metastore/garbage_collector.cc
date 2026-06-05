@@ -49,16 +49,35 @@ garbage_collector::remove_unreferenced_objects(ss::abort_source* as) {
     if (to_remove.empty()) {
         co_return std::expected<void, error>{};
     }
-    auto del_res = co_await io_->delete_objects(to_remove.copy(), as);
-    if (!del_res.has_value()) {
-        co_return std::unexpected(error{"io error"});
+    co_return co_await remove_objects(
+      std::move(to_remove), removal_mode::gc, as);
+}
+
+ss::future<std::expected<void, garbage_collector::error>>
+garbage_collector::remove_objects(
+  chunked_vector<object_extent> to_remove,
+  removal_mode mode,
+  ss::abort_source* as) {
+    if (to_remove.empty()) {
+        co_return std::expected<void, error>{};
+    }
+    auto sync_res = co_await stm_->sync(10s);
+    if (!sync_res.has_value()) {
+        co_return std::unexpected(error{"sync error"});
+    }
+    if (mode == removal_mode::gc) {
+        auto del_res = co_await io_->delete_objects(to_remove.copy(), as);
+        if (!del_res.has_value()) {
+            co_return std::unexpected(error{"io error"});
+        }
     }
     chunked_vector<object_id> remove_ids;
     remove_ids.reserve(to_remove.size());
     for (const auto& ext : to_remove) {
         remove_ids.emplace_back(ext.id);
     }
-    auto update_res = remove_objects_update::build(s, std::move(remove_ids));
+    auto update_res = remove_objects_update::build(
+      stm_->state(), std::move(remove_ids));
     if (!update_res.has_value()) {
         co_return std::unexpected(error{"logic error"});
     }
