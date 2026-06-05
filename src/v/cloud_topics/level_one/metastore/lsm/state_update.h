@@ -60,6 +60,24 @@ struct add_objects_db_update {
     term_state_update_t new_terms;
 };
 
+// Registers tiered-storage segments as imported L1 extents by reference (the
+// TS->CT migration mirror). Forward-appends at the partition tail like
+// add_objects; for a fresh/empty partition it seeds start/next at the first
+// imported extent's base (a non-zero migration start), threads the imported
+// location (ts_path) onto the object row and the segment descriptor onto the
+// extent row, and marks the partition migrating. Objects are created directly
+// (footer_pos 0, not preregistered). A
+// batch that does not connect at the tail is rejected (the mirror is ordered).
+struct append_imported_objects_db_update {
+    ss::future<std::expected<void, db_update_error>>
+    build_rows(state_reader&, chunked_vector<write_batch_row>&) const;
+
+    std::expected<void, db_update_error> validate_inputs() const;
+
+    chunked_vector<new_object> new_objects;
+    term_state_update_t new_terms;
+};
+
 struct replace_objects_db_update {
     ss::future<std::expected<void, db_update_error>>
     build_rows(state_reader&, chunked_vector<write_batch_row>&) const;

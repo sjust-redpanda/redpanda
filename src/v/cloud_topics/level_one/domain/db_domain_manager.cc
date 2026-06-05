@@ -342,6 +342,47 @@ db_domain_manager::add_objects(rpc::add_objects_request req) {
     };
 }
 
+ss::future<rpc::append_imported_objects_reply>
+db_domain_manager::append_imported_objects(
+  rpc::append_imported_objects_request req) {
+    absl::btree_set<model::topic_id> topics;
+    absl::btree_set<model::topic_id_partition> partitions;
+    absl::btree_set<object_id> oids;
+    collect_topics_and_partitions(req.new_objects, topics, partitions);
+    collect_object_ids(req.new_objects, oids);
+
+    auto locks_res = co_await gate_and_open_writes({
+      .topic_read_locks = std::move(topics),
+      .partition_locks = std::move(partitions),
+      .object_locks = std::move(oids),
+    });
+    if (!locks_res.has_value()) {
+        co_return rpc::append_imported_objects_reply{.ec = locks_res.error()};
+    }
+
+    auto update = append_imported_objects_db_update{
+      .new_objects = std::move(req.new_objects),
+      .new_terms = std::move(req.new_terms),
+    };
+    auto reader = state_reader(db_->db().create_snapshot());
+    chunked_vector<write_batch_row> rows;
+    auto build_res = co_await update.build_rows(reader, rows);
+    if (!build_res.has_value()) {
+        co_return rpc::append_imported_objects_reply{
+          .ec = log_and_convert(
+            build_res.error(),
+            "Rejecting request to append imported objects: "),
+        };
+    }
+
+    auto apply_res = co_await write_rows(locks_res.value(), std::move(rows));
+    if (!apply_res.has_value()) {
+        co_return rpc::append_imported_objects_reply{.ec = apply_res.error()};
+    }
+
+    co_return rpc::append_imported_objects_reply{.ec = rpc::errc::ok};
+}
+
 ss::future<rpc::replace_objects_reply>
 db_domain_manager::replace_objects(rpc::replace_objects_request req) {
     // Collect topics and partitions upfront.

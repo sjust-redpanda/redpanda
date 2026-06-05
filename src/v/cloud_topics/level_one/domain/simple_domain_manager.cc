@@ -171,6 +171,55 @@ simple_domain_manager::add_objects(rpc::add_objects_request req) {
     };
 }
 
+ss::future<rpc::append_imported_objects_reply>
+simple_domain_manager::append_imported_objects(
+  rpc::append_imported_objects_request req) {
+    auto gate = maybe_gate();
+    if (!gate.has_value()) {
+        co_return rpc::append_imported_objects_reply{
+          .ec = rpc::errc::not_leader};
+    }
+    auto sync_res = co_await stm_->sync(10s);
+    if (!sync_res.has_value()) {
+        co_return rpc::append_imported_objects_reply{
+          .ec = convert_stm_errc(sync_res.error()),
+        };
+    }
+    chunked_hash_set<object_id> added_oids;
+    for (const auto& obj : req.new_objects) {
+        added_oids.emplace(obj.oid);
+    }
+    append_imported_objects_update update{
+      .new_objects = std::move(req.new_objects),
+      .new_terms = std::move(req.new_terms),
+    };
+    storage::record_batch_builder builder(
+      model::record_batch_type::l1_stm, model::offset{0});
+    builder.add_raw_kv(
+      serde::to_iobuf(append_imported_objects_update::key),
+      serde::to_iobuf(std::move(update)));
+    auto repl_res = co_await stm_->replicate_and_wait(
+      sync_res.value(), std::move(builder).build(), as_);
+    if (!repl_res.has_value()) {
+        co_return rpc::append_imported_objects_reply{
+          .ec = convert_stm_errc(repl_res.error()),
+        };
+    }
+    bool any_added = false;
+    for (const auto& oid : added_oids) {
+        if (stm_->state().objects.contains(oid)) {
+            any_added = true;
+            break;
+        }
+    }
+    if (!any_added) {
+        co_return rpc::append_imported_objects_reply{
+          .ec = rpc::errc::concurrent_requests,
+        };
+    }
+    co_return rpc::append_imported_objects_reply{.ec = rpc::errc::ok};
+}
+
 ss::future<rpc::replace_objects_reply>
 simple_domain_manager::replace_objects(rpc::replace_objects_request req) {
     auto gate = maybe_gate();

@@ -38,6 +38,18 @@ ss::future<rpc::add_objects_reply> do_add_objects(
     co_return co_await domain_mgr->add_objects(std::move(req));
 }
 
+ss::future<rpc::append_imported_objects_reply> do_append_imported_objects(
+  domain_supervisor& domain_supervisor,
+  const model::ntp& ntp,
+  rpc::append_imported_objects_request req) {
+    auto domain_mgr = domain_supervisor.get(ntp);
+    if (!domain_mgr) {
+        co_return rpc::append_imported_objects_reply{
+          .ec = rpc::errc::not_leader};
+    }
+    co_return co_await domain_mgr->append_imported_objects(std::move(req));
+}
+
 ss::future<rpc::replace_objects_reply> do_replace_objects(
   domain_supervisor& domain_supervisor,
   const model::ntp& ntp,
@@ -370,6 +382,15 @@ template ss::future<rpc::add_objects_reply> leader_router::process<
   &leader_router::add_objects_locally,
   &leader_router::client::add_objects>(rpc::add_objects_request, bool);
 
+template ss::future<rpc::append_imported_objects_reply>
+  leader_router::remote_dispatch<
+    &leader_router::client::append_imported_objects>(
+    rpc::append_imported_objects_request, model::node_id);
+template ss::future<rpc::append_imported_objects_reply> leader_router::process<
+  &leader_router::append_imported_objects_locally,
+  &leader_router::client::append_imported_objects>(
+  rpc::append_imported_objects_request, bool);
+
 template ss::future<rpc::compact_objects_reply>
   leader_router::remote_dispatch<&leader_router::client::compact_objects>(
     rpc::compact_objects_request, model::node_id);
@@ -550,6 +571,30 @@ ss::future<rpc::add_objects_reply> leader_router::add_objects(
     co_return co_await process<
       &leader_router::add_objects_locally,
       &client::add_objects>(std::move(request), bool(local_only_exec));
+}
+
+ss::future<rpc::append_imported_objects_reply>
+leader_router::append_imported_objects_locally(
+  rpc::append_imported_objects_request request,
+  const model::ntp& metastore_ntp,
+  ss::shard_id shard) {
+    auto m = _probe.auto_measure_append_imported_objects();
+    co_return co_await container().invoke_on(
+      shard,
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+          return do_append_imported_objects(
+            *(fe._domain_supervisor), metastore_ntp, std::move(req));
+      });
+}
+
+ss::future<rpc::append_imported_objects_reply>
+leader_router::append_imported_objects(
+  rpc::append_imported_objects_request request, local_only local_only_exec) {
+    auto holder = _gate.hold();
+    co_return co_await process<
+      &leader_router::append_imported_objects_locally,
+      &client::append_imported_objects>(
+      std::move(request), bool(local_only_exec));
 }
 
 ss::future<rpc::compact_objects_reply> leader_router::compact_objects_locally(

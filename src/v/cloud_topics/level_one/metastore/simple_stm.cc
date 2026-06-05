@@ -160,6 +160,13 @@ ss::future<> simple_stm::do_apply(const model::record_batch& batch) {
             maybe_log_update_error(_log, key, o, result);
             break;
         }
+        case update_key::append_imported_objects: {
+            auto update = serde::read<append_imported_objects_update>(
+              value_parser);
+            auto result = update.apply(state_);
+            maybe_log_update_error(_log, key, o, result);
+            break;
+        }
         case update_key::remove_objects: {
             auto update = serde::read<remove_objects_update>(value_parser);
             auto result = update.apply(state_);

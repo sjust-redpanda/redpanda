@@ -33,6 +33,9 @@ public:
     ss::future<rpc::add_objects_reply>
       add_objects(rpc::add_objects_request) override;
 
+    ss::future<rpc::append_imported_objects_reply>
+      append_imported_objects(rpc::append_imported_objects_request) override;
+
     ss::future<rpc::replace_objects_reply>
       replace_objects(rpc::replace_objects_request) override;
 

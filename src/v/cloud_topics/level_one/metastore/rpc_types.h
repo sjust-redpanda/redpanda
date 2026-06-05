@@ -63,6 +63,30 @@ struct add_objects_request
     term_state_update_t new_terms;
 };
 
+struct append_imported_objects_reply
+  : serde::envelope<
+      append_imported_objects_reply,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    auto serde_fields() { return std::tie(ec); }
+
+    errc ec;
+};
+struct append_imported_objects_request
+  : serde::envelope<
+      append_imported_objects_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    using resp_t = append_imported_objects_reply;
+    auto serde_fields() {
+        return std::tie(metastore_partition, new_objects, new_terms);
+    }
+
+    model::partition_id metastore_partition;
+    chunked_vector<new_object> new_objects;
+    term_state_update_t new_terms;
+};
+
 struct compact_objects_reply
   : serde::envelope<
       compact_objects_reply,
