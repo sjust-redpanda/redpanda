@@ -358,6 +358,7 @@ replicated_metastore::get_offsets(const model::topic_id_partition& tidp) {
     metastore::offsets_response resp;
     resp.start_offset = reply.start_offset;
     resp.next_offset = reply.next_offset;
+    resp.migration_phase = reply.migration_phase;
     co_return resp;
 }
 
@@ -546,6 +547,27 @@ replicated_metastore::set_start_offset(
             co_return std::expected<void, metastore::errc>{};
         }
     }
+}
+
+ss::future<std::expected<void, metastore::errc>>
+replicated_metastore::set_migration_phase(
+  const model::topic_id_partition& tidp, migration_phase phase) {
+    rpc::set_migration_phase_request req;
+    req.tp = tidp;
+    req.phase = phase;
+
+    auto reply_fut = co_await ss::coroutine::as_future(
+      fe_.set_migration_phase(std::move(req)));
+    if (reply_fut.failed()) {
+        auto ex = reply_fut.get_exception();
+        vlog(cd_log.warn, "Error while sending request: {}", ex);
+        co_return std::unexpected(metastore::errc::transport_error);
+    }
+    auto reply = reply_fut.get();
+    if (reply.ec != rpc::errc::ok) {
+        co_return std::unexpected(rpc_to_meta_errc(reply.ec));
+    }
+    co_return std::expected<void, metastore::errc>{};
 }
 
 ss::future<std::expected<metastore::topic_removal_response, metastore::errc>>

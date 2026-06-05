@@ -695,6 +695,7 @@ add_objects_db_update::build_rows(
                                   : partition_state::compaction_epoch_t{0},
           .size = (opt ? opt->size : 0) + extent_size_sum,
           .num_extents = (opt ? opt->num_extents : 0) + extents.size(),
+          .migration_phase = opt ? opt->migration_phase : migration_phase::none,
         };
     }
     // Now that we've validated the offsets of our extents, validate the terms
@@ -1316,6 +1317,7 @@ set_start_offset_db_update::build_rows(
             .num_extents
             = metadata.num_extents
               - std::min(metadata.num_extents, extent_keys_to_delete.size()),
+            .migration_phase = metadata.migration_phase,
           }),
       });
 
@@ -1373,6 +1375,49 @@ set_start_offset_db_update::discover_truncated_object_ids(
         }
     }
     co_return discovered_oids;
+}
+
+ss::future<std::expected<void, db_update_error>>
+set_migration_phase_db_update::build_rows(
+  state_reader& reader,
+  chunked_vector<write_batch_row>& out,
+  bool* is_no_op) const {
+    auto meta_res = co_await reader.get_metadata(tp);
+    if (!meta_res.has_value()) {
+        co_return std::unexpected(wrap_read_err(
+          std::move(meta_res.error()), "Error reading metadata for {}", tp));
+    }
+    // An absent partition has the default phase `none`; setting migrating or
+    // complete creates its metadata row (the migrating marker may be the
+    // partition's first write).
+    metadata_row_value updated = meta_res->has_value() ? **meta_res
+                                                       : metadata_row_value{};
+    const auto current = updated.migration_phase;
+
+    using underlying = std::underlying_type_t<migration_phase>;
+    if (static_cast<underlying>(phase) < static_cast<underlying>(current)) {
+        co_return std::unexpected(db_update_error(
+          invalid_update,
+          fmt::format(
+            "Migration phase transition for {} is not monotonic: {} -> {}",
+            tp,
+            static_cast<underlying>(current),
+            static_cast<underlying>(phase))));
+    }
+    if (phase == current) {
+        if (is_no_op) {
+            *is_no_op = true;
+        }
+        co_return std::expected<void, db_update_error>{};
+    }
+
+    updated.migration_phase = phase;
+    out.emplace_back(
+      write_batch_row{
+        .key = metadata_row_key::encode(tp),
+        .value = serde::to_iobuf(updated),
+      });
+    co_return std::expected<void, db_update_error>{};
 }
 
 ss::future<std::expected<void, db_update_error>>
