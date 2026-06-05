@@ -31,13 +31,14 @@ enum class update_key : uint8_t {
     expire_preregistered_objects = 6,
     replace_objects = 7,
     set_migration_phase = 8,
+    append_imported_objects = 9,
 };
 
 using stm_update_error = named_type<ss::sstring, struct update_error_tag>;
 
 struct new_object
   : public serde::
-      envelope<new_object, serde::version<0>, serde::compat_version<0>> {
+      envelope<new_object, serde::version<1>, serde::compat_version<0>> {
     struct metadata
       : public serde::
           envelope<metadata, serde::version<0>, serde::compat_version<0>> {
@@ -56,7 +57,7 @@ struct new_object
 
     friend bool operator==(const new_object&, const new_object&) = default;
     auto serde_fields() {
-        return std::tie(oid, footer_pos, object_size, extent_metas);
+        return std::tie(oid, footer_pos, object_size, extent_metas, imported);
     }
 
     object_id oid;
@@ -66,6 +67,11 @@ struct new_object
       model::topic_id,
       chunked_hash_map<model::partition_id, metadata>>
       extent_metas;
+
+    // Only set for objects imported from a tiered-storage segment (the TS->CT
+    // migration import path); nullopt for natively written L1 objects. An
+    // imported object carries a single extent covering the segment.
+    std::optional<imported_segment_info> imported;
 
     // Returns the sum of lengths of the extents collected.
     size_t collect_extents_by_tidp(sorted_extents_by_tidp_t*) const;
@@ -93,6 +99,32 @@ struct add_objects_update
     std::expected<std::monostate, stm_update_error> can_apply(
       const state&,
       chunked_hash_map<model::topic_id_partition, kafka::offset>* = nullptr);
+    std::expected<std::monostate, stm_update_error> apply(state&);
+
+    chunked_vector<new_object> new_objects;
+    term_state_update_t new_terms;
+};
+
+// Registers tiered-storage segments as imported L1 extents by reference (the
+// TS->CT migration mirror). Like add_objects it appends forward from the
+// partition's tail, sharing the contiguity/term/next_offset core; unlike
+// add_objects it seeds a *fresh* partition's start/next at the first imported
+// extent's base (a non-zero migration start rather than 0), threads
+// imported_segment_info onto each object, and marks the partition migrating.
+// The objects are external (footer_pos 0) and not preregistered.
+struct append_imported_objects_update
+  : public serde::envelope<
+      append_imported_objects_update,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    friend bool operator==(
+      const append_imported_objects_update&,
+      const append_imported_objects_update&) = default;
+    auto serde_fields() { return std::tie(new_objects, new_terms); }
+
+    static constexpr auto key{update_key::append_imported_objects};
+
+    std::expected<std::monostate, stm_update_error> can_apply(const state&);
     std::expected<std::monostate, stm_update_error> apply(state&);
 
     chunked_vector<new_object> new_objects;
@@ -368,6 +400,9 @@ struct fmt::formatter<cloud_topics::l1::update_key> final
             return formatter<string_view>::format("replace_objects", ctx);
         case cloud_topics::l1::update_key::set_migration_phase:
             return formatter<string_view>::format("set_migration_phase", ctx);
+        case cloud_topics::l1::update_key::append_imported_objects:
+            return formatter<string_view>::format(
+              "append_imported_objects", ctx);
         }
     }
 };

@@ -219,6 +219,12 @@ snapshot_metastore::set_migration_phase(
     co_return std::unexpected(errc::invalid_request);
 }
 
+ss::future<std::expected<void, l1::metastore::errc>>
+snapshot_metastore::append_imported_objects(
+  chunked_vector<l1::metastore::imported_object>) {
+    co_return std::unexpected(errc::invalid_request);
+}
+
 ss::future<
   std::expected<l1::metastore::topic_removal_response, l1::metastore::errc>>
 snapshot_metastore::remove_topics(const chunked_vector<model::topic_id>&) {

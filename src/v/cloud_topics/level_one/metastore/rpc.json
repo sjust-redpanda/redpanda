@@ -12,6 +12,11 @@
             "output_type": "add_objects_reply"
         },
         {
+            "name": "append_imported_objects",
+            "input_type": "append_imported_objects_request",
+            "output_type": "append_imported_objects_reply"
+        },
+        {
             "name": "compact_objects",
             "input_type": "compact_objects_request",
             "output_type": "compact_objects_reply",

@@ -60,6 +60,9 @@ public:
     ss::future<rpc::add_objects_reply>
       add_objects(rpc::add_objects_request, local_only = local_only::no);
 
+    ss::future<rpc::append_imported_objects_reply> append_imported_objects(
+      rpc::append_imported_objects_request, local_only = local_only::no);
+
     ss::future<rpc::replace_objects_reply> replace_objects(
       rpc::replace_objects_request, local_only = local_only::no);
 
@@ -159,6 +162,12 @@ private:
 
     ss::future<rpc::add_objects_reply> add_objects_locally(
       rpc::add_objects_request, const model::ntp& metastore_ntp, ss::shard_id);
+
+    ss::future<rpc::append_imported_objects_reply>
+    append_imported_objects_locally(
+      rpc::append_imported_objects_request,
+      const model::ntp& metastore_ntp,
+      ss::shard_id);
 
     ss::future<rpc::replace_objects_reply> replace_objects_locally(
       rpc::replace_objects_request,

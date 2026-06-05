@@ -55,6 +55,9 @@ public:
     ss::future<std::expected<void, errc>> set_migration_phase(
       const model::topic_id_partition&, l1::migration_phase) override;
 
+    ss::future<std::expected<void, errc>>
+      append_imported_objects(chunked_vector<imported_object>) override;
+
     ss::future<std::expected<topic_removal_response, errc>>
     remove_topics(const chunked_vector<model::topic_id>&) override;
 

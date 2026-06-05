@@ -513,13 +513,19 @@ partition_validator::validate_objects(
         co_return std::monostate{};
     }
     for (const auto& oid : seen_objects) {
+        // Fetch the object entry up front: it drives the metadata anomaly
+        // checks below and tells us whether this is an imported (tiered-
+        // storage) extent, which is backed by a TS segment at its own path
+        // rather than by a native L1 object.
+        auto obj_res = co_await reader_.get_object(oid);
+        if (!obj_res.has_value()) {
+            co_return std::unexpected(wrap_read_err(
+              std::move(obj_res.error()), "reading object metadata"));
+        }
+        const auto& obj_opt = obj_res.value();
+
         if (opts.check_object_metadata) {
-            auto obj_res = co_await reader_.get_object(oid);
-            if (!obj_res.has_value()) {
-                co_return std::unexpected(wrap_read_err(
-                  std::move(obj_res.error()), "reading object metadata"));
-            }
-            if (!obj_res.value().has_value()) {
+            if (!obj_opt.has_value()) {
                 result.record(
                   anomaly_type::object_not_found,
                   "extent references object {} which does not exist "
@@ -527,7 +533,7 @@ partition_validator::validate_objects(
                   oid);
                 continue;
             }
-            if (obj_res.value().value().is_preregistration) {
+            if (obj_opt.value().is_preregistration) {
                 result.record(
                   anomaly_type::object_preregistered,
                   "extent references object {} which is still a "
@@ -542,7 +548,14 @@ partition_validator::validate_objects(
         if (!opts.remote || !opts.bucket || !opts.as) {
             continue;
         }
-        auto path = object_path_factory::level_one_path(oid);
+        // An imported extent points at the tiered-storage segment object by
+        // path (no native L1 object is written for it during migration), so
+        // verify it at that path instead of the L1 object path.
+        auto path
+          = (obj_opt.has_value() && obj_opt.value().imported.has_value())
+              ? cloud_storage_clients::object_key{
+                  obj_opt.value().imported->ts_path}
+              : object_path_factory::level_one_path(oid);
         retry_chain_node rtc(*opts.as, 30s, 1s);
         auto exists_fut = co_await ss::coroutine::as_future(
           opts.remote->object_exists(
