@@ -217,13 +217,31 @@ struct archival_metadata_stm::read_write_fence_cmd
     auto serde_fields() { return std::tie(last_applied_offset); }
 };
 
+struct archival_metadata_stm::set_migration_state_cmd
+  : public serde::envelope<
+      set_migration_state_cmd,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    static constexpr cmd_key key{15};
+
+    // The target migration flag: true while a tiered->cloud migration is in
+    // progress on this partition.
+    bool migrating{false};
+
+    auto serde_fields() { return std::tie(migrating); }
+};
+
 // Serde format description
 // v5
 //  - add apply_offset field
+// v6
+//  - add last_clean_at, last_dirty_at fields
+// v7
+//  - add migration_in_progress field
 //
 struct archival_metadata_stm::snapshot
   : public serde::
-      envelope<snapshot, serde::version<6>, serde::compat_version<0>> {
+      envelope<snapshot, serde::version<7>, serde::compat_version<0>> {
     /// List of segments
     chunked_vector<segment> segments;
     /// List of replaced segments
@@ -274,6 +292,10 @@ struct archival_metadata_stm::snapshot
     // The offset of the last record that modified the stm;
     // default (-inf) in v5 and earlier
     model::offset last_dirty_at;
+    // Whether a tiered->cloud migration is in progress on this partition;
+    // default (false) in v6 and earlier (a native cloud topic or a tiered
+    // partition that never migrated).
+    bool migration_in_progress{false};
 
     auto serde_fields() {
         return std::tie(
@@ -295,7 +317,8 @@ struct archival_metadata_stm::snapshot
           highest_producer_id,
           applied_offset,
           last_clean_at,
-          last_dirty_at);
+          last_dirty_at,
+          migration_in_progress);
     }
 };
 
@@ -324,6 +347,17 @@ command_batch_builder& command_batch_builder::reset_metadata() {
       archival_metadata_stm::reset_metadata_cmd::key);
     iobuf empty_buf;
     _builder.add_raw_kv(std::move(key_buf), std::move(empty_buf));
+    return *this;
+}
+
+command_batch_builder&
+command_batch_builder::set_migration_state(bool migrating) {
+    iobuf key_buf = serde::to_iobuf(
+      archival_metadata_stm::set_migration_state_cmd::key);
+    auto record_val = archival_metadata_stm::set_migration_state_cmd{
+      .migrating = migrating};
+    iobuf val_buf = serde::to_iobuf(record_val);
+    _builder.add_raw_kv(std::move(key_buf), std::move(val_buf));
     return *this;
 }
 
@@ -774,6 +808,14 @@ ss::future<std::error_code> archival_metadata_stm::cleanup_metadata(
     co_return co_await builder.replicate();
 }
 
+ss::future<std::error_code> archival_metadata_stm::set_migration_state(
+  bool migrating, ss::lowres_clock::time_point deadline, ss::abort_source& as) {
+    auto holder = _gate.hold();
+    auto builder = batch_start(deadline, as);
+    builder.set_migration_state(migrating);
+    co_return co_await builder.replicate();
+}
+
 ss::future<std::error_code> archival_metadata_stm::process_anomalies(
   model::timestamp scrub_timestamp,
   std::optional<model::offset> last_scrubbed_offset,
@@ -1123,6 +1165,12 @@ ss::future<> archival_metadata_stm::do_apply(const model::record_batch& b) {
                       serde::from_iobuf<update_highest_producer_id_cmd::value>(
                         r.release_value()));
                     break;
+                case set_migration_state_cmd::key:
+                    apply_set_migration_state(
+                      serde::from_iobuf<set_migration_state_cmd>(
+                        r.release_value())
+                        .migrating);
+                    break;
                 case read_write_fence_cmd::key:
                     if (
                       apply_read_write_fence(
@@ -1295,6 +1343,7 @@ archival_metadata_stm::apply_local_snapshot(
     }
 
     _last_dirty_at = snap.last_dirty_at;
+    _migration_in_progress = snap.migration_in_progress;
 
     co_return raft::local_snapshot_applied::yes;
 }
@@ -1326,7 +1375,8 @@ archival_metadata_stm::take_local_snapshot(ssx::semaphore_units apply_units) {
         .highest_producer_id = _manifest->highest_producer_id(),
         .applied_offset = _manifest->get_applied_offset(),
         .last_clean_at = _last_clean_at,
-        .last_dirty_at = _last_dirty_at});
+        .last_dirty_at = _last_dirty_at,
+        .migration_in_progress = _migration_in_progress});
     auto snapshot_offset = last_applied_offset();
     apply_units.return_all();
 
@@ -1502,9 +1552,20 @@ void archival_metadata_stm::apply_update_start_kafka_offset(kafka::offset so) {
     }
 }
 
+void archival_metadata_stm::apply_set_migration_state(bool migrating) {
+    if (_migration_in_progress == migrating) {
+        return;
+    }
+    _migration_in_progress = migrating;
+    vlog(_logger.info, "TS->CT migration flag set to {}", migrating);
+}
+
 void archival_metadata_stm::apply_reset_metadata() {
     vlog(_logger.info, "Resetting manifest");
     _manifest->unsafe_reset();
+    // Clearing the manifest at cutover also clears the migration flag: the
+    // partition is now served as a native cloud topic.
+    _migration_in_progress = false;
 }
 
 bool archival_metadata_stm::apply_read_write_fence(
@@ -1690,6 +1751,11 @@ model::offset archival_metadata_stm::get_last_offset() const {
 
 model::offset archival_metadata_stm::get_archive_start_offset() const {
     return _manifest->get_archive_start_offset();
+}
+
+bool archival_metadata_stm::holds_archived_data() const {
+    return _manifest->size() > 0
+           || _manifest->get_archive_start_offset() != model::offset{};
 }
 
 model::offset archival_metadata_stm::get_archive_clean_offset() const {
