@@ -215,6 +215,26 @@ public:
     virtual ss::future<std::expected<add_response, errc>>
     add_objects(const object_metadata_builder&, const term_offset_map_t&) = 0;
 
+    // A single tiered-storage segment to import into L1 by reference (the
+    // TS->CT migration mirror). Each becomes one imported L1 object and one
+    // extent covering [info.base_kafka_offset, info.last_kafka_offset].
+    struct imported_object {
+        model::topic_id_partition tidp;
+        model::term_id term;
+        model::timestamp max_timestamp;
+        size_t size_bytes;
+        imported_segment_info info;
+    };
+
+    // Register tiered-storage segments as imported L1 extents, forward-appended
+    // at the partition tail. For a partition with no L1 data yet it seeds the
+    // start/next at the first imported extent's base (a non-zero migration
+    // start) and marks the partition migrating. The mirror is ordered: a batch
+    // that does not connect at the tail is rejected. Used by the TS->CT
+    // migration mirror fiber.
+    virtual ss::future<std::expected<void, errc>>
+      append_imported_objects(chunked_vector<imported_object>) = 0;
+
     // Moves the start offset of the given partition's log to the given offset.
     virtual ss::future<std::expected<void, errc>>
     set_start_offset(const model::topic_id_partition&, kafka::offset) = 0;

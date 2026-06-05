@@ -59,6 +59,9 @@ public:
     virtual ss::future<rpc::add_objects_reply>
       add_objects(rpc::add_objects_request) = 0;
 
+    virtual ss::future<rpc::append_imported_objects_reply>
+      append_imported_objects(rpc::append_imported_objects_request) = 0;
+
     virtual ss::future<rpc::replace_objects_reply>
       replace_objects(rpc::replace_objects_request) = 0;
 

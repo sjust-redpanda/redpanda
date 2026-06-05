@@ -36,6 +36,11 @@ public:
         return _add_objects.auto_measure();
     }
 
+    std::unique_ptr<hist_t::measurement>
+    auto_measure_append_imported_objects() {
+        return _append_imported_objects.auto_measure();
+    }
+
     std::unique_ptr<hist_t::measurement> auto_measure_compact_objects() {
         return _compact_objects.auto_measure();
     }
@@ -112,6 +117,7 @@ public:
 
 private:
     hist_t _add_objects;
+    hist_t _append_imported_objects;
     hist_t _compact_objects;
     hist_t _replace_objects;
     hist_t _get_first_offset_ge;

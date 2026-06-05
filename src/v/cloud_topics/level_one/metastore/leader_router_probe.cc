@@ -30,6 +30,12 @@ void leader_router_probe::setup_metrics() {
           [this] { return _add_objects.internal_histogram_logform(); },
           sm::description("Latency of local add_objects requests")),
         sm::make_histogram(
+          "append_imported_objects_duration_microseconds",
+          [this] {
+              return _append_imported_objects.internal_histogram_logform();
+          },
+          sm::description("Latency of local append_imported_objects requests")),
+        sm::make_histogram(
           "compact_objects_duration_microseconds",
           [this] { return _compact_objects.internal_histogram_logform(); },
           sm::description("Latency of local compact_objects requests")),

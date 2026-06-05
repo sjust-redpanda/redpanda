@@ -536,6 +536,122 @@ add_objects_update::apply(state& state) {
 }
 
 std::expected<std::monostate, stm_update_error>
+append_imported_objects_update::can_apply(const state& state) {
+    if (new_objects.empty()) {
+        return std::unexpected(
+          stm_update_error{"No imported objects requested"});
+    }
+    sorted_extents_by_tidp_t extents_by_tp;
+    for (const auto& o : new_objects) {
+        o.collect_extents_by_tidp(&extents_by_tp);
+    }
+    for (const auto& [tidp, extents] : extents_by_tp) {
+        if (extents.empty()) {
+            continue;
+        }
+        auto p_ref = state.partition_state(tidp);
+        // Forward-append: an existing non-empty partition connects at its tail;
+        // a fresh/empty partition seeds at the first imported extent's base (a
+        // non-zero migration start).
+        kafka::offset expected = (p_ref.has_value()
+                                  && !p_ref->get().extents.empty())
+                                   ? p_ref->get().next_offset
+                                   : extents.begin()->base_offset;
+        for (const auto& e : extents) {
+            if (e.base_offset > e.last_offset) {
+                return std::unexpected(
+                  stm_update_error{fmt::format(
+                    "append_imported_objects inverted extent for {}: {} > {}",
+                    tidp,
+                    e.base_offset,
+                    e.last_offset)});
+            }
+            if (e.base_offset != expected) {
+                return std::unexpected(
+                  stm_update_error{fmt::format(
+                    "append_imported_objects non-contiguous batch for {}: "
+                    "expected {}, got {}",
+                    tidp,
+                    expected,
+                    e.base_offset)});
+            }
+            expected = kafka::next_offset(e.last_offset);
+        }
+        auto terms_it = new_terms.find(tidp);
+        if (terms_it == new_terms.end() || terms_it->second.empty()) {
+            return std::unexpected(
+              stm_update_error{fmt::format(
+                "append_imported_objects missing term info for {}", tidp)});
+        }
+    }
+    return std::monostate{};
+}
+
+std::expected<std::monostate, stm_update_error>
+append_imported_objects_update::apply(state& state) {
+    auto allowed = can_apply(state);
+    if (!allowed.has_value()) {
+        return std::unexpected(allowed.error());
+    }
+    sorted_extents_by_tidp_t extents_by_tp;
+    for (const auto& o : new_objects) {
+        o.collect_extents_by_tidp(&extents_by_tp);
+        state.objects[o.oid] = object_entry{
+          .total_data_size = 0,
+          .removed_data_size = 0,
+          .footer_pos = o.footer_pos,
+          .object_size = o.object_size,
+          .last_updated = model::timestamp::now(),
+          .is_preregistration = false,
+          .imported = o.imported,
+        };
+    }
+    for (const auto& [tidp, extents] : extents_by_tp) {
+        if (extents.empty()) {
+            continue;
+        }
+        auto& t_state = state.topic_to_state[tidp.topic_id];
+        auto& p_state = t_state.pid_to_state[tidp.partition];
+        // Seed a fresh/empty partition's start at the first imported extent's
+        // base; an existing partition keeps its start.
+        if (p_state.extents.empty()) {
+            p_state.start_offset = extents.begin()->base_offset;
+        }
+        for (const auto& e : extents) {
+            p_state.extents.emplace(e);
+            state.objects[e.oid].total_data_size += e.len;
+            vlog(
+              cd_log.debug,
+              "Imported object {} appended to {} [{}, {}]",
+              e.oid,
+              tidp,
+              e.base_offset,
+              e.last_offset);
+        }
+        p_state.next_offset = kafka::next_offset(
+          p_state.extents.rbegin()->last_offset);
+
+        // Append terms forward (skip a leading term that matches the current
+        // tail term), as in add_objects.
+        const auto& req_terms = new_terms.find(tidp)->second;
+        auto new_term_it = req_terms.begin();
+        if (
+          !p_state.term_starts.empty()
+          && req_terms.begin()->term_id
+               <= p_state.term_starts.rbegin()->term_id) {
+            ++new_term_it;
+        }
+        p_state.term_starts.insert(new_term_it, req_terms.end());
+
+        // The mirror's first append marks the partition migrating.
+        if (p_state.migration_phase == migration_phase::none) {
+            p_state.migration_phase = migration_phase::migrating;
+        }
+    }
+    return std::monostate{};
+}
+
+std::expected<std::monostate, stm_update_error>
 replace_objects_update::can_apply(const state& state) {
     auto layout_res = validate_new_objects_layout(state, new_objects);
     if (!layout_res.has_value()) {
