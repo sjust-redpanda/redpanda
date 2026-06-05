@@ -72,6 +72,7 @@ redpanda_cc_gtest(
         "//src/v/cloud_storage_clients",
         "//src/v/cloud_topics:app",
         "//src/v/cloud_topics/level_one/common:fake_io",
+        "//src/v/cloud_topics/level_one/common:object_handle",
         "//src/v/cloud_topics/level_one/metastore:garbage_collector",
         "//src/v/cloud_topics/level_one/metastore:simple_stm",
         "//src/v/cloud_topics/level_one/metastore:state_update",
@@ -231,6 +232,23 @@ redpanda_cc_gtest(
         "//src/v/cloud_topics/level_one/metastore/lsm:values",
         "//src/v/lsm",
         "//src/v/lsm/io:memory_persistence",
+        "//src/v/serde",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "imported_serde_test",
+    timeout = "short",
+    srcs = [
+        "imported_serde_test.cc",
+    ],
+    deps = [
+        "//src/v/bytes:iobuf",
+        "//src/v/cloud_topics/level_one/common:object_id",
+        "//src/v/cloud_topics/level_one/metastore:state",
+        "//src/v/cloud_topics/level_one/metastore/lsm:values",
         "//src/v/serde",
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",
