@@ -71,6 +71,8 @@ snapshot_metastore::get_first_ge(
       .object_size = obj.object_size,
       .first_offset = extent.base_offset,
       .last_offset = extent.last_offset,
+      .imported = l1::to_imported_ts_info(
+        obj.imported_ts_location, extent.imported_ts_delta, extent.last_offset),
     };
 }
 
@@ -122,6 +124,10 @@ snapshot_metastore::get_first_ge(
               .object_size = obj.object_size,
               .first_offset = key->base_offset,
               .last_offset = extent.last_offset,
+              .imported = l1::to_imported_ts_info(
+                obj.imported_ts_location,
+                extent.imported_ts_delta,
+                extent.last_offset),
             };
         }
     }
@@ -215,6 +221,12 @@ snapshot_metastore::set_start_offset(
 
 ss::future<std::expected<void, l1::metastore::errc>>
 snapshot_metastore::set_migrating(const model::topic_id_partition&, bool) {
+    co_return std::unexpected(errc::invalid_request);
+}
+
+ss::future<std::expected<void, l1::metastore::errc>>
+snapshot_metastore::append_imported_objects(
+  chunked_vector<l1::metastore::imported_object>) {
     co_return std::unexpected(errc::invalid_request);
 }
 
@@ -312,6 +324,10 @@ snapshot_metastore::get_extent_metadata_forwards(
               .oid = val.oid,
               .footer_pos = obj.footer_pos,
               .object_size = obj.object_size,
+              .imported = l1::to_imported_ts_info(
+                obj.imported_ts_location,
+                val.imported_ts_delta,
+                val.last_offset),
             };
         }
         extents.push_back(std::move(em));

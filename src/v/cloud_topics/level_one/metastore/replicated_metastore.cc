@@ -9,6 +9,7 @@
  */
 #include "cloud_topics/level_one/metastore/replicated_metastore.h"
 
+#include "cloud_topics/level_one/common/object_id.h"
 #include "cloud_topics/level_one/metastore/leader_router.h"
 #include "cloud_topics/level_one/metastore/manifest_io.h"
 #include "cloud_topics/level_one/metastore/rpc_types.h"
@@ -16,10 +17,53 @@
 #include "cloud_topics/logger.h"
 
 #include <algorithm>
+#include <map>
 
 namespace cloud_topics::l1 {
 
 namespace {
+
+// Convert imported-segment descriptors into new_objects (each a single-extent
+// imported object) and per-tidp term_starts (one per distinct term at its
+// lowest offset). Mirrors build_import_parts in simple_metastore.cc.
+void build_import_parts(
+  chunked_vector<metastore::imported_object> objs,
+  chunked_vector<new_object>& new_objects,
+  term_state_update_t& new_terms) {
+    chunked_hash_map<
+      model::topic_id_partition,
+      std::map<model::term_id, kafka::offset>>
+      term_min;
+    for (auto& o : objs) {
+        new_object no;
+        no.oid = create_object_id();
+        no.footer_pos = 0;
+        no.object_size = o.size_bytes;
+        no.extent_metas[o.tidp.topic_id][o.tidp.partition]
+          = new_object::metadata{
+            .base_offset = o.base_kafka_offset,
+            .last_offset = o.imported.last_kafka_offset,
+            .max_timestamp = o.max_timestamp,
+            .filepos = 0,
+            .len = o.size_bytes,
+            .imported_ts_delta = to_segment_info(o.imported),
+          };
+        no.imported_ts_location = to_object_location(o.imported);
+        new_objects.push_back(std::move(no));
+
+        auto& tmap = term_min[o.tidp];
+        auto it = tmap.find(o.term);
+        if (it == tmap.end() || o.base_kafka_offset < it->second) {
+            tmap[o.term] = o.base_kafka_offset;
+        }
+    }
+    for (auto& [tidp, tmap] : term_min) {
+        auto& terms = new_terms[tidp];
+        for (const auto& [term, off] : tmap) {
+            terms.push_back(term_start{.term_id = term, .start_offset = off});
+        }
+    }
+}
 
 // Convert metastore error codes to RPC error codes
 metastore::errc rpc_to_meta_errc(rpc::errc ec) {
@@ -547,6 +591,58 @@ replicated_metastore::set_start_offset(
             co_return std::expected<void, metastore::errc>{};
         }
     }
+}
+
+ss::future<std::expected<void, metastore::errc>>
+replicated_metastore::append_imported_objects(
+  chunked_vector<metastore::imported_object> objs) {
+    if (objs.empty()) {
+        co_return std::expected<void, metastore::errc>{};
+    }
+    // Group descriptors by the metastore partition that owns each tidp.
+    chunked_hash_map<
+      model::partition_id,
+      chunked_vector<metastore::imported_object>>
+      by_partition;
+    for (auto& o : objs) {
+        auto metastore_partition = fe_.metastore_partition(o.tidp);
+        if (!metastore_partition) {
+            vlog(
+              cd_log.error, "Unable to get metastore partition for {}", o.tidp);
+            co_return std::unexpected(errc::transport_error);
+        }
+        by_partition[*metastore_partition].push_back(std::move(o));
+    }
+    for (auto& [partition_id, part_objs] : by_partition) {
+        // Imported segments go through the normal add_objects RPC; the
+        // partition must already be marked migrating (set_migrating) so the
+        // leader adopts its log at the imported extents' (non-zero) base.
+        rpc::add_objects_request req;
+        req.metastore_partition = partition_id;
+        build_import_parts(
+          std::move(part_objs), req.new_objects, req.new_terms);
+        auto reply_fut = co_await ss::coroutine::as_future(
+          fe_.add_objects(std::move(req)));
+        if (reply_fut.failed()) {
+            auto ex = reply_fut.get_exception();
+            vlog(cd_log.warn, "Error while sending import request: {}", ex);
+            co_return std::unexpected(metastore::errc::transport_error);
+        }
+        auto reply = reply_fut.get();
+        if (reply.ec != rpc::errc::ok) {
+            co_return std::unexpected(rpc_to_meta_errc(reply.ec));
+        }
+        if (!reply.corrected_next_offsets.empty()) {
+            // The imported batch did not connect at the partition tail (the
+            // partition must be migrating, and the mirror forward-appends), so
+            // surface it rather than silently dropping the extents.
+            vlog(
+              cd_log.warn,
+              "Imported batch did not connect at the partition tail");
+            co_return std::unexpected(metastore::errc::invalid_request);
+        }
+    }
+    co_return std::expected<void, metastore::errc>{};
 }
 
 ss::future<std::expected<void, metastore::errc>>

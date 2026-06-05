@@ -18,6 +18,8 @@
 #include "container/chunked_vector.h"
 #include "model/fundamental.h"
 
+#include <map>
+
 namespace cloud_topics::l1 {
 
 namespace {
@@ -32,6 +34,48 @@ term_state_update_t make_terms_update(const metastore::term_offset_map_t& m) {
         ret[tp] = std::move(term_updates);
     }
     return ret;
+}
+
+// Convert imported-segment descriptors into new_objects (each a single-extent
+// imported object) and per-tidp term_starts (one per distinct term at its
+// lowest offset, since term_starts must have unique, monotonic term ids).
+void build_import_parts(
+  chunked_vector<metastore::imported_object> objs,
+  chunked_vector<new_object>& new_objects,
+  term_state_update_t& new_terms) {
+    chunked_hash_map<
+      model::topic_id_partition,
+      std::map<model::term_id, kafka::offset>>
+      term_min;
+    for (auto& o : objs) {
+        new_object no;
+        no.oid = create_object_id();
+        no.footer_pos = 0;
+        no.object_size = o.size_bytes;
+        no.extent_metas[o.tidp.topic_id][o.tidp.partition]
+          = new_object::metadata{
+            .base_offset = o.base_kafka_offset,
+            .last_offset = o.imported.last_kafka_offset,
+            .max_timestamp = o.max_timestamp,
+            .filepos = 0,
+            .len = o.size_bytes,
+            .imported_ts_delta = to_segment_info(o.imported),
+          };
+        no.imported_ts_location = to_object_location(o.imported);
+        new_objects.push_back(std::move(no));
+
+        auto& tmap = term_min[o.tidp];
+        auto it = tmap.find(o.term);
+        if (it == tmap.end() || o.base_kafka_offset < it->second) {
+            tmap[o.term] = o.base_kafka_offset;
+        }
+    }
+    for (auto& [tidp, tmap] : term_min) {
+        auto& terms = new_terms[tidp];
+        for (const auto& [term, off] : tmap) {
+            terms.push_back(term_start{.term_id = term, .start_offset = off});
+        }
+    }
 }
 } // namespace
 
@@ -303,6 +347,48 @@ simple_metastore::set_start_offset(
     auto update_res = set_start_offset_update::build(state_, tp, requested_o);
     if (!update_res.has_value()) {
         vlog(cd_log.debug, "Set start offset failed: {}", update_res.error());
+        co_return std::unexpected(metastore::errc::invalid_request);
+    }
+    auto apply_res = update_res->apply(state_);
+    vassert(
+      apply_res.has_value(),
+      "Apply must succeed if can_apply() is true: {}",
+      apply_res.error());
+    co_return std::expected<void, metastore::errc>{};
+}
+
+ss::future<std::expected<void, metastore::errc>>
+simple_metastore::append_imported_objects(
+  chunked_vector<metastore::imported_object> objs) {
+    if (objs.empty()) {
+        co_return std::expected<void, metastore::errc>{};
+    }
+    chunked_vector<new_object> new_objects;
+    term_state_update_t new_terms;
+    build_import_parts(std::move(objs), new_objects, new_terms);
+    // Imported segments go through the normal extent-addition path. The
+    // partition must already be marked migrating (via set_migrating) so
+    // add_objects adopts its log at the imported extents' (non-zero) base.
+    add_response resp;
+    auto update_res = add_objects_update::build(
+      state_,
+      std::move(new_objects),
+      std::move(new_terms),
+      &resp.corrected_next_offsets);
+    if (!update_res.has_value()) {
+        vlog(
+          cd_log.warn,
+          "Failed to append imported objects: {}",
+          update_res.error());
+        co_return std::unexpected(metastore::errc::invalid_request);
+    }
+    if (!resp.corrected_next_offsets.empty()) {
+        // The imported batch did not connect at the partition tail (e.g. the
+        // partition was not marked migrating, or the batch was already
+        // applied). The mirror forward-appends, so surface this rather than
+        // silently dropping the extents.
+        vlog(
+          cd_log.warn, "Imported batch did not connect at the partition tail");
         co_return std::unexpected(metastore::errc::invalid_request);
     }
     auto apply_res = update_res->apply(state_);
