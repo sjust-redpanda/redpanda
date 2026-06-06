@@ -1203,6 +1203,30 @@ ss::future<> archival_metadata_stm::do_apply(const model::record_batch& b) {
 
     // The offset should only be advanced after all the changes are applied.
     _manifest->advance_insync_offset(b.last_offset());
+
+    maybe_signal_archived_data_available();
+}
+
+void archival_metadata_stm::set_archived_data_available_callback(
+  ss::noncopyable_function<void()> cb) {
+    _archived_data_available_cb = std::move(cb);
+    // Arm relative to the current state so a callback registered after the STM
+    // already holds archived data does not fire spuriously, but does fire if the
+    // manifest later grows from empty.
+    _archived_data_available_signaled = holds_archived_data();
+}
+
+void archival_metadata_stm::maybe_signal_archived_data_available() {
+    if (!_archived_data_available_cb) {
+        return;
+    }
+    const bool holds = holds_archived_data();
+    if (holds && !_archived_data_available_signaled) {
+        _archived_data_available_signaled = true;
+        _archived_data_available_cb();
+    } else if (!holds) {
+        _archived_data_available_signaled = false;
+    }
 }
 
 ss::future<> archival_metadata_stm::apply_raft_snapshot(const iobuf&) {
@@ -1264,6 +1288,8 @@ ss::future<> archival_metadata_stm::apply_raft_snapshot(const iobuf&) {
       next_offset,
       start_offset,
       get_last_offset());
+
+    maybe_signal_archived_data_available();
 }
 
 ss::future<raft::local_snapshot_applied>
@@ -1344,6 +1370,8 @@ archival_metadata_stm::apply_local_snapshot(
 
     _last_dirty_at = snap.last_dirty_at;
     _migration_in_progress = snap.migration_in_progress;
+
+    maybe_signal_archived_data_available();
 
     co_return raft::local_snapshot_applied::yes;
 }
