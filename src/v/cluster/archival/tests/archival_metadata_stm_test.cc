@@ -256,6 +256,64 @@ FIXTURE_TEST(test_migration_state_flag, archival_metadata_stm_fixture) {
     BOOST_REQUIRE(!archival_stm->is_migrating());
 }
 
+// The archived-data-available callback fires on the holds_archived_data()
+// false->true edge and re-arms on true->false. A partition recovered mid
+// tiered->cloud migration restores its archival manifest asynchronously --
+// after start()/leadership -- so the archiver must be (re-)constructed off this
+// edge rather than at construction time, or the migration mirror never resumes.
+FIXTURE_TEST(
+  test_archived_data_available_callback_edge, archival_metadata_stm_fixture) {
+    wait_for_confirmed_leader();
+
+    int fired = 0;
+    archival_stm->set_archived_data_available_callback([&fired] { ++fired; });
+
+    // Initially empty: no archived data, callback not fired.
+    BOOST_REQUIRE(!archival_stm->holds_archived_data());
+    BOOST_REQUIRE_EQUAL(fired, 0);
+
+    auto add_segment = [&](model::offset base, model::offset committed) {
+        std::vector<segment_meta> m;
+        m.push_back(
+          segment_meta{
+            .base_offset = base,
+            .committed_offset = committed,
+            .archiver_term = model::term_id(1),
+            .segment_term = model::term_id(1)});
+        archival_stm
+          ->add_segments(
+            m,
+            std::nullopt,
+            model::producer_id{},
+            ss::lowres_clock::now() + 10s,
+            never_abort,
+            cluster::segment_validated::yes)
+          .get();
+    };
+
+    // First segment: the false->true edge fires the callback exactly once.
+    add_segment(model::offset(0), model::offset(99));
+    BOOST_REQUIRE(archival_stm->holds_archived_data());
+    BOOST_REQUIRE_EQUAL(fired, 1);
+
+    // More data while already holding archived data: no re-fire.
+    add_segment(model::offset(100), model::offset(199));
+    BOOST_REQUIRE_EQUAL(fired, 1);
+
+    // reset_metadata (cutover) empties the manifest -> re-arm.
+    auto batcher = archival_stm->batch_start(
+      ss::lowres_clock::now() + 10s, never_abort);
+    batcher.reset_metadata();
+    batcher.replicate().get();
+    BOOST_REQUIRE(!archival_stm->holds_archived_data());
+    BOOST_REQUIRE_EQUAL(fired, 1);
+
+    // A later migration re-adds archived data -> fires again.
+    add_segment(model::offset(0), model::offset(99));
+    BOOST_REQUIRE(archival_stm->holds_archived_data());
+    BOOST_REQUIRE_EQUAL(fired, 2);
+}
+
 FIXTURE_TEST(
   test_archival_stm_update_lco_when_compacted_segment_added,
   archival_metadata_stm_fixture) {
