@@ -82,6 +82,17 @@ public:
     /// after a configuration change.
     void maybe_construct_archiver();
 
+    /// Construct + start the archiver if one is now warranted but missing. The
+    /// archiver is normally built in start(), but a cloud-topic partition's
+    /// construction gate (should_construct_archiver) is manifest-dependent, so
+    /// on recovery the archiver can be skipped at start() before the archival
+    /// STM restores its manifest. Re-evaluated on two triggers: leadership
+    /// acquisition (partition_manager) and the archival STM transitioning to
+    /// holding archived data (set_archived_data_available_callback), so a
+    /// recovered migrating partition resumes its migration mirror regardless of
+    /// whether the manifest is restored before or after leadership.
+    ss::future<> maybe_start_archiver();
+
     ss::future<result<kafka_result>> replicate(
       chunked_vector<model::record_batch> batches, raft::replicate_options);
 
@@ -451,6 +462,9 @@ private:
       10);
     ssx::semaphore _archiver_reset_mutex{1, "archiver_reset"};
     std::unique_ptr<archival::ntp_archiver> _archiver;
+    // Guards background archiver re-evaluation spawned from the archival STM's
+    // archived-data-available callback. Closed early in stop().
+    ss::gate _archiver_reeval_gate;
 
     std::optional<cloud_storage_clients::bucket_name> _read_replica_bucket{
       std::nullopt};
