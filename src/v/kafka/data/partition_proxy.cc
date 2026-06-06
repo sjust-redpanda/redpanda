@@ -28,6 +28,29 @@ partition_proxy make_with_impl(Args&&... args) {
 
 partition_proxy
 make_partition_proxy(const ss::lw_shared_ptr<cluster::partition>& partition) {
+    // Structural IO gate: a partition that still holds tiered-storage data is
+    // served as tiered storage -- a plain tiered partition, or a partition mid
+    // tiered->cloud migration whose data still lives in tiered storage. This
+    // keys on partition-raft state (the manifest), not the cloud_topic_enabled()
+    // config flag, so it is robust to the unordered controller propagation of
+    // the storage-mode flip. replicated_partition serves the whole partition
+    // (local log + cloud manifest). Cutover (reset_metadata) clears both the
+    // live manifest and the archive, after which the partition falls through to
+    // the cloud-topic path below (reading its imported extents).
+    //
+    // "Still holds tiered data" must include the archive: spillover offloads the
+    // oldest segments out of the live STM manifest into archive (spillover)
+    // sub-manifests, and retention/GC runs on a migrating partition (the
+    // archiver is not dormant until cutover). So the live manifest can reach 0
+    // while data remains in the archive; keying only on it would misread a
+    // spilled, still-migrating partition as cut over and route it to the
+    // cloud-topic path before its extents were imported. holds_archived_data()
+    // consults both the live manifest and the archive.
+    const auto& archival_stm = partition->archival_meta_stm();
+    if (archival_stm && archival_stm->holds_archived_data()) {
+        return make_with_impl<replicated_partition>(partition);
+    }
+
     auto is_ct = partition->get_ntp_config().cloud_topic_enabled();
     auto is_rr = partition->is_read_replica_mode_enabled();
     if (is_ct) {
