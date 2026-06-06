@@ -313,6 +313,17 @@ public:
         }
     }
 
+    // Sink the migration mirror writes through to register tiered-storage
+    // segments into the L1 metastore (injected from cloud_topics; null until
+    // the cloud-topics subsystem registers it). Read lazily by the archiver's
+    // mirror job.
+    archival::migration_metastore* migration_metastore() const {
+        return _migration_metastore;
+    }
+    void set_migration_metastore(archival::migration_metastore* m) {
+        _migration_metastore = m;
+    }
+
     uint64_t upload_backlog_size() const;
 
     /**
@@ -451,6 +462,7 @@ private:
       10);
     ssx::semaphore _archiver_reset_mutex{1, "archiver_reset"};
     std::unique_ptr<archival::ntp_archiver> _archiver;
+    archival::migration_metastore* _migration_metastore{nullptr};
 
     std::optional<cloud_storage_clients::bucket_name> _read_replica_bucket{
       std::nullopt};
