@@ -373,6 +373,7 @@ ss::future<consensus_ptr> partition_manager::manage(
       _upload_hks,
       read_replica_bucket,
       _cloud_topics_state);
+    p->set_migration_metastore(_migration_metastore);
 
     // Populate partition_mode at creation when the feature is active, so it is
     // classified deterministically here from the topic config rather than via
