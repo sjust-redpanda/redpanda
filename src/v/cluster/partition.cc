@@ -494,6 +494,22 @@ ss::future<> partition::start(
     _archival_meta_stm
       = _raft->stm_manager()->get<cluster::archival_metadata_stm>();
 
+    if (_archival_meta_stm) {
+        // A cloud-topic partition's archiver is constructed only once it holds
+        // archived data (a tiered->cloud migration). On recovery the archival
+        // STM restores its manifest from the log asynchronously, so that can
+        // become true after start()/leadership -- too late for the construction
+        // checks there. Re-evaluate when the manifest first holds archived data
+        // so a recovered migrating partition resumes its migration mirror.
+        _archival_meta_stm->set_archived_data_available_callback([this] {
+            if (_archiver_reeval_gate.is_closed()) {
+                return;
+            }
+            ssx::spawn_with_gate(
+              _archiver_reeval_gate, [this] { return maybe_start_archiver(); });
+        });
+    }
+
     // store partition properties stm offset for fast access
     _partition_properties_stm
       = _raft->stm_manager()->get<cluster::partition_properties_stm>();
@@ -575,6 +591,11 @@ ss::future<> partition::stop() {
     _as.request_abort();
 
     unregister_flush_hook(_archiver_flush_subscription);
+
+    // Drain any in-flight background archiver re-evaluation before taking the
+    // reset mutex below (a re-eval task holds it while (re)constructing the
+    // archiver), so stop() does not race archiver construction.
+    co_await _archiver_reeval_gate.close();
 
     {
         // `partition_manager::do_shutdown` (caller of stop) will assert
@@ -808,21 +829,40 @@ bool partition::should_construct_archiver() {
     // in the case of read replicas -- we still need the archiver to drive
     // manifest updates, etc.
     const auto& ntp_config = _raft->log()->config();
-    return config::shard_local_cfg().cloud_storage_enabled()
-           && config::shard_local_cfg().cloud_storage_disable_archiver_manager()
-           && _cloud_storage_api.local_is_initialized()
-           // The archiver can only be created for partitions that belong to
-           // user topics. This includes everything inside the kafka namespace
-           // except for the kafka consumer offsets topic. The consumer offsets
-           // topic is backed up separately by the cluster/cluster_metadata
-           // subsystem. The archival_metadata_stm can't be created for the
-           // consumer offsets topic partitions. The schema registry topic is
-           // not exempt from this. It should be possible to create an archiver
-           // for it.
-           && _raft->ntp().ns == model::kafka_namespace
-           && _raft->ntp().tp.topic != model::kafka_consumer_offsets_topic
-           && !ntp_config.cloud_topic_enabled()
-           && (ntp_config.is_archival_enabled() || ntp_config.is_read_replica_mode_enabled());
+    const bool base
+      = config::shard_local_cfg().cloud_storage_enabled()
+        && config::shard_local_cfg().cloud_storage_disable_archiver_manager()
+        && _cloud_storage_api.local_is_initialized()
+        // The archiver can only be created for partitions that
+        // belong to user topics. This includes everything inside
+        // the kafka namespace except for the kafka consumer
+        // offsets topic. The consumer offsets topic is backed up
+        // separately by the cluster/cluster_metadata subsystem.
+        // The archival_metadata_stm can't be created for the
+        // consumer offsets topic partitions. The schema registry
+        // topic is not exempt from this. It should be possible to
+        // create an archiver for it.
+        && _raft->ntp().ns == model::kafka_namespace
+        && _raft->ntp().tp.topic != model::kafka_consumer_offsets_topic;
+    if (!base) {
+        return false;
+    }
+    if (!ntp_config.cloud_topic_enabled()) {
+        return ntp_config.is_archival_enabled()
+               || ntp_config.is_read_replica_mode_enabled();
+    }
+    // A cloud-topic partition normally needs no archiver. The exception is a
+    // partition mid tiered->cloud migration: its tiered-storage data must keep
+    // being uploaded, GC'd, and mirrored into L1 while the partition is still
+    // served from tiered storage. Holding tiered data (live manifest or the
+    // spillover archive) is exactly that migrating state -- a native cloud
+    // topic, or a cut-over partition, holds neither. This must match the read
+    // routing gate (make_partition_proxy): both serve a spilled migrating
+    // partition (live manifest empty, archive present) as tiered storage, so
+    // both must key on holds_archived_data(), not the live manifest alone.
+    // (Reconciliation re-evaluates this on leadership for a partition whose
+    // manifest is not yet restored at start.)
+    return _archival_meta_stm && _archival_meta_stm->holds_archived_data();
 }
 
 void partition::maybe_construct_archiver() {
@@ -976,6 +1016,23 @@ ss::future<> partition::restart_archiver(bool should_notify_topic_config) {
         }
         co_await _archiver->start();
     }
+}
+
+ss::future<> partition::maybe_start_archiver() {
+    // The archiver is normally constructed in start(). For a cloud-topic
+    // partition the construction gate (should_construct_archiver) is
+    // manifest-dependent -- holds_archived_data() -- so on recovery the archiver
+    // can be skipped at start() because the archival STM has not yet restored
+    // its manifest. The start()/leadership checks then miss it, so a recovered
+    // migrating partition would never resume its migration mirror. This is
+    // re-evaluated on leadership and when the archival STM starts holding
+    // archived data; construct the archiver if it is now warranted.
+    // restart_archiver builds it (the stop step is a no-op when _archiver is
+    // null) and is serialized with other (re)construction via the reset mutex.
+    if (_archiver || !should_construct_archiver()) {
+        co_return;
+    }
+    co_await restart_archiver(true);
 }
 
 std::optional<model::offset>
