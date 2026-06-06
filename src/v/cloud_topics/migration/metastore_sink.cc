@@ -13,6 +13,7 @@
 // common/object_id.h) and the migrating flag (via metastore/state.h),
 // whose packages are not directly visible here.
 #include "cloud_topics/level_one/metastore/metastore.h"
+#include "cluster/metadata_cache.h"
 
 namespace cloud_topics {
 
@@ -32,14 +33,35 @@ errc to_errc(l1::metastore::errc e) {
 }
 } // namespace
 
+std::optional<model::topic_id_partition>
+migration_metastore_sink::resolve(const model::ntp& ntp) const {
+    auto cfg = _md->get_topic_cfg(
+      model::topic_namespace_view{ntp.ns, ntp.tp.topic});
+    if (!cfg || !cfg->tp_id.has_value()) {
+        return std::nullopt;
+    }
+    return model::topic_id_partition{*cfg->tp_id, ntp.tp.partition};
+}
+
 ss::future<errc> migration_metastore_sink::append_imported(
-  chunked_vector<imported_segment> segs) {
+  const model::ntp& ntp, chunked_vector<imported_segment> segs) {
+    auto tidp = resolve(ntp);
+    if (!tidp.has_value()) {
+        co_return errc::invalid;
+    }
+    // Mark the partition migrating before importing: the metastore only adopts
+    // a fresh partition's log at the imported extents' (non-zero) base when it
+    // is migrating. Idempotent, so it is safe to repeat on every batch (only
+    // the first import, against an empty partition, depends on it).
+    if (auto res = co_await _ms.set_migrating(*tidp, true); !res.has_value()) {
+        co_return to_errc(res.error());
+    }
     chunked_vector<l1::metastore::imported_object> objs;
     objs.reserve(segs.size());
     for (auto& s : segs) {
         objs.push_back(
           l1::metastore::imported_object{
-            .tidp = s.tidp,
+            .tidp = *tidp,
             .term = s.term,
             .max_timestamp = s.max_timestamp,
             .size_bytes = s.size_bytes,
@@ -60,12 +82,16 @@ ss::future<errc> migration_metastore_sink::append_imported(
 }
 
 ss::future<errc> migration_metastore_sink::prune_below(
-  const model::topic_id_partition& tidp, kafka::offset new_start) {
+  const model::ntp& ntp, kafka::offset new_start) {
+    auto tidp = resolve(ntp);
+    if (!tidp.has_value()) {
+        co_return errc::invalid;
+    }
     // Prune the imported extents below new_start. The backing tiered-storage
     // objects are owned by the archiver during migration and are not deleted
     // here -- only the L1 rows are dropped (set_start_offset accounts the
     // extents as removed without touching object storage).
-    auto res = co_await _ms.set_start_offset(tidp, new_start);
+    auto res = co_await _ms.set_start_offset(*tidp, new_start);
     if (!res.has_value()) {
         co_return to_errc(res.error());
     }
@@ -73,8 +99,12 @@ ss::future<errc> migration_metastore_sink::prune_below(
 }
 
 ss::future<std::optional<archival::migration_metastore::offsets>>
-migration_metastore_sink::get_offsets(const model::topic_id_partition& tidp) {
-    auto res = co_await _ms.get_offsets(tidp);
+migration_metastore_sink::get_offsets(const model::ntp& ntp) {
+    auto tidp = resolve(ntp);
+    if (!tidp.has_value()) {
+        co_return std::nullopt;
+    }
+    auto res = co_await _ms.get_offsets(*tidp);
     if (!res.has_value()) {
         co_return std::nullopt;
     }
@@ -85,9 +115,13 @@ migration_metastore_sink::get_offsets(const model::topic_id_partition& tidp) {
 }
 
 ss::future<errc>
-migration_metastore_sink::mark_complete(const model::topic_id_partition& tidp) {
+migration_metastore_sink::mark_complete(const model::ntp& ntp) {
+    auto tidp = resolve(ntp);
+    if (!tidp.has_value()) {
+        co_return errc::invalid;
+    }
     // Cutover clears the migrating flag: the partition is now a cloud topic.
-    auto res = co_await _ms.set_migrating(tidp, false);
+    auto res = co_await _ms.set_migrating(*tidp, false);
     if (!res.has_value()) {
         co_return to_errc(res.error());
     }
