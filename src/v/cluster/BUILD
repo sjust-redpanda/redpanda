@@ -2190,6 +2190,7 @@ redpanda_cc_library(
         "archival/async_data_uploader.h",
         "archival/fwd.h",
         "archival/logger.h",
+        "archival/migration_metastore.h",
         "archival/ntp_archiver_service.h",
         "archival/probe.h",
         "archival/purger.h",
