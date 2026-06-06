@@ -274,6 +274,17 @@ public:
     bool holds_archived_data() const;
     kafka::offset get_start_kafka_offset() const;
 
+    /// Register a callback invoked (synchronously, on this shard) when the STM
+    /// transitions to holding archived data (holds_archived_data() goes false ->
+    /// true). The partition uses this to (re)construct its archiver once the
+    /// manifest is available: on recovery the STM restores its manifest from the
+    /// log asynchronously, so holds_archived_data() can become true after the
+    /// partition has already started and/or become leader -- too late for the
+    /// start()/leadership construction checks. Re-armed when the STM stops
+    /// holding archived data (cutover), so a later migration notifies again. The
+    /// callback must not block.
+    void set_archived_data_available_callback(ss::noncopyable_function<void()>);
+
     // Return list of all segments that has to be
     // removed from S3.
     chunked_vector<cloud_storage::partition_manifest::lw_segment_meta>
@@ -399,6 +410,11 @@ private:
     void maybe_notify_waiter(cluster::errc) noexcept;
     void maybe_notify_waiter(std::exception_ptr) noexcept;
 
+    // Fire _archived_data_available_cb on the false->true edge of
+    // holds_archived_data(); re-arm on the true->false edge. Called after every
+    // apply that can change the manifest (do_apply + snapshot applies).
+    void maybe_signal_archived_data_available();
+
 private:
     prefix_logger _logger;
 
@@ -418,6 +434,12 @@ private:
     // by set_migration_state and cleared by reset_metadata at cutover. false
     // for a native cloud topic or a tiered partition that never migrated.
     bool _migration_in_progress{false};
+
+    // Edge-triggered notification that the STM now holds archived data; see
+    // set_archived_data_available_callback. _signaled tracks the last edge so
+    // the callback fires once per false->true transition.
+    ss::noncopyable_function<void()> _archived_data_available_cb;
+    bool _archived_data_available_signaled{false};
 
     std::optional<ss::promise<errc>> _active_operation_res;
 
