@@ -28,6 +28,7 @@
 #include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/archival/archival_policy.h"
 #include "cluster/archival/logger.h"
+#include "cluster/archival/migration_metastore.h"
 #include "cluster/archival/replica_state_validator.h"
 #include "cluster/archival/retention_calculator.h"
 #include "cluster/archival/scrubber.h"
@@ -2065,9 +2066,20 @@ ntp_archiver::schedule_uploads(model::offset max_offset_exclusive) {
       .archiver_term = _start_term,
     });
 
+    // Suspend compacted reupload while the partition is migrating tiered->cloud.
+    // The migration mirror dark-copies the manifest into the cloud-topics L1
+    // metastore by trimming the front and appending the tail only; it cannot
+    // reflect an in-place segment rewrite. A compacted reupload replaces an
+    // already-mirrored segment (the old object moves to _replaced and is GC'd)
+    // without the mirror re-importing the replacement, leaving the L1 extent
+    // referencing a deleted object. Reupload resumes as native cloud-topic (L1)
+    // compaction after cutover; cloud_topic_enabled() is the trigger-aligned,
+    // race-free signal (post-cutover the archiver is dormant, so this path is
+    // not reached then).
     if (
       config::shard_local_cfg().cloud_storage_enable_compacted_topic_reupload()
       && _parent.get_ntp_config().is_locally_compacted()
+      && !_parent.get_ntp_config().cloud_topic_enabled()
       && compacted_segments_upload_start < start_upload_offset) {
         params.push_back({
           .upload_kind = segment_upload_kind::compacted,
@@ -2749,6 +2761,12 @@ ss::future<ntp_archiver::housekeeping_result> ntp_archiver::housekeeping() {
             }
             co_await apply_spillover();
         }
+        // Run the migration mirror outside the housekeeping mutex so its
+        // metastore RPCs don't stall uploads/GC. No-op unless the partition is
+        // migrating and the metastore sink is available.
+        if (may_begin_uploads()) {
+            co_await run_migration_mirror();
+        }
     } catch (const ss::abort_requested_exception&) {
     } catch (const ss::gate_closed_exception&) {
     } catch (const ss::broken_semaphore&) {
@@ -2764,6 +2782,76 @@ ss::future<ntp_archiver::housekeeping_result> ntp_archiver::housekeeping() {
     }
 
     co_return result;
+}
+
+ss::future<> ntp_archiver::run_migration_mirror() {
+    auto stm = _parent.archival_meta_stm();
+    if (!stm || !stm->is_migrating()) {
+        co_return;
+    }
+    auto* mm = _parent.migration_metastore();
+    if (mm == nullptr) {
+        // The cloud-topics subsystem has not registered the metastore sink
+        // yet; retry on the next housekeeping tick.
+        co_return;
+    }
+    const auto& m = manifest();
+    if (m.size() == 0) {
+        co_return;
+    }
+
+    // Current L1 coverage -- the mirror's durable progress cursor.
+    auto offs = co_await mm->get_offsets(_ntp);
+
+    // Head-prune: retention GC may have dropped segments from the front of the
+    // manifest. Drop the imported extents below the new manifest start (detach
+    // only -- the archiver still owns the tiered-storage objects).
+    const auto manifest_start = m.begin()->base_kafka_offset();
+    if (offs.has_value() && manifest_start > offs->start_offset) {
+        auto pr = co_await mm->prune_below(_ntp, manifest_start);
+        if (pr != migration_metastore::errc::ok) {
+            vlog(
+              _rtclog.warn,
+              "migration mirror: prune to {} failed",
+              manifest_start);
+            co_return;
+        }
+    }
+
+    // Forward-append the tail: segments at or above the current L1 next offset
+    // (or the manifest start if L1 is still empty). The manifest is contiguous,
+    // so this is a single contiguous run extending the top.
+    const auto append_from = offs.has_value() ? offs->next_offset
+                                              : manifest_start;
+    chunked_vector<migration_metastore::imported_segment> to_append;
+    for (const auto& meta : m) {
+        if (meta.base_kafka_offset() < append_from) {
+            continue;
+        }
+        to_append.push_back(
+          migration_metastore::imported_segment{
+            .term = meta.segment_term,
+            .max_timestamp = meta.max_timestamp,
+            .size_bytes = meta.size_bytes,
+            .ts_path
+            = m.generate_segment_path(meta, remote_path_provider())().native(),
+            .delta_offset = meta.delta_offset,
+            .delta_offset_end = meta.delta_offset_end,
+            .base_kafka_offset = meta.base_kafka_offset(),
+            .last_kafka_offset = kafka::prev_offset(meta.next_kafka_offset()),
+          });
+    }
+    if (to_append.empty()) {
+        co_return;
+    }
+    const auto append_count = to_append.size();
+    auto ar = co_await mm->append_imported(_ntp, std::move(to_append));
+    if (ar != migration_metastore::errc::ok) {
+        vlog(
+          _rtclog.warn,
+          "migration mirror: append of {} imported segment(s) failed",
+          append_count);
+    }
 }
 
 ss::future<> ntp_archiver::apply_archive_retention() {
