@@ -2836,7 +2836,31 @@ ss::future<> ntp_archiver::migration_head_prune() {
 
 ss::future<> ntp_archiver::run_migration_mirror() {
     auto stm = _parent.archival_meta_stm();
-    if (!stm || !stm->is_migrating()) {
+    if (!stm) {
+        co_return;
+    }
+    // Case C reconciliation: a cloud-topic partition with a non-empty archival
+    // manifest is migrating -- the storage-mode flip (the trigger) propagates
+    // unordered w.r.t. the partition raft log, so a leader may observe the flip
+    // before the partition has recorded the migration flag. Set it here
+    // (leader-only, idempotent); the flip is durable in the controller and the
+    // manifest still holds the tiered-storage data.
+    if (
+      !stm->is_migrating() && _parent.get_ntp_config().cloud_topic_enabled()
+      && stm->manifest().size() > 0) {
+        auto ec = co_await stm->set_migration_state(
+          true,
+          ss::lowres_clock::now() + _conf->manifest_upload_timeout(),
+          _as);
+        if (ec) {
+            vlog(
+              _rtclog.warn,
+              "migration mirror: failed to set migrating flag: {}",
+              ec.message());
+            co_return;
+        }
+    }
+    if (!stm->is_migrating()) {
         co_return;
     }
     auto* mm = _parent.migration_metastore();
