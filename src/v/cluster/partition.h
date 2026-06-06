@@ -251,6 +251,12 @@ public:
     /// Return true if shadow indexing is enabled for the partition
     bool is_remote_fetch_enabled() const;
 
+    /// Return true if the partition's data should be served via the cloud read
+    /// path: either remote fetch is enabled, or the partition is mid
+    /// tiered->cloud migration (a cloud-mode partition that still has a
+    /// non-empty archival manifest).
+    bool is_remote_fetch_enabled_or_migrating() const;
+
     /// Check if cloud storage is connected to cluster partition
     ///
     /// The remaining 'cloud' methods can only be called if this
