@@ -48,7 +48,6 @@ public:
     /// (the archiver addresses by ntp; the sink resolves ntp -> the L1
     /// topic_id_partition).
     struct imported_segment {
-        model::topic_id_partition tidp;
         model::term_id term;
         model::timestamp max_timestamp;
         size_t size_bytes{0};
@@ -73,22 +72,23 @@ public:
     /// base and marks it migrating. Segments must be contiguous and connect at
     /// next_offset; idempotent against already-present extents.
     virtual ss::future<errc>
-    append_imported(chunked_vector<imported_segment>) = 0;
+    append_imported(const model::ntp&, chunked_vector<imported_segment>) = 0;
 
     /// Prune imported extents below new_start (head GC). During migration the
-    /// archiver still owns the tiered-storage objects, so this only detaches the
-    /// L1 rows -- it does not delete the backing segment objects.
+    /// archiver still owns the tiered-storage objects, so this only detaches
+    /// the L1 rows -- it does not delete the backing segment objects.
     virtual ss::future<errc>
-    prune_below(const model::topic_id_partition&, kafka::offset new_start) = 0;
+    prune_below(const model::ntp&, kafka::offset new_start) = 0;
 
-    /// The partition's current L1 offsets, or nullopt if it has no L1 state yet.
+    /// The partition's current L1 offsets, or nullopt if it has no L1 state
+    /// yet.
     virtual ss::future<std::optional<offsets>>
-    get_offsets(const model::topic_id_partition&) = 0;
+    get_offsets(const model::ntp&) = 0;
 
-    /// Mark the partition's offline migration_phase complete (cutover finalize).
-    /// The migrating phase is set implicitly by the first append_imported.
-    virtual ss::future<errc>
-    mark_complete(const model::topic_id_partition&) = 0;
+    /// Clear the partition's offline migrating flag (cutover
+    /// finalize). The migrating phase is set implicitly by the first
+    /// append_imported.
+    virtual ss::future<errc> mark_complete(const model::ntp&) = 0;
 };
 
 } // namespace archival
