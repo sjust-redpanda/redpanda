@@ -113,7 +113,20 @@ ss::future<std::error_code> partition::prefix_truncate(
   model::offset rp_start_offset,
   kafka::offset kafka_start_offset,
   ss::lowres_clock::time_point deadline) {
-    if (!_log_eviction_stm || !_raft->log_config().is_locally_collectable()) {
+    // A partition mid tiered->cloud migration is cloud-mode, so
+    // is_locally_collectable() is false, yet it is still served from its local
+    // log + archival manifest and must keep supporting prefix truncation. The
+    // eviction STM writes the truncate batch and the archival STM prunes the
+    // manifest head (the L1 mirror then drops the imported extents below it,
+    // exactly as retention-driven head-prune does). Fall back to the
+    // deletion-policy check (is_remotely_collectable, i.e. is_locally_collectable
+    // minus the cloud-topic short-circuit) for the migrating case.
+    const auto& log_cfg = _raft->log_config();
+    const bool collectable
+      = log_cfg.is_locally_collectable()
+        || (is_remote_fetch_enabled_or_migrating()
+            && log_cfg.is_remotely_collectable());
+    if (!_log_eviction_stm || !collectable) {
         vlog(
           clusterlog.info,
           "Cannot prefix-truncate topic/partition {} retention settings not "
@@ -295,6 +308,18 @@ bool partition::is_remote_fetch_enabled() const {
         return cfg.is_remote_fetch_enabled()
                || config::shard_local_cfg().cloud_storage_enable_remote_read();
     }
+}
+
+bool partition::is_remote_fetch_enabled_or_migrating() const {
+    // A partition mid tiered->cloud migration has its storage mode flipped to
+    // cloud, so is_remote_fetch_enabled() is false, yet its data still lives in
+    // tiered storage and must be served via the cloud read path. A non-empty
+    // cloud manifest on a cloud-mode partition is exactly that migrating state
+    // (a native cloud topic carries an empty archival manifest). Keying on the
+    // manifest rather than the config flag is robust to the unordered
+    // propagation of the storage-mode flip.
+    return is_remote_fetch_enabled()
+           || (get_ntp_config().cloud_topic_enabled() && cloud_data_available());
 }
 
 bool partition::cloud_data_available() const {
@@ -641,7 +666,14 @@ partition::timequery(storage::timequery_config cfg) {
 }
 
 bool partition::may_read_from_cloud() const {
-    return (is_remote_fetch_enabled() || is_read_replica_mode_enabled())
+    // is_remote_fetch_enabled_or_migrating(), not is_remote_fetch_enabled():
+    // a partition mid tiered->cloud migration is cloud-mode (remote fetch
+    // reports disabled) yet its prefix lives only in tiered storage / the
+    // imported L1 extents, so cloud reads -- including timequery -- must still
+    // consult it. Otherwise queries fall back to the local log alone and miss
+    // the migrated prefix (e.g. timequery for an early timestamp returns the
+    // local log start instead of the true earliest offset).
+    return (is_remote_fetch_enabled_or_migrating() || is_read_replica_mode_enabled())
            && (_cloud_storage_partition && _cloud_storage_partition->is_data_available());
 }
 
