@@ -36,6 +36,8 @@ paths (cluster recovery / read replica classify on the metastore migration
 phase).
 """
 
+import time
+
 from ducktape.mark import matrix
 from ducktape.tests.test import TestContext
 from ducktape.utils.util import wait_until
@@ -325,44 +327,210 @@ class TsToCtMigrationTest(RedpandaTest):
         consumer.stop()
         consumer.free()
 
+
+class TsToCtMigrationRecoveryTest(RedpandaTest):
+    """Whole-cluster metadata recovery of a partition that is mid tiered->cloud
+    migration (E1).
+
+    A partition still migrating is authoritative in tiered storage, not in the
+    (incomplete) L1 mirror. The recovery backend must therefore recover it as
+    tiered storage -- rebuilding its archival STM from the remote manifest --
+    rather than bootstrapping it from L1. The live migration then resumes and
+    cuts over.
+
+    The flow keeps a producer running across the snapshot+wipe so the partition
+    stays mid-migration (the cutover convergence rule requires a stable manifest
+    tail, which cannot happen while the producer is appending), captures the
+    migrating state in object storage (metastore manifest flush + controller
+    snapshot), abruptly stops + wipes + recovers the cluster, and then verifies a
+    consumer reading from offset 0 sees a correct, gap-free prefix of the data
+    that reached tiered storage.
+    """
+    TOPIC = "ts-ct-recovery-test"
+    MSG_SIZE = 128
+
+    def __init__(self, test_context: TestContext):
+        si_settings = SISettings(test_context, fast_uploads=True)
+        super().__init__(
+            test_context=test_context,
+            num_brokers=1,
+            si_settings=si_settings,
+            extra_rp_conf={
+                "cloud_topics_produce_batching_size_threshold": 65536,
+                "log_segment_size_min": 1,
+                "log_segment_ms_min": 1000,
+                "log_segment_size": 1048576,
+                "cloud_storage_housekeeping_interval_ms": 1000,
+                "log_compaction_interval_ms": 1000,
+                # Whole-cluster recovery: upload controller snapshots and the L1
+                # metastore manifest frequently so the migrating state reaches
+                # object storage quickly.
+                "enable_cluster_metadata_upload_loop": True,
+                "cloud_storage_cluster_metadata_upload_interval_ms": 1000,
+                "controller_snapshot_max_age_sec": 1,
+                "cloud_topics_long_term_flush_interval": 2000,
+            },
+        )
+        self.rpk = RpkTool(self.redpanda)
+        self.admin = Admin(self.redpanda)
+
+    def _has_ts_segments(self, topic: str) -> bool:
+        manifest = self.admin.get_partition_manifest(topic, 0)
+        return len(manifest.get("segments", {})) >= 1
+
     @cluster(num_nodes=2)
     def test_ts_to_ct_migration_recovery(self):
-        """Cluster metadata recovery of a mid-migration partition: it is
-        classified by the metastore migration_phase and recovered as a
-        tiered-storage partition (re-ingesting the TS manifest), after which the
-        live migration resumes and cuts over. A consume from offset 0 after
-        recovery must return all records in order.
+        self.redpanda.set_feature_active(
+            "tiered_to_cloud_migration", True, timeout_sec=30)
+        # Hold the partition in the migrating phase (the knob is a cluster config,
+        # so it is captured in the controller snapshot and restored on recovery)
+        # so the partition is recovered via the migrating branch -- as tiered
+        # storage -- rather than racing a cutover.
+        self.redpanda.set_cluster_config(
+            {"cloud_topics_disable_migration_cutover_for_tests": True})
 
-        NOTE: E1 (migration-aware cluster recovery) is implemented build-green
-        (the recovery backend routes a migrating partition to tiered-storage
-        recovery: cluster_recovery_backend sets recovery=true, controller_backend
-        emplaces the remote_topic_properties, and ntp_config honors the override
-        so the archival STM is rebuilt from the remote manifest). This body --
-        produce TS data, trigger migration, snapshot cluster metadata
-        mid-migration, wipe + recover, assert the recovered partition serves all
-        records -- is the validation vehicle and is not yet filled in / run.
-        """
-        # Body pending: exercises E1 end to end (cluster metadata recovery of a
-        # mid-migration partition). Build-green only at present.
-        pass
+        self.rpk.create_topic(
+            self.TOPIC,
+            partitions=1,
+            replicas=1,
+            config={
+                TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED,
+                "segment.bytes": str(32 * 1024),
+                "retention.local.target.bytes": str(64 * 1024),
+            },
+        )
 
-    @cluster(num_nodes=2)
-    def test_ts_to_ct_migration_read_replica(self):
-        """A read replica of a migrating source serves it as tiered storage,
-        and switches to the cloud-topic read path when the source's metastore
-        migration_phase flips to complete at cutover. read_committed semantics
-        hold across the switch.
+        # A long-running producer so there is substantial migrating state in
+        # tiered storage to recover. Rate-limited so the recovered prefix the
+        # consumer must drain below stays bounded on a fast or contended host
+        # (the gating waits are time-based, so an unthrottled producer can build
+        # an arbitrarily large prefix); 128 KiB/s still fills the 32 KiB segments
+        # quickly enough for the upload waits.
+        producer = KgoVerifierProducer(
+            self.test_context,
+            self.redpanda,
+            self.TOPIC,
+            msg_size=self.MSG_SIZE,
+            msg_count=100_000_000,
+            rate_limit_bps=128 * 1024,
+        )
+        producer.start()
+        try:
+            wait_until(
+                lambda: self._has_ts_segments(self.TOPIC),
+                timeout_sec=120,
+                backoff_sec=2,
+                err_msg="No TS segment uploaded within 120s",
+                retry_on_exc=True,
+            )
+            # Trigger the migration; the partition stays TS-served and the mirror
+            # imports into L1 (marking the metastore phase migrating).
+            self.rpk.alter_topic_config(
+                self.TOPIC,
+                TopicSpec.PROPERTY_STORAGE_MODE,
+                TopicSpec.STORAGE_MODE_CLOUD,
+            )
+            # The manifest stays non-empty (still TS-served / migrating) because
+            # the producer is running. Let the migrating state reach object
+            # storage: controller snapshot + a couple of metastore flushes.
+            wait_until(
+                lambda: self._has_ts_segments(self.TOPIC),
+                timeout_sec=60,
+                backoff_sec=2,
+                err_msg="partition cut over before recovery snapshot",
+                retry_on_exc=True,
+            )
+            self.redpanda.wait_for_controller_snapshot(self.redpanda.nodes[0])
+            time.sleep(8)
+            acked_before = producer.produce_status.acked
+            self.logger.info(
+                f"acked before recovery: {acked_before}")
+            assert acked_before > 0, "producer made no progress"
+        finally:
+            # Abruptly stop the broker while the producer is still running so the
+            # partition is captured mid-migration (no cutover).
+            self.redpanda.stop()
+            producer.stop()
+            producer.free()
 
-        NOTE: E2 (phase-aware read replica) is implemented build-green. The
-        cloud-topic read replica reads the source's migration_phase from the L1
-        snapshot; because the cutover-last mirror copies the migrating source's
-        tiered-storage data into L1 as imported extents, the same L1 read path
-        serves the source through migration (lagging the source tail until
-        cutover) and natively after -- so no separate tiered-storage read path
-        is needed. This body -- create a read replica of a migrating source,
-        assert read_committed reads hold across the source's cutover -- is the
-        validation vehicle and is not yet filled in / run.
-        """
-        # Body pending: exercises E2 end to end (read replica of a migrating
-        # source). Build-green only at present.
-        pass
+        # Wipe local data and restart, then drive whole-cluster recovery.
+        for n in self.redpanda.nodes:
+            self.redpanda.remove_local_data(n)
+        self.redpanda.restart_nodes(
+            self.redpanda.nodes,
+            auto_assign_node_id=True,
+            omit_seeds_on_idx_one=False,
+        )
+        self.redpanda._admin.await_stable_leader(
+            "controller", partition=0, namespace="redpanda",
+            timeout_s=60, backoff_s=2)
+        self.redpanda._admin.initialize_cluster_recovery()
+
+        def recovery_done() -> bool:
+            state = self.redpanda._admin.get_cluster_recovery_status().json()[
+                "state"]
+            if "failed" in state:
+                raise RuntimeError(f"cluster recovery failed: {state}")
+            return "inactive" in state
+
+        wait_until(
+            recovery_done,
+            timeout_sec=120,
+            backoff_sec=2,
+            err_msg="cluster recovery did not complete within 120s",
+            retry_on_exc=True,
+        )
+
+        # The migrating partition was recovered as tiered storage (the metastore
+        # phase is migrating and cutover is held off), served via the structural
+        # gate from the rebuilt archival STM.
+        assert self.TOPIC in set(self.rpk.list_topics()), \
+            "topic was not recovered"
+
+        # Cluster recovery reaching 'inactive' only means the controller
+        # finished. The migrating partition is served from tiered storage via the
+        # rebuilt archival STM, whose manifest is applied asynchronously -- until
+        # it lands the partition reports high_watermark 0. A single-pass
+        # (loop=False) consumer started against an empty partition latches onto
+        # end offset 0 and blocks forever waiting for records that never arrive,
+        # so wait for the recovered prefix to be served first. The threshold
+        # matches the valid_reads assertion below; if the prefix never appears
+        # this fails here with a clear message instead of an opaque consumer
+        # timeout.
+        def recovered_prefix_served() -> bool:
+            hwm = list(self.rpk.describe_topic(self.TOPIC))[0].high_watermark or 0
+            return hwm > 1000
+
+        wait_until(
+            recovered_prefix_served,
+            timeout_sec=120,
+            backoff_sec=2,
+            err_msg="recovered partition did not expose its tiered-storage "
+            "prefix (high_watermark stayed <= 1000)",
+            retry_on_exc=True,
+        )
+
+        consumer = KgoVerifierSeqConsumer(
+            self.test_context,
+            self.redpanda,
+            self.TOPIC,
+            loop=False,
+        )
+        consumer.start()
+        # Generous timeout: the recovered prefix is drained in one pass and the
+        # consumer can be starved on a contended / low-resource host.
+        consumer.wait(timeout_sec=300)
+        status = consumer.consumer_status.validator
+        # The recovered prefix (the data that reached tiered storage before the
+        # wipe) must be correct and gap-free. The exact count is nondeterministic
+        # -- records acked but not yet uploaded are legitimately lost on cluster
+        # wipe -- so assert a substantial contiguous prefix rather than an exact
+        # total.
+        assert status.invalid_reads == 0, \
+            f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, \
+            f"recovered prefix has gaps: offset_gaps={status.offset_gaps}"
+        assert status.valid_reads > 1000, \
+            f"recovered partition served too few records: {status.valid_reads}"
+        consumer.stop()
+        consumer.free()
