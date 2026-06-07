@@ -386,8 +386,15 @@ partition_manager::maybe_download_log(
         co_return cloud_storage::log_recovery_result{};
     }
 
-    // TODO: implement a recovery primitive for cloud topics.
-    if (ntp_cfg.cloud_topic_enabled()) {
+    // A native cloud-topic partition has no tiered-storage log to download.
+    // The exception is a partition recovered mid tiered->cloud migration: its
+    // authoritative data is still in tiered storage and must be restored from
+    // the remote manifest (recover-as-tiered-storage). The recovery backend
+    // requests this via the recovery override, so only bail for a cloud topic
+    // that is not recovering.
+    if (
+      ntp_cfg.cloud_topic_enabled()
+      && ntp_cfg.recovery_enabled() != storage::topic_recovery_enabled::yes) {
         co_return cloud_storage::log_recovery_result{};
     }
 
