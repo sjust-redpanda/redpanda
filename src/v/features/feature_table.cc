@@ -47,6 +47,8 @@ std::string_view to_string_view(feature f) {
         return "shadow_linking";
     case feature::batch_mirror_topic_status:
         return "batch_mirror_topic_status";
+    case feature::tiered_to_cloud_migration:
+        return "tiered_to_cloud_migration";
     case feature::coordinated_compaction:
         return "coordinated_compaction";
     case feature::cloud_retention:
