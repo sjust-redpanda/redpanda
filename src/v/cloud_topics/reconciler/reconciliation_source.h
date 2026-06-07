@@ -58,6 +58,13 @@ public:
         return _tidp;
     }
 
+    // True if the partition is still mid tiered->cloud migration (its archival
+    // STM manifest is non-empty, so it is served as tiered storage and the
+    // archiver's mirror -- not the reconciler -- owns its L1 region). The
+    // reconciler must skip such a partition to avoid two writers; it resumes
+    // once the partition cuts over (manifest emptied).
+    virtual bool is_migrating() const { return false; }
+
     // Returns true if there may be new data to reconcile (LSO > LRO).
     virtual bool has_pending_data() = 0;
 

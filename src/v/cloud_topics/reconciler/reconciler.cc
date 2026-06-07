@@ -214,9 +214,8 @@ void reconciler<Clock>::detach(const model::ntp& ntp) {
         _sources.erase(it);
 
         // Clean up topic scheduler if no partitions remain.
-        if (
-          auto sched_it = _topic_schedulers.find(topic_id);
-          sched_it != _topic_schedulers.end()) {
+        if (auto sched_it = _topic_schedulers.find(topic_id);
+            sched_it != _topic_schedulers.end()) {
             if (--sched_it->second.partition_count == 0) {
                 _topic_schedulers.erase(sched_it);
             }
@@ -245,9 +244,8 @@ ss::future<> reconciler<Clock>::reconciliation_loop() {
             co_return;
         }
 
-        if (
-          config::shard_local_cfg()
-            .cloud_topics_disable_reconciliation_loop()) {
+        if (config::shard_local_cfg()
+              .cloud_topics_disable_reconciliation_loop()) {
             vlog(lg.debug, "Reconciliation loop disabled, skipping iteration");
             continue;
         }
@@ -325,6 +323,14 @@ ss::future<> reconciler<Clock>::reconcile() {
     chunked_vector<ss::shared_ptr<source>> sources;
     // Make a copy of the sources to not worry about concurrent modification.
     for (auto& [_, src] : _sources) {
+        // Skip partitions still mid tiered->cloud migration: they are served as
+        // tiered storage and the archiver's mirror owns their L1 region, so the
+        // reconciler must not also write to it. Re-evaluated every round, so a
+        // partition is picked up automatically once it cuts over (its archival
+        // manifest is emptied).
+        if (src->is_migrating()) {
+            continue;
+        }
         sources.push_back(src);
     }
     vlog(
@@ -463,10 +469,9 @@ ss::future<size_t> reconciler<Clock>::reconcile_source_set(
     auto metadata_builder_res = co_await l1::retry_metastore_op(
       [this]() {
           return _metastore->object_builder().then(
-            [this](
-              std::expected<
-                std::unique_ptr<l1::metastore::object_metadata_builder>,
-                l1::metastore::errc> result) {
+            [this](std::expected<
+                   std::unique_ptr<l1::metastore::object_metadata_builder>,
+                   l1::metastore::errc> result) {
                 if (
                   !result.has_value()
                   && result.error() == l1::metastore::errc::transport_error) {
@@ -506,12 +511,11 @@ ss::future<size_t> reconciler<Clock>::reconcile_source_set(
     futures.reserve(oid_to_sources.size());
     for (const auto& [oid, srcs] : oid_to_sources) {
         oids.push_back(oid);
-        futures.push_back(
-          ss::get_units(_reconciliation_sem, 1)
-            .then([this, &oid, &srcs](auto units) {
-                return reconcile_sources(oid, srcs).finally(
-                  [units = std::move(units)] {});
-            }));
+        futures.push_back(ss::get_units(_reconciliation_sem, 1)
+                            .then([this, &oid, &srcs](auto units) {
+                                return reconcile_sources(oid, srcs).finally(
+                                  [units = std::move(units)] {});
+                            }));
     }
     // NB: `futures` has size at most 3.
     auto results = co_await ss::when_all(futures.begin(), futures.end());
@@ -778,12 +782,11 @@ reconciler<Clock>::add_source_to_object(
       src->ntp(),
       src->last_reconciled_offset());
 
-    auto reader = co_await src->make_reader(
-      source::reader_config{
-        .start_offset = start_offset,
-        .max_bytes = ctx.size_budget,
-        .as = &_as,
-      });
+    auto reader = co_await src->make_reader(source::reader_config{
+      .start_offset = start_offset,
+      .max_bytes = ctx.size_budget,
+      .as = &_as,
+    });
     auto metadata = co_await build_from_reader(
       src->topic_id_partition(), std::move(reader), ctx.builder.get(), &_probe);
 
