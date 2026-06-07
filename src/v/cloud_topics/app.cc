@@ -24,7 +24,9 @@
 #include "cloud_topics/read_replica/snapshot_manager.h"
 #include "cloud_topics/reconciler/reconciler.h"
 #include "cloud_topics/topic_manifest_upload_manager.h"
+#include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/controller.h"
+#include "cluster/partition.h"
 #include "cluster/utils/partition_change_notifier_impl.h"
 #include "config/configuration.h"
 #include "config/node_config.h"
@@ -312,6 +314,16 @@ ss::future<> app::wire_up_notifications() {
             const model::topic_id_partition& tidp,
             auto partition) noexcept {
               if (partition) {
+                  // Attach all cloud-topic leader partitions, including ones
+                  // mid tiered->cloud migration. While a partition is migrating
+                  // the reconciler skips it each round
+                  // (source::is_migrating()), so the archiver's mirror is the
+                  // sole L1 writer; once the partition cuts over (its archival
+                  // manifest is emptied) the reconciler picks it up on the next
+                  // round without needing a re-attach. Leadership notifications
+                  // do not fire on cutover, so a per-round skip -- not an
+                  // attach-time gate -- is what makes the transition take
+                  // effect.
                   r.attach_partition(
                     ntp, tidp, data_plane.get(), std::move(*partition));
               } else {
