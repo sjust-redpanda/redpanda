@@ -374,6 +374,7 @@ ss::future<cluster::errc> cluster_recovery_backend::do_action(
 
                 // Query metastore for bootstrap params and set them before
                 // creating the topic
+                bool topic_is_migrating = false;
                 if (metastore && topic_cfg.tp_id.has_value()) {
                     absl::
                       btree_map<model::partition_id, partition_bootstrap_params>
@@ -413,6 +414,16 @@ ss::future<cluster::errc> cluster_recovery_backend::do_action(
                               tidp,
                               offsets_res.error());
                             co_return cluster::errc::replication_error;
+                        }
+
+                        // A partition still mid-migration (tiered->cloud) is
+                        // authoritative in tiered storage, not in the
+                        // (incomplete) L1 mirror. Recover it as tiered storage:
+                        // it rebuilds its archival STM from the remote
+                        // manifest, is served as TS via the structural gate,
+                        // and the live migration mirror resumes and cuts over.
+                        if (offsets_res->migrating) {
+                            topic_is_migrating = true;
                         }
 
                         // Start offset for a CTP is a next_offset that
@@ -491,6 +502,33 @@ ss::future<cluster::errc> cluster_recovery_backend::do_action(
                             co_return cluster::errc::replication_error;
                         }
                     }
+                }
+
+                if (topic_is_migrating) {
+                    // Recover as tiered storage: rebuild the archival STM from
+                    // the remote manifest on first start (controller_backend
+                    // emplaces the remote_topic_properties for a migrating
+                    // cloud-topic partition; ntp_config honors the override).
+                    topic_cfg.properties.recovery = true;
+                    vlog(
+                      clusterlog.info,
+                      "Recovering mid-migration cloud topic {} as tiered "
+                      "storage",
+                      topic_cfg.tp_ns);
+                } else {
+                    // A completed (or never-migrated) cloud topic is
+                    // authoritative in L1. Drop any leftover
+                    // remote_topic_properties so the recovered partition's
+                    // archival STM does not re-adopt the pre-cutover
+                    // tiered-storage manifest: a non-empty archival manifest
+                    // would make the structural IO gate route the partition
+                    // back to tiered storage, and the (non-dormant) archiver
+                    // would treat it as live -- re-triggering migration (case
+                    // C) and applying retention to the imported segments.
+                    // Imported extents carry their own tiered-storage paths
+                    // (imported_ts_info::ts_path), so they stay readable from L1
+                    // without these properties.
+                    topic_cfg.properties.remote_topic_properties.reset();
                 }
 
                 topics.emplace_back(std::move(topic_cfg));

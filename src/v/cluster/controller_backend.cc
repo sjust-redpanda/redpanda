@@ -511,9 +511,8 @@ controller_backend::calculate_learner_initial_offset(
      * Initial learner start offset only makes sense for partitions with cloud
      * storage data
      */
-    if (
-      auto tp_cfg = p->get_topic_config();
-      tp_cfg.has_value() && tp_cfg->get().is_internal()) {
+    if (auto tp_cfg = p->get_topic_config();
+        tp_cfg.has_value() && tp_cfg->get().is_internal()) {
         vlog(clusterlog.trace, "{} is part of an internal topic", p->ntp());
         return std::nullopt;
     }
@@ -617,9 +616,8 @@ controller_backend::calculate_learner_initial_offset(
           model::timestamp::now().value() - initial_retention_ms->count());
     }
 
-    auto retention_offset = log->retention_offset(
-      storage::gc_config(
-        retention_timestamp_threshold, initial_retention_bytes));
+    auto retention_offset = log->retention_offset(storage::gc_config(
+      retention_timestamp_threshold, initial_retention_bytes));
 
     if (!retention_offset) {
         return std::nullopt;
@@ -1339,9 +1337,8 @@ controller_backend::reconcile_partition_reconfiguration(
           "(leader: {})",
           partition->ntp(),
           leader);
-        if (
-          can_finish_update(
-            leader, update.get_state(), update.get_resulting_replicas())) {
+        if (can_finish_update(
+              leader, update.get_state(), update.get_resulting_replicas())) {
             auto ec = co_await dispatch_update_finished(
               partition->ntp(), update.get_resulting_replicas());
             if (ec) {
@@ -1512,6 +1509,17 @@ ss::future<std::error_code> controller_backend::create_partition(
             // topic being cloud enabled implies existence of overrides
             ntp_config.get_overrides().recovery_enabled
               = storage::topic_recovery_enabled::yes;
+            rtp.emplace(remote_rev, cfg.partition_count);
+        }
+        // A tiered->cloud partition recovered mid-migration is served as tiered
+        // storage and must rebuild its archival STM from the remote manifest.
+        // It is excluded from the branch above (cloud topics are not
+        // is_tiered_storage_topic), so emplace the remote topic properties here
+        // when cluster recovery has requested recovery for it.
+        if (
+          ntp_config.cloud_topic_enabled() && !rtp.has_value()
+          && ntp_config.get_overrides().recovery_enabled
+               == storage::topic_recovery_enabled::yes) {
             rtp.emplace(remote_rev, cfg.partition_count);
         }
         /**
