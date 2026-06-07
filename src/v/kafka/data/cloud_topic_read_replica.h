@@ -146,6 +146,14 @@ private:
         partition_metadata metadata;
         std::unique_ptr<snapshot_metastore> metastore;
         l1::io* io;
+        // The source partition's migration classification, read from the
+        // snapshot. `none`/`complete` -> the source is a native cloud topic and
+        // L1 is authoritative. `migrating` -> the source is a tiered->cloud
+        // partition still served as tiered storage; its data is mirrored into
+        // L1 as imported extents, so the same L1 read path serves it (lagging
+        // the source's tail until cutover). The read replica therefore needs no
+        // separate tiered-storage read path -- the imported mirror unifies it.
+        l1::migration_phase source_phase{};
     };
     ss::future<std::expected<snapshot, ss::sstring>> get_snapshot() const;
 

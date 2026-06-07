@@ -333,14 +333,17 @@ class TsToCtMigrationTest(RedpandaTest):
         live migration resumes and cuts over. A consume from offset 0 after
         recovery must return all records in order.
 
-        NOTE: depends on E1 (migration-aware cluster recovery); included as the
-        validation vehicle for that path.
+        NOTE: E1 (migration-aware cluster recovery) is implemented build-green
+        (the recovery backend routes a migrating partition to tiered-storage
+        recovery: cluster_recovery_backend sets recovery=true, controller_backend
+        emplaces the remote_topic_properties, and ntp_config honors the override
+        so the archival STM is rebuilt from the remote manifest). This body --
+        produce TS data, trigger migration, snapshot cluster metadata
+        mid-migration, wipe + recover, assert the recovered partition serves all
+        records -- is the validation vehicle and is not yet filled in / run.
         """
-        # Full body to be completed alongside E1 (the recovery backend routing).
-        # The structure: produce TS data, trigger migration, take a cluster
-        # metadata snapshot mid-migration, wipe + recover the cluster, then
-        # assert the recovered partition serves all records (TS while still
-        # migrating, cloud-topic once it re-converges and cuts over).
+        # Body pending: exercises E1 end to end (cluster metadata recovery of a
+        # mid-migration partition). Build-green only at present.
         pass
 
     @cluster(num_nodes=2)
@@ -350,8 +353,16 @@ class TsToCtMigrationTest(RedpandaTest):
         migration_phase flips to complete at cutover. read_committed semantics
         hold across the switch.
 
-        NOTE: depends on E2 (phase-aware read replica); included as the
-        validation vehicle for that path.
+        NOTE: E2 (phase-aware read replica) is implemented build-green. The
+        cloud-topic read replica reads the source's migration_phase from the L1
+        snapshot; because the cutover-last mirror copies the migrating source's
+        tiered-storage data into L1 as imported extents, the same L1 read path
+        serves the source through migration (lagging the source tail until
+        cutover) and natively after -- so no separate tiered-storage read path
+        is needed. This body -- create a read replica of a migrating source,
+        assert read_committed reads hold across the source's cutover -- is the
+        validation vehicle and is not yet filled in / run.
         """
-        # Full body to be completed alongside E2 (read-replica phase selection).
+        # Body pending: exercises E2 end to end (read replica of a migrating
+        # source). Build-green only at present.
         pass

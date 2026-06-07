@@ -71,6 +71,7 @@ snapshot_metastore::get_first_ge(
       .object_size = obj.object_size,
       .first_offset = extent.base_offset,
       .last_offset = extent.last_offset,
+      .imported = obj.imported,
     };
 }
 
@@ -122,6 +123,7 @@ snapshot_metastore::get_first_ge(
               .object_size = obj.object_size,
               .first_offset = key->base_offset,
               .last_offset = extent.last_offset,
+              .imported = obj.imported,
             };
         }
     }
@@ -319,6 +321,7 @@ snapshot_metastore::get_extent_metadata_forwards(
               .oid = val.oid,
               .footer_pos = obj.footer_pos,
               .object_size = obj.object_size,
+              .imported = obj.imported,
             };
         }
         extents.push_back(std::move(em));
