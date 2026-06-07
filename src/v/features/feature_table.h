@@ -57,6 +57,7 @@ enum class feature : std::uint64_t {
     cloud_topics = 1ULL << 13U,
     tiered_cloud_topics = 1ULL << 14U,
     batch_mirror_topic_status = 1ULL << 15U,
+    tiered_to_cloud_migration = 1ULL << 16U,
     node_isolation = 1ULL << 19U,
     group_offset_retention = 1ULL << 20U,
     membership_change_controller_cmds = 1ULL << 22U,
@@ -564,6 +565,12 @@ inline constexpr std::array feature_schema{
     "batch_mirror_topic_status",
     feature::batch_mirror_topic_status,
     feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v26_2_1,
+    "tiered_to_cloud_migration",
+    feature::tiered_to_cloud_migration,
+    feature_spec::available_policy::explicit_only,
     feature_spec::prepare_policy::always},
 };
 
