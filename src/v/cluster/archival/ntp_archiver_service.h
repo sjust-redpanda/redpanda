@@ -56,10 +56,10 @@ public:
     ntp_archiver_upload_result() = default;
     ntp_archiver_upload_result(const ntp_archiver_upload_result&) = default;
     ntp_archiver_upload_result(ntp_archiver_upload_result&&) = default;
-    ntp_archiver_upload_result&
-    operator=(const ntp_archiver_upload_result&) = default;
-    ntp_archiver_upload_result&
-    operator=(ntp_archiver_upload_result&&) = default;
+    ntp_archiver_upload_result& operator=(const ntp_archiver_upload_result&)
+      = default;
+    ntp_archiver_upload_result& operator=(ntp_archiver_upload_result&&)
+      = default;
     ~ntp_archiver_upload_result() = default;
 
     /// Result without the value (error or success)
@@ -305,6 +305,15 @@ public:
     // of what the mirror imported, empties the mirrored range so the forward
     // append re-seeds it at the surviving manifest start. No-op unless migrating.
     ss::future<> migration_head_prune();
+
+    // Cut a converged migrating partition over to cloud topics. In one archival
+    // STM batch: reset_metadata (empties the manifest -> the structural IO gate
+    // flips routing to CT) and clear the migration flag (the mirror stops).
+    // Then seed the ctp_stm reconciliation baseline at the boundary B to hand
+    // over the local-log trim floor, and mark the offline migration phase
+    // complete. Forward-only.
+    ss::future<>
+    do_migration_cutover(kafka::offset boundary, model::offset log_boundary);
 
     // Request a flush operation of all current local data to cloud storage.
     // This function can be used in combination with wait() to block until the
@@ -730,8 +739,16 @@ private:
 
     /// Return true if it is permitted to start new uploads: this
     /// requires can_update_archival_metadata, plus that we are
-    /// not paused.
+    /// not paused, plus that the partition is not a dormant cut-over
+    /// cloud topic.
     bool may_begin_uploads() const;
+
+    /// Return true if this is a cloud-topic partition that has cut over (or has
+    /// no tiered data to migrate): its archival STM manifest is empty and it is
+    /// not migrating. Such a partition must not archive -- re-uploading would
+    /// re-trigger the migration. The archiver is normally torn down in this
+    /// state; the upload loop also idles on it to avoid spinning until then.
+    bool is_cloud_topic_dormant() const;
 
     /// Returns true if retention should remove data from STM
     /// region of the log and false if it should work on archive
