@@ -13,6 +13,7 @@
 #include "cloud_io/scheduler_types.h"
 #include "cloud_topics/level_one/frontend_reader/level_one_reader.h"
 #include "cloud_topics/log_reader_config.h"
+#include "cloud_topics/logger.h"
 #include "cloud_topics/read_replica/metadata_provider.h"
 #include "cloud_topics/read_replica/snapshot_metastore.h"
 #include "cloud_topics/read_replica/snapshot_provider.h"
@@ -160,9 +161,8 @@ ss::future<storage::translating_reader>
 partition_proxy::make_reader(kafka::log_reader_config cfg) {
     auto snap_res = co_await get_snapshot();
     if (!snap_res.has_value()) {
-        co_await ss::coroutine::return_exception(
-          std::runtime_error(
-            fmt::format("make_reader failed: {}", snap_res.error())));
+        co_await ss::coroutine::return_exception(std::runtime_error(
+          fmt::format("make_reader failed: {}", snap_res.error())));
     }
     co_return co_await make_reader(std::move(snap_res.value()), cfg);
 }
@@ -300,22 +300,20 @@ result<kafka::partition_info> partition_proxy::get_partition_info() const {
     }
     auto hwm = high_watermark();
     for (const auto& follower_metric : followers.value()) {
-        ret.replicas.push_back(
-          kafka::replica_info{
-            .id = follower_metric.id,
-            .high_watermark = hwm,
-            .log_end_offset = hwm,
-            .is_alive = follower_metric.is_live,
-          });
+        ret.replicas.push_back(kafka::replica_info{
+          .id = follower_metric.id,
+          .high_watermark = hwm,
+          .log_end_offset = hwm,
+          .is_alive = follower_metric.is_live,
+        });
     }
 
-    ret.replicas.push_back(
-      kafka::replica_info{
-        .id = partition_->raft()->self().id(),
-        .high_watermark = hwm,
-        .log_end_offset = hwm,
-        .is_alive = true,
-      });
+    ret.replicas.push_back(kafka::replica_info{
+      .id = partition_->raft()->self().id(),
+      .high_watermark = hwm,
+      .log_end_offset = hwm,
+      .is_alive = true,
+    });
 
     return {std::move(ret)};
 }
@@ -393,20 +391,36 @@ partition_proxy::get_snapshot() const {
     auto snapshot_res = co_await snapshot_provider_->get_snapshot(
       domain, metadata->bucket, earliest_snap_time, replicated_seqno, 30s);
     if (!snapshot_res) {
-        co_return std::unexpected(
-          fmt::format(
-            "error getting snapshot for domain {} bucket {}, earliest refresh "
-            "time: {}, min_seqno: {}: {}",
-            domain,
-            metadata->bucket,
-            earliest_snap_time.time_since_epoch(),
-            replicated_seqno,
-            snapshot_res.error()));
+        co_return std::unexpected(fmt::format(
+          "error getting snapshot for domain {} bucket {}, earliest refresh "
+          "time: {}, min_seqno: {}: {}",
+          domain,
+          metadata->bucket,
+          earliest_snap_time.time_since_epoch(),
+          replicated_seqno,
+          snapshot_res.error()));
     }
+    // Read whether the source is still migrating from the snapshot. While the
+    // source is mid migration (tiered->cloud), its data lives in L1 as imported
+    // extents (the dark mirror); the L1 read path below serves those exactly as
+    // it serves native extents, so no separate tiered-storage read path is
+    // needed. Surfaced for observability and to gate behavior at cutover.
+    auto migrating = false;
+    auto offs = co_await snapshot_res->metastore->get_offsets(metadata->tidp);
+    if (offs.has_value()) {
+        migrating = offs->migrating;
+    }
+    vlog(
+      cd_log.debug,
+      "read replica {} snapshot: source migrating={}",
+      ntp(),
+      migrating);
+
     co_return snapshot{
       .metadata = *metadata,
       .metastore = std::move(snapshot_res->metastore),
       .io = snapshot_res->io,
+      .source_migrating = migrating,
     };
 }
 
