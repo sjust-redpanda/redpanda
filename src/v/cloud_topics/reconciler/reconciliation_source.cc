@@ -62,6 +62,16 @@ public:
       , _fe(ss::make_lw_shared<frontend>(partition, dp_api))
       , _partition(std::move(partition)) {}
 
+    bool is_migrating() const override {
+        // Holding tiered data (live manifest or the spillover archive) means the
+        // partition is still served from tiered storage and being mirrored into
+        // L1 -- the reconciler must skip it until cutover. Keying on the live
+        // manifest alone would mis-classify a spilled migrating partition (live
+        // manifest empty, archive present) as not migrating and reconcile it.
+        const auto& stm = _partition->archival_meta_stm();
+        return stm != nullptr && stm->holds_archived_data();
+    }
+
     bool has_pending_data() override {
         auto lro = last_reconciled_offset();
         auto lso = _fe->last_stable_offset();
