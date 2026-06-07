@@ -51,6 +51,8 @@ std::string_view to_string_view(feature f) {
         return "shadow_link_sr_api_sync";
     case feature::iceberg_extended_mode_config:
         return "iceberg_extended_mode_config";
+    case feature::tiered_to_cloud_migration:
+        return "tiered_to_cloud_migration";
     case feature::coordinated_compaction:
         return "coordinated_compaction";
     case feature::cloud_retention:
