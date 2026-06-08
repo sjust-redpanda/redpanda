@@ -68,6 +68,7 @@ class TsToCtMigrationTest(RedpandaTest):
     TOPIC = "ts-ct-migration-test"
 
     TOPIC_CUTOVER = "ts-ct-migration-cutover-test"
+    TOPIC_HEADPRUNE = "ts-ct-migration-headprune-test"
 
     # Transactional parameters. msgs_per_transaction is intentionally large so
     # that when the migration trigger fires mid-stream at least one in-flight
@@ -174,6 +175,10 @@ class TsToCtMigrationTest(RedpandaTest):
             if e.code == ConnectErrorCode.NOT_FOUND:
                 return None
             raise
+
+    def _partition_start_offset(self, topic: str) -> int:
+        parts = list(self.rpk.describe_topic(topic))
+        return parts[0].start_offset if parts else 0
 
     def _records_removed(self) -> float:
         return self.redpanda.metric_sum(
@@ -624,6 +629,112 @@ class TsToCtMigrationTest(RedpandaTest):
         assert len(manifest.get("segments", {})) == 0, \
             "archiver re-populated the TS manifest after cutover -- post-cutover " \
             "writes went to tiered storage instead of the cloud-topic path"
+
+    @cluster(num_nodes=2)
+    @matrix(storage_mode=[
+        TopicSpec.STORAGE_MODE_CLOUD,
+        TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+    ])
+    def test_ts_to_ct_migration_head_prune(self, storage_mode: str):
+        """Retention trims the archival manifest head WHILE migrating; the mirror
+        head-prunes the imported L1 extents below the new start (detach only --
+        the archiver still owns the backing tiered-storage objects during
+        migration). After cutover the partition's start offset is the trimmed
+        start (> 0), and a consumer from the earliest available offset sees a
+        correct, gap-free prefix -- no stale imported extents below the start,
+        no gap.
+
+        retention.bytes (a whole-partition byte budget) forces the cloud manifest
+        head to trim once enough data has been produced. Cutover is held off (via
+        the test knob) until the head has trimmed, so the head-prune-while-
+        migrating step is observed deterministically rather than racing cutover.
+        """
+        self._enable_migration()
+        if storage_mode == TopicSpec.STORAGE_MODE_TIERED_CLOUD:
+            self.redpanda.set_feature_active(
+                "tiered_cloud_topics", True, timeout_sec=30)
+        # Hold the partition in the migrating phase so retention trims the head
+        # while it is still migrating (cutover would otherwise complete first).
+        self.redpanda.set_cluster_config(
+            {"cloud_topics_disable_migration_cutover_for_tests": True})
+
+        self.rpk.create_topic(
+            self.TOPIC_HEADPRUNE,
+            partitions=1,
+            replicas=1,
+            config={
+                TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED,
+                "segment.bytes": str(32 * 1024),
+                "retention.local.target.bytes": str(64 * 1024),
+                # Whole-partition byte budget: once the cloud manifest exceeds
+                # this, archival GC trims its head (advancing the start offset).
+                "retention.bytes": str(2 * 1024 * 1024),
+            },
+        )
+
+        producer = KgoVerifierProducer(
+            self.test_context,
+            self.redpanda,
+            self.TOPIC_HEADPRUNE,
+            msg_size=self.MSG_SIZE,
+            msg_count=100_000_000,
+            rate_limit_bps=1024 * 1024,
+        )
+        producer.start()
+        try:
+            self._wait_for_ts_segment(self.TOPIC_HEADPRUNE)
+            self._trigger_migration(self.TOPIC_HEADPRUNE, storage_mode)
+
+            # Retention trims the manifest head while the partition is still
+            # migrating: the start offset advances above 0 while the archival
+            # manifest is still non-empty (i.e. not yet cut over). This is what
+            # drives the mirror's head-prune of the L1 imported extents.
+            def head_trimmed_while_migrating() -> bool:
+                m = self.admin.get_partition_manifest(self.TOPIC_HEADPRUNE, 0)
+                migrating = len(m.get("segments", {})) > 0
+                return migrating and self._partition_start_offset(
+                    self.TOPIC_HEADPRUNE) > 0
+
+            wait_until(
+                head_trimmed_while_migrating,
+                timeout_sec=180,
+                backoff_sec=3,
+                err_msg="manifest head was not trimmed (start_offset stayed 0) "
+                "while migrating",
+                retry_on_exc=True,
+            )
+        finally:
+            producer.stop()
+            producer.free()
+
+        # Allow cutover now that the head has trimmed mid-migration.
+        self.redpanda.set_cluster_config(
+            {"cloud_topics_disable_migration_cutover_for_tests": False})
+        self._wait_for_cutover(self.TOPIC_HEADPRUNE)
+
+        # The trimmed start carried through cutover: the partition begins above
+        # 0, with no stale imported extents below it.
+        trimmed_start = self._partition_start_offset(self.TOPIC_HEADPRUNE)
+        assert trimmed_start > 0, \
+            f"head-pruned start was lost across cutover: start={trimmed_start}"
+
+        consumer = KgoVerifierSeqConsumer(
+            self.test_context,
+            self.redpanda,
+            self.TOPIC_HEADPRUNE,
+            loop=False,
+        )
+        consumer.start()
+        consumer.wait(timeout_sec=180)
+        status = consumer.consumer_status.validator
+        assert status.invalid_reads == 0, \
+            f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, \
+            f"head-pruned prefix has gaps: offset_gaps={status.offset_gaps}"
+        assert status.valid_reads > 0, \
+            "head-pruned partition served no records"
+        consumer.stop()
+        consumer.free()
 
 
 class TsToCtMigrationRecoveryTest(RedpandaTest):
