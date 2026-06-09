@@ -39,6 +39,7 @@ phase).
 import time
 
 from ducktape.mark import matrix
+from ducktape.mark import ignore  # type: ignore[reportUnknownVariableType]
 from ducktape.tests.test import TestContext
 from ducktape.utils.util import wait_until
 
@@ -3032,6 +3033,152 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
         finally:
             producer.stop()
             producer.free()
+            if self.second_cluster is not None:
+                self.second_cluster.stop()
+
+    # DEFERRED: a read replica created against a *tiered* source does not yet
+    # follow the source's TS->CT migration -- it stays a tiered-storage replica
+    # and freezes at the source's cutover (it never re-classifies as a
+    # cloud-topic replica). Tracked in pending-work.md ("read replica must
+    # transparently follow a TS->CT migration"). This test is the regression for
+    # that work; un-ignore it once implemented.
+    @ignore
+    @cluster(num_nodes=4)
+    def test_ts_to_ct_migration_read_replica_live_through_migration(self):
+        """A producer and a read-replica consumer both run continuously across
+        the whole migration. The replica is created against the *tiered* source
+        before the trigger, and the consumer reads through the source's
+        tiered -> migrating -> complete transition while the producer keeps
+        writing. The replica must follow the source's cutover transparently --
+        no consumer error, no offset gap -- and the consumer must eventually see
+        every produced offset.
+        """
+        topic = "ts-ct-rr-live-test"
+        self.redpanda.set_feature_active(
+            "tiered_to_cloud_migration", True, timeout_sec=30)
+
+        self.rpk.create_topic(
+            topic,
+            partitions=1,
+            replicas=1,
+            config={
+                TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED,
+                "segment.bytes": str(32 * 1024),
+                "retention.local.target.bytes": str(64 * 1024),
+            },
+        )
+
+        total = 30000
+        producer = None
+        consumer = None
+        try:
+            # Rate-limited so production spans the migration: the trigger fires
+            # and the source cuts over while the producer and the replica
+            # consumer are both still active.
+            producer = KgoVerifierProducer(
+                self.test_context,
+                self.redpanda,
+                topic,
+                msg_size=self.MSG_SIZE,
+                msg_count=total,
+                rate_limit_bps=128 * 1024,
+            )
+            producer.start()
+            wait_until(
+                lambda: self._has_ts_segments(topic),
+                timeout_sec=120,
+                backoff_sec=2,
+                err_msg="No TS segment uploaded within 120s",
+                retry_on_exc=True,
+            )
+
+            # Bring up the replica and start the consumer while the source is
+            # still a plain tiered topic -- i.e. prior to the migration.
+            self.second_cluster = make_redpanda_service(
+                self.test_context,
+                num_brokers=1,
+                si_settings=self.rr_settings,
+                extra_rp_conf={
+                    "enable_cluster_metadata_upload_loop": False,
+                    "cloud_topics_disable_metastore_flush_loop_for_tests": True,
+                    "cloud_topics_disable_level_zero_gc_for_tests": True,
+                },
+            )
+            self.second_cluster.start(start_si=False)
+            rr_rpk = RpkTool(self.second_cluster)
+            rr_rpk.create_topic(
+                topic,
+                config={"redpanda.remote.readreplica": self.source_bucket},
+            )
+
+            def rr_has_leader() -> bool:
+                parts = list(rr_rpk.describe_topic(topic, tolerant=True))
+                return len(parts) > 0 and all(p.leader != -1 for p in parts)
+
+            wait_until(
+                rr_has_leader,
+                timeout_sec=90,
+                backoff_sec=3,
+                err_msg="read replica never got a leader",
+                retry_on_exc=True,
+            )
+
+            # The consumer reads continuously; pass the source producer so its
+            # wait() blocks until the producer is done AND the replica has
+            # consumed every produced offset.
+            consumer = KgoVerifierSeqConsumer(
+                self.test_context,
+                self.second_cluster,
+                topic,
+                loop=True,
+                producer=producer,
+            )
+            consumer.start()
+
+            # Confirm the replica is serving the pre-migration (tiered) source
+            # before we trigger the migration.
+            wait_until(
+                lambda: consumer.consumer_status.validator.valid_reads > 0,
+                timeout_sec=120,
+                backoff_sec=3,
+                err_msg="replica served nothing from the tiered source",
+                retry_on_exc=True,
+            )
+
+            # Trigger the migration while the producer and replica consumer run.
+            self.rpk.alter_topic_config(
+                topic,
+                TopicSpec.PROPERTY_STORAGE_MODE,
+                TopicSpec.STORAGE_MODE_CLOUD,
+            )
+
+            # The source must complete the migration during the live workload
+            # (its archival manifest empties), under concurrent writes.
+            wait_until(
+                lambda: not self._has_ts_segments(topic),
+                timeout_sec=240,
+                backoff_sec=5,
+                err_msg="source did not cut over during the live workload",
+                retry_on_exc=True,
+            )
+
+            # The replica consumer, running across the source's cutover, must
+            # eventually see every produced offset, contiguous and correct.
+            consumer.wait(timeout_sec=300)
+            status = consumer.consumer_status.validator
+            assert status.invalid_reads == 0, \
+                f"replica served incorrect records across migration: " \
+                f"invalid_reads={status.invalid_reads}"
+            assert status.offset_gaps == 0, \
+                f"replica saw a gap across migration: " \
+                f"offset_gaps={status.offset_gaps}"
+        finally:
+            if consumer is not None:
+                consumer.stop()
+                consumer.free()
+            if producer is not None:
+                producer.stop()
+                producer.free()
             if self.second_cluster is not None:
                 self.second_cluster.stop()
 
