@@ -2809,25 +2809,30 @@ ss::future<> ntp_archiver::migration_head_prune() {
         co_return;
     }
     auto offs = co_await mm->get_offsets(_ntp);
-    if (!offs.has_value()) {
+    // The true log start, including data offloaded to spillover (archive)
+    // sub-manifests. NB: not m.begin() once spilled -- that is the spillover
+    // boundary, not the log start.
+    const auto log_start = m.full_log_start_kafka_offset();
+    if (
+      !offs.has_value() || !log_start.has_value()
+      || *log_start <= offs->start_offset) {
         co_return;
     }
-    // Retention GC may have dropped segments from the front of the manifest,
-    // advancing the start past the L1 mirror's start. Detach the imported
-    // extents below it (detach only -- the archiver still owns the tiered-
-    // storage objects), so the GC that runs next does not delete an object the
-    // mirror still references.
-    const auto manifest_start = m.begin()->base_kafka_offset();
-    if (manifest_start <= offs->start_offset) {
-        co_return;
-    }
+    // Retention GC dropped data from the front of the log, advancing the true
+    // log start past the L1 mirror's start. Detach the imported extents below it
+    // (detach only -- the archiver still owns the tiered-storage objects), so
+    // the GC that runs next does not delete an object the mirror still
+    // references. Keyed on the true log start, not m.begin(): a spillover
+    // advances m.begin() without deleting data and must not be mistaken for a
+    // retention prune.
+    //
     // Clamp to next_offset: if retention ran ahead of what the mirror imported
-    // (manifest_start > next_offset), the entire mirrored range is below the new
+    // (*log_start > next_offset), the entire mirrored range is below the new
     // start and is stale -- pruning to next_offset empties the partition, after
     // which the forward-append re-seeds it at the surviving manifest start (the
     // empty && migrating path in add_objects). This also keeps prune_below off
     // the set_start_offset > next_offset rejection.
-    auto prune_to = std::min(manifest_start, offs->next_offset);
+    auto prune_to = std::min(*log_start, offs->next_offset);
     auto pr = co_await mm->prune_below(_ntp, prune_to);
     if (pr != migration_metastore::errc::ok) {
         vlog(_rtclog.warn, "migration mirror: prune to {} failed", prune_to);
@@ -2879,39 +2884,74 @@ ss::future<> ntp_archiver::run_migration_mirror() {
     // offsets reflect any detach/empty it did this pass.
     auto offs = co_await mm->get_offsets(_ntp);
 
-    const auto manifest_start = m.begin()->base_kafka_offset();
+    // The true start of the log, including any data offloaded to spillover
+    // (archive) sub-manifests. NB: this is not m.begin() once the manifest has
+    // spilled -- m.begin() is then the spillover boundary, not the log start.
+    const auto log_start = m.full_log_start_kafka_offset();
 
     // Forward-append the tail: segments at or above the current L1 next offset
-    // (or the manifest start if L1 is still empty). The manifest is contiguous,
-    // so this is a single contiguous run extending the top.
-    const auto append_from = offs.has_value() ? offs->next_offset
-                                              : manifest_start;
-    chunked_vector<migration_metastore::imported_segment> to_append;
-    for (const auto& meta : m) {
-        if (meta.base_kafka_offset() < append_from) {
-            continue;
-        }
-        to_append.push_back(
-          migration_metastore::imported_segment{
-            .term = meta.segment_term,
-            .max_timestamp = meta.max_timestamp,
-            .size_bytes = meta.size_bytes,
-            .ts_path
-            = m.generate_segment_path(meta, remote_path_provider())().native(),
-            .base_kafka_offset = meta.base_kafka_offset(),
-            .last_kafka_offset = kafka::prev_offset(meta.next_kafka_offset()),
-          });
-    }
-    if (to_append.empty()) {
-        co_return;
-    }
-    const auto append_count = to_append.size();
-    auto ar = co_await mm->append_imported(_ntp, std::move(to_append));
-    if (ar != migration_metastore::errc::ok) {
+    // (or the true log start if L1 is still empty). Iterate the whole log via
+    // the manifest view -- the spillover (archive) sub-manifests as well as the
+    // live STM manifest -- so the spilled history is imported, not just the live
+    // manifest tail.
+    const auto append_from = offs.has_value()
+                               ? offs->next_offset
+                               : log_start.value_or(kafka::offset{});
+    auto cursor = co_await _manifest_view->get_cursor(
+      m.full_log_start_offset().value_or(
+        m.get_start_offset().value_or(model::offset{})));
+    if (cursor.has_error()) {
         vlog(
           _rtclog.warn,
-          "migration mirror: append of {} imported segment(s) failed",
-          append_count);
+          "migration mirror: failed to open manifest cursor: {}",
+          cursor.error());
+        co_return;
+    }
+    chunked_vector<migration_metastore::imported_segment> to_append;
+    co_await cloud_storage::for_each_manifest(
+      std::move(cursor.value()), [&, this](auto submanifest) {
+          const auto& sm = *submanifest;
+          for (const auto& meta : sm) {
+              if (meta.base_kafka_offset() < append_from) {
+                  continue;
+              }
+              // Skip segments with no kafka-addressable records (e.g. one
+              // holding only control/config batches, or a fully-compacted-away
+              // segment): next_kafka_offset == base_kafka_offset. L1 is keyed on
+              // kafka offsets, so such a segment imports nothing; building an
+              // extent for it yields last_kafka_offset = base_kafka_offset - 1,
+              // an inverted (base > last) extent that the metastore rejects --
+              // failing the whole append and stalling the mirror.
+              if (meta.base_kafka_offset() >= meta.next_kafka_offset()) {
+                  continue;
+              }
+              to_append.push_back(
+                migration_metastore::imported_segment{
+                  .term = meta.segment_term,
+                  .max_timestamp = meta.max_timestamp,
+                  .size_bytes = meta.size_bytes,
+                  .ts_path = sm.generate_segment_path(
+                                 meta, remote_path_provider())()
+                               .native(),
+                  .base_kafka_offset = meta.base_kafka_offset(),
+                  .last_kafka_offset = kafka::prev_offset(
+                    meta.next_kafka_offset()),
+                  .delta_base = meta.delta_offset,
+                });
+          }
+          return ss::stop_iteration::no;
+      });
+    if (!to_append.empty()) {
+        const auto append_count = to_append.size();
+        auto ar = co_await mm->append_imported(_ntp, std::move(to_append));
+        if (ar != migration_metastore::errc::ok) {
+            vlog(
+              _rtclog.warn,
+              "migration mirror: append of {} imported segment(s) failed",
+              append_count);
+            // Don't claim convergence on a failed append.
+            co_return;
+        }
     }
 }
 
