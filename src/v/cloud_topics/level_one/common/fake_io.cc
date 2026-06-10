@@ -12,11 +12,147 @@
 
 #include "bytes/iostream.h"
 #include "cloud_storage_clients/multipart_upload.h"
+#include "cloud_topics/level_one/common/object.h"
+#include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
+#include "cloud_topics/level_one/common/ts_reader.h"
 
 namespace cloud_topics::l1 {
 
 static ss::logger fake_io_log("fake_io");
+
+namespace {
+
+class fake_footer_index final : public object_index {
+public:
+    explicit fake_footer_index(l1::footer f)
+      : _footer(std::move(f)) {}
+
+    std::optional<seek_result> seek_to_offset(
+      model::topic_id_partition tidp, kafka::offset offset) const override {
+        auto r = _footer.file_position_before_kafka_offset(tidp, offset);
+        if (r == l1::footer::npos) {
+            return std::nullopt;
+        }
+        return seek_result{
+          .file_position = r.file_position, .length = r.length};
+    }
+
+    std::optional<seek_result> seek_to_timestamp(
+      model::topic_id_partition tidp, model::timestamp ts) const override {
+        auto r = _footer.file_position_before_max_timestamp(tidp, ts);
+        if (r == l1::footer::npos) {
+            return std::nullopt;
+        }
+        return seek_result{
+          .file_position = r.file_position, .length = r.length};
+    }
+
+private:
+    l1::footer _footer;
+};
+
+class fake_object_handle final : public object_handle {
+public:
+    fake_object_handle(
+      object_extent extent,
+      fake_io* io,
+      l1::footer footer,
+      cloud_io::group_id group)
+      : _extent(extent)
+      , _io(io)
+      , _index(std::move(footer))
+      , _group(group) {}
+
+    const object_index& index() const override { return _index; }
+
+    ss::future<std::expected<std::unique_ptr<l1::object_reader>, io::errc>>
+    open_reader(const seek_result& seek, ss::abort_source* as) override {
+        l1::object_extent read_extent{
+          .id = _extent.id,
+          .position = seek.file_position,
+          .size = seek.length,
+        };
+        auto stream_result = co_await _io->read_object(read_extent, as, _group);
+        if (!stream_result.has_value()) {
+            co_return std::unexpected(stream_result.error());
+        }
+        co_return l1::object_reader::create(std::move(*stream_result));
+    }
+
+private:
+    object_extent _extent;
+    fake_io* _io;
+    fake_footer_index _index;
+    cloud_io::group_id _group;
+};
+
+// Trivial index for an imported TS segment stored in fake_io. Always seeks to
+// file_position=0 (conservative full-segment scan), which is correct since the
+// caller is responsible for dispatching only to a segment whose range includes
+// the target offset.
+class fake_ts_index final : public object_index {
+public:
+    fake_ts_index(
+      size_t segment_size,
+      model::offset_delta delta,
+      kafka::offset last_kafka_offset)
+      : _segment_size(segment_size)
+      , _delta(delta)
+      , _last(last_kafka_offset) {}
+
+    std::optional<seek_result> seek_to_offset(
+      model::topic_id_partition, kafka::offset target) const override {
+        if (target > _last) {
+            return std::nullopt;
+        }
+        return seek_result{
+          .file_position = 0, .length = _segment_size, .delta = _delta};
+    }
+
+    std::optional<seek_result> seek_to_timestamp(
+      model::topic_id_partition, model::timestamp) const override {
+        return seek_result{
+          .file_position = 0, .length = _segment_size, .delta = _delta};
+    }
+
+private:
+    size_t _segment_size;
+    model::offset_delta _delta;
+    kafka::offset _last;
+};
+
+class fake_ts_object_handle final : public object_handle {
+public:
+    fake_ts_object_handle(
+      iobuf bytes,
+      fake_ts_index index,
+      model::term_id term,
+      absl::btree_set<model::tx_range, std::greater<>> aborted)
+      : _bytes(std::move(bytes))
+      , _index(std::move(index))
+      , _term(term)
+      , _aborted(std::move(aborted)) {}
+
+    const object_index& index() const override { return _index; }
+
+    ss::future<std::expected<std::unique_ptr<object_reader>, io::errc>>
+    open_reader(const seek_result& seek, ss::abort_source*) override {
+        auto stream = make_iobuf_input_stream(
+          _bytes.share(seek.file_position, seek.length));
+        auto delta = seek.delta.value_or(model::offset_delta{0});
+        co_return std::make_unique<tiered_storage_object_reader>(
+          std::move(stream), delta, _term, _aborted);
+    }
+
+private:
+    iobuf _bytes;
+    fake_ts_index _index;
+    model::term_id _term;
+    absl::btree_set<model::tx_range, std::greater<>> _aborted;
+};
+
+} // anonymous namespace
 
 // In-memory multipart upload state for testing.
 class fake_multipart_state final
@@ -123,6 +259,55 @@ fake_io::read_object(
               data.share(extent.position, extent.size));
         })
       .value_or(std::unexpected(io::errc::cloud_missing_object));
+}
+
+void fake_io::put_ts_segment(
+  ss::sstring ts_path,
+  iobuf segment_bytes,
+  kafka::offset base_kafka_offset,
+  kafka::offset last_kafka_offset,
+  model::offset_delta delta_offset,
+  absl::btree_set<model::tx_range, std::greater<>> aborted) {
+    _ts_storage.insert_or_assign(
+      std::move(ts_path),
+      ts_segment_fixture{
+        .bytes = std::move(segment_bytes),
+        .base_kafka_offset = base_kafka_offset,
+        .last_kafka_offset = last_kafka_offset,
+        .delta_offset = delta_offset,
+        .aborted = std::move(aborted),
+      });
+}
+
+ss::future<std::expected<std::unique_ptr<object_handle>, io::errc>>
+fake_io::open_object(
+  object_extent extent, ss::abort_source* as, cloud_io::group_id g) {
+    if (extent.imported.has_value()) {
+        auto it = _ts_storage.find(extent.imported->ts_path);
+        if (it == _ts_storage.end()) {
+            co_return std::unexpected(io::errc::cloud_missing_object);
+        }
+        auto& fixture = it->second;
+        size_t segment_size = fixture.bytes.size_bytes();
+        fake_ts_index idx{
+          segment_size, fixture.delta_offset, fixture.last_kafka_offset};
+        co_return std::make_unique<fake_ts_object_handle>(
+          fixture.bytes.share(0, segment_size),
+          std::move(idx),
+          extent.imported->segment_term,
+          fixture.aborted);
+    }
+    auto stream_result = co_await read_object(extent, as, g);
+    if (!stream_result.has_value()) {
+        co_return std::unexpected(stream_result.error());
+    }
+    auto footer_buf = co_await read_iobuf_exactly(*stream_result, extent.size);
+    auto footer_result = co_await l1::footer::read(std::move(footer_buf));
+    if (!std::holds_alternative<l1::footer>(footer_result)) {
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    co_return std::make_unique<fake_object_handle>(
+      extent, this, std::get<l1::footer>(std::move(footer_result)), g);
 }
 
 ss::future<std::expected<void, io::errc>> fake_io::delete_objects(
