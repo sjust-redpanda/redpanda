@@ -210,7 +210,7 @@ public:
     }
 
     ss::future<std::expected<void, errc>>
-    delete_objects(chunked_vector<object_id>, ss::abort_source*) override {
+    delete_objects(chunked_vector<object_location>, ss::abort_source*) override {
         return ss::make_ready_future<std::expected<void, errc>>(
           std::unexpected(errc::cloud_op_error));
     }

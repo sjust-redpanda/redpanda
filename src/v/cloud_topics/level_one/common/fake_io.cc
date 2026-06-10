@@ -125,10 +125,10 @@ fake_io::read_object(
       .value_or(std::unexpected(io::errc::cloud_missing_object));
 }
 
-ss::future<std::expected<void, io::errc>>
-fake_io::delete_objects(chunked_vector<object_id> oids, ss::abort_source*) {
-    for (const auto& oid : oids) {
-        remove_object(oid);
+ss::future<std::expected<void, io::errc>> fake_io::delete_objects(
+  chunked_vector<object_location> objects, ss::abort_source*) {
+    for (const auto& obj : objects) {
+        remove_object(obj.id);
     }
     co_return std::expected<void, io::errc>{};
 }

@@ -93,9 +93,11 @@ public:
     virtual ss::future<std::expected<iobuf, errc>> read_object_as_iobuf(
       object_extent, ss::abort_source*, cloud_io::group_id g);
 
-    // Delete the specified objects from object storage.
+    // Delete the specified objects from object storage. An entry with a ts_path
+    // is routed to the TS bucket (at that path); otherwise the L1 bucket path is
+    // used.
     virtual ss::future<std::expected<void, errc>>
-    delete_objects(chunked_vector<object_id>, ss::abort_source*) = 0;
+    delete_objects(chunked_vector<object_location>, ss::abort_source*) = 0;
 
     // Create a multipart upload for streaming data directly to object storage.
     virtual ss::future<
