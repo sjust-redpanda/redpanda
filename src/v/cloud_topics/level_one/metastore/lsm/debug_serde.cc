@@ -163,6 +163,12 @@ debug_encode_value(const proto::admin::metastore::row_value& val) {
           .len = static_cast<size_t>(v.get_len()),
           .oid = object_id{*uuid},
         };
+        if (v.has_imported_ts_delta()) {
+            const auto& isi = v.get_imported_ts_delta();
+            rv.imported_ts_delta = imported_ts_segment_info{
+              .segment_term = model::term_id{isi.get_segment_term()},
+            };
+        }
         return serde::to_iobuf(std::move(rv));
     }
     if (val.has_term()) {
@@ -204,6 +210,12 @@ debug_encode_value(const proto::admin::metastore::row_value& val) {
           .last_updated = model::timestamp{v.get_last_updated()},
           .is_preregistration = v.get_is_preregistration(),
         };
+        if (v.has_imported_ts_location()) {
+            const auto& loc = v.get_imported_ts_location();
+            entry.imported_ts_location = imported_ts_object_location{
+              .ts_path = ss::sstring{loc.get_ts_path()},
+            };
+        }
         object_row_value rv{
           .object = std::move(entry),
         };
