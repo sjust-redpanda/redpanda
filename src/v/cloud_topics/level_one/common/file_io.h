@@ -43,6 +43,9 @@ public:
     ss::future<std::expected<ss::input_stream<char>, errc>> read_object(
       object_extent, ss::abort_source*, cloud_io::group_id g) override;
 
+    ss::future<std::expected<std::unique_ptr<object_handle>, errc>> open_object(
+      object_extent, ss::abort_source*, cloud_io::group_id g) override;
+
     ss::future<std::expected<void, errc>>
     delete_objects(chunked_vector<object_location>, ss::abort_source*) override;
 
@@ -56,6 +59,10 @@ private:
       cloud_io::space_reservation_guard*,
       std::filesystem::path,
       uint64_t content_length);
+
+    // Download a raw object by key into an iobuf, using _ts_bucket.
+    ss::future<std::expected<iobuf, errc>>
+    download_raw_iobuf(const ss::sstring& key, ss::abort_source* as);
 
     // Delete a batch of keys from the given bucket.
     ss::future<std::expected<void, errc>> delete_keys(

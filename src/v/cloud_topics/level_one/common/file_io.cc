@@ -19,8 +19,10 @@
 #include "cloud_storage_clients/client.h"
 #include "cloud_topics/level_one/common/abstract_io.h"
 #include "cloud_topics/level_one/common/object.h"
+#include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
 #include "cloud_topics/level_one/common/object_utils.h"
+#include "cloud_topics/level_one/common/ts_reader.h"
 #include "cloud_topics/logger.h"
 #include "config/configuration.h"
 
@@ -93,6 +95,280 @@ struct one_time_stream_provider : public stream_provider {
         return ss::now();
     }
     std::optional<ss::input_stream<char>> _st;
+};
+
+class l1_footer_index final : public object_index {
+public:
+    explicit l1_footer_index(footer f)
+      : _footer(std::move(f)) {}
+
+    std::optional<seek_result> seek_to_offset(
+      model::topic_id_partition tidp, kafka::offset offset) const override {
+        auto r = _footer.file_position_before_kafka_offset(tidp, offset);
+        if (r == footer::npos) {
+            return std::nullopt;
+        }
+        return seek_result{
+          .file_position = r.file_position, .length = r.length};
+    }
+
+    std::optional<seek_result> seek_to_timestamp(
+      model::topic_id_partition tidp, model::timestamp ts) const override {
+        auto r = _footer.file_position_before_max_timestamp(tidp, ts);
+        if (r == footer::npos) {
+            return std::nullopt;
+        }
+        return seek_result{
+          .file_position = r.file_position, .length = r.length};
+    }
+
+private:
+    footer _footer;
+};
+
+class l1_native_object_handle final : public object_handle {
+public:
+    l1_native_object_handle(
+      object_id oid, footer f, file_io* io, cloud_io::group_id group)
+      : _oid(oid)
+      , _index(std::move(f))
+      , _io(io)
+      , _group(group) {}
+
+    const object_index& index() const override { return _index; }
+
+    ss::future<std::expected<std::unique_ptr<object_reader>, io::errc>>
+    open_reader(const seek_result& seek, ss::abort_source* as) override {
+        object_extent extent{
+          .id = _oid,
+          .position = seek.file_position,
+          .size = seek.length,
+        };
+        auto stream_result = co_await _io->read_object(extent, as, _group);
+        if (!stream_result.has_value()) {
+            co_return std::unexpected(stream_result.error());
+        }
+        co_return object_reader::create(std::move(stream_result).value());
+    }
+
+private:
+    object_id _oid;
+    l1_footer_index _index;
+    file_io* _io;
+    cloud_io::group_id _group;
+};
+
+// Implements object_index over a tiered-storage segment's offset_index.
+//
+// find_kaf_offset/find_timestamp are non-const on offset_index (they flush a
+// write buffer internally), so _index is mutable.
+class ts_segment_index final : public object_index {
+public:
+    ts_segment_index(
+      cloud_storage::offset_index index,
+      kafka::offset max_kafka_offset,
+      model::offset_delta base_delta,
+      size_t segment_size)
+      : _index(std::move(index))
+      , _max_kafka_offset(max_kafka_offset)
+      , _base_delta(base_delta)
+      , _segment_size(segment_size) {}
+
+    std::optional<seek_result> seek_to_offset(
+      model::topic_id_partition, kafka::offset target) const override {
+        if (target > _max_kafka_offset) {
+            return std::nullopt;
+        }
+        // Offsets below the segment's base return {file_pos=0, full segment},
+        // which causes the reader to scan from the start — correct because the
+        // caller is responsible for only dispatching to a segment whose range
+        // includes the target.
+        auto entry = _index.find_kaf_offset(target + kafka::offset{1});
+        size_t file_pos = entry ? static_cast<size_t>(entry->file_pos) : 0;
+        model::offset_delta delta
+          = entry
+              ? model::offset_delta{entry->rp_offset() - entry->kaf_offset()}
+              : _base_delta;
+        return seek_result{
+          .file_position = file_pos,
+          .length = _segment_size - file_pos,
+          .delta = delta};
+    }
+
+    std::optional<seek_result> seek_to_timestamp(
+      model::topic_id_partition, model::timestamp ts) const override {
+        auto entry = _index.find_timestamp(ts);
+        size_t file_pos = entry ? static_cast<size_t>(entry->file_pos) : 0;
+        model::offset_delta delta
+          = entry
+              ? model::offset_delta{entry->rp_offset() - entry->kaf_offset()}
+              : _base_delta;
+        return seek_result{
+          .file_position = file_pos,
+          .length = _segment_size - file_pos,
+          .delta = delta};
+    }
+
+private:
+    mutable cloud_storage::offset_index _index;
+    kafka::offset _max_kafka_offset;
+    model::offset_delta _base_delta;
+    size_t _segment_size;
+};
+
+// Implements object_handle for an imported tiered-storage segment.
+class tiered_storage_object_handle final : public object_handle {
+public:
+    tiered_storage_object_handle(
+      object_extent extent,
+      cloud_io::remote* remote,
+      cloud_storage_clients::bucket_name bucket,
+      cloud_io::cache* cache,
+      std::unique_ptr<ts_segment_index> index,
+      absl::btree_set<model::tx_range, std::greater<>> aborted)
+      : _extent(std::move(extent))
+      , _remote(remote)
+      , _bucket(std::move(bucket))
+      , _cache(cache)
+      , _index(std::move(index))
+      , _aborted(std::move(aborted)) {}
+
+    const object_index& index() const override { return *_index; }
+
+    ss::future<std::expected<std::unique_ptr<object_reader>, io::errc>>
+    open_reader(const seek_result& seek, ss::abort_source* as) override {
+        vassert(_extent.imported.has_value(), "missing imported info");
+        auto delta = seek.delta.value_or(
+          _extent.imported->delta_offset);
+        // This downloads the whole segment suffix [file_position, segment_end)
+        // up front, even when the fetch stops early (max_offset/max_bytes).
+        // Bounding the download to the fetch window was considered and
+        // deferred: it is a perf refinement (the native L1 path downloads
+        // seek..end the same way), and a naive length cap is a data-loss bug --
+        // the reader would hit EOF early and level_one_reader would treat the
+        // object as finished, skipping the un-downloaded tail. A correct bound
+        // needs either a windowed/lazy data_source here (so EOF still only
+        // happens at the true segment end) or a read bound plumbed through the
+        // shared open_reader/object_index interface.
+        auto stream_result = co_await download_ts_range(
+          _extent.imported->ts_path,
+          seek.file_position,
+          seek.length,
+          as);
+        if (!stream_result.has_value()) {
+            co_return std::unexpected(stream_result.error());
+        }
+        co_return std::make_unique<tiered_storage_object_reader>(
+          std::move(*stream_result),
+          delta,
+          _extent.imported->segment_term,
+          _aborted);
+    }
+
+private:
+    ss::future<uint64_t> save_to_cache(
+      ss::input_stream<char> stream,
+      cloud_io::space_reservation_guard* reservation,
+      std::filesystem::path cache_key,
+      uint64_t content_length) {
+        co_await _cache->put(std::move(cache_key), stream, *reservation);
+        co_return content_length;
+    }
+
+    ss::future<std::expected<ss::input_stream<char>, io::errc>>
+    download_ts_range(
+      const ss::sstring& ts_path,
+      size_t offset,
+      size_t size,
+      ss::abort_source* as) {
+        static constexpr auto timeout = 10s;
+        static constexpr auto backoff = 100ms;
+        retry_chain_node root(*as, ss::lowres_clock::now() + timeout, backoff);
+        lazy_abort_source las{[as] {
+            return as->abort_requested() ? std::make_optional("abort requested")
+                                         : std::nullopt;
+        }};
+        std::filesystem::path cache_key = fmt::format(
+          "ts_{}_position_{}_size_{}.partial", ts_path, offset, size);
+        while (true) {
+            auto stream_fut = co_await ss::coroutine::as_future<
+              std::optional<cloud_io::cache_item_stream>>(_cache->get_stream(
+              cache_key,
+              config::shard_local_cfg().storage_read_buffer_size(),
+              config::shard_local_cfg().storage_read_readahead_count()));
+            if (stream_fut.failed()) {
+                auto ex = stream_fut.get_exception();
+                vlog(
+                  cd_log.warn,
+                  "Error reading from cache for ts {}: {}",
+                  ts_path,
+                  ex);
+                co_return std::unexpected(io::errc::file_io_error);
+            }
+            auto stream = stream_fut.get();
+            if (stream) {
+                co_return std::move(stream->body);
+            }
+            auto reservation_fut = co_await ss::coroutine::as_future<
+              cloud_io::space_reservation_guard>(
+              _cache->reserve_space(size, 1));
+            if (reservation_fut.failed()) {
+                auto ex = reservation_fut.get_exception();
+                vlog(
+                  cd_log.warn,
+                  "Error reserving cache space for ts {}: {}",
+                  ts_path,
+                  ex);
+                co_return std::unexpected(io::errc::file_io_error);
+            }
+            cloud_io::try_consume_stream consumer =
+              [this, r = reservation_fut.get(), &cache_key](
+                uint64_t content_length, ss::input_stream<char> s) mutable {
+                  return save_to_cache(
+                    std::move(s), &r, cache_key, content_length);
+              };
+            auto result_fut
+              = co_await ss::coroutine::as_future<cloud_io::download_result>(
+                _remote->download_stream(
+                  cloud_io::transfer_details{
+                    .bucket = _bucket,
+                    .key = cloud_storage_clients::object_key{ts_path},
+                    .parent_rtc = root,
+                  },
+                  consumer,
+                  "ts_segment_download",
+                  /*acquire_hydration_units=*/true,
+                  cloud_storage_clients::http_byte_range{
+                    offset, offset + size - 1}));
+            if (result_fut.failed()) {
+                auto ex = result_fut.get_exception();
+                vlog(
+                  cd_log.warn,
+                  "Error downloading TS segment {}: {}",
+                  ts_path,
+                  ex);
+                co_return std::unexpected(io::errc::cloud_op_error);
+            }
+            switch (result_fut.get()) {
+            case cloud_io::download_result::success:
+                continue;
+            case cloud_io::download_result::notfound:
+                co_return std::unexpected(io::errc::cloud_missing_object);
+            case cloud_io::download_result::timedout:
+                co_return std::unexpected(io::errc::cloud_op_timeout);
+            case cloud_io::download_result::failed:
+                co_return std::unexpected(io::errc::cloud_op_error);
+            }
+            std::unreachable();
+        }
+    }
+
+    object_extent _extent;
+    cloud_io::remote* _remote;
+    cloud_storage_clients::bucket_name _bucket;
+    cloud_io::cache* _cache;
+    std::unique_ptr<ts_segment_index> _index;
+    absl::btree_set<model::tx_range, std::greater<>> _aborted;
 };
 
 } // namespace
@@ -262,6 +538,89 @@ file_io::read_object(
     }
 }
 
+ss::future<std::expected<std::unique_ptr<object_handle>, io::errc>>
+file_io::open_object(
+  object_extent extent, ss::abort_source* as, cloud_io::group_id g) {
+    if (extent.imported.has_value()) {
+        auto index_path = cloud_storage::generate_index_path(
+          cloud_storage::remote_segment_path{
+            std::filesystem::path{extent.imported->ts_path}});
+        cloud_storage::offset_index ts_index(
+          model::offset{0},
+          kafka::offset{0},
+          0,
+          cloud_storage::remote_segment_sampling_step_bytes,
+          model::timestamp::missing());
+        auto index_iobuf = co_await download_raw_iobuf(index_path.native(), as);
+        if (index_iobuf.has_value()) {
+            ts_index.from_iobuf(std::move(*index_iobuf));
+        } else if (index_iobuf.error() != io::errc::cloud_missing_object) {
+            // A genuinely absent index (notfound) is fine: fall back to a
+            // full-segment scan with an empty index. Any other error (timeout
+            // or transient failure) must propagate -- previously it was
+            // silently masked as an empty-index full scan.
+            vlog(
+              cd_log.warn,
+              "Failed to download index for imported segment {}: {}",
+              extent.imported->ts_path,
+              index_iobuf.error());
+            co_return std::unexpected(index_iobuf.error());
+        }
+        auto idx = std::make_unique<ts_segment_index>(
+          std::move(ts_index),
+          extent.imported->last_kafka_offset,
+          extent.imported->delta_offset,
+          extent.size);
+
+        // Aborted-transaction ranges for this segment, so the reader can strip
+        // aborted data and make the imported region committed-only (like native
+        // CT L1). Ranges are in raw log-offset space, as the reader needs.
+        absl::btree_set<model::tx_range, std::greater<>> aborted;
+        cloud_storage::remote_segment_path seg_path{
+          std::filesystem::path{extent.imported->ts_path}};
+        auto tx_path = cloud_storage::generate_remote_tx_path(seg_path);
+        auto tx_iobuf = co_await download_raw_iobuf(tx_path().native(), as);
+        if (tx_iobuf.has_value()) {
+            cloud_storage::tx_range_manifest manifest(seg_path);
+            co_await manifest.update(
+              make_iobuf_input_stream(std::move(*tx_iobuf)));
+            for (auto& r : std::move(manifest).get_tx_range()) {
+                aborted.insert(r);
+            }
+        } else if (tx_iobuf.error() != io::errc::cloud_missing_object) {
+            // Absent .tx (notfound) means no aborted transactions -- the common
+            // case. Any other error must propagate rather than silently produce
+            // an empty set, which would leak aborted data into the read path.
+            vlog(
+              cd_log.warn,
+              "Failed to download tx manifest for imported segment {}: {}",
+              extent.imported->ts_path,
+              tx_iobuf.error());
+            co_return std::unexpected(tx_iobuf.error());
+        }
+
+        co_return std::make_unique<tiered_storage_object_handle>(
+          extent,
+          _remote,
+          _ts_bucket,
+          _cache,
+          std::move(idx),
+          std::move(aborted));
+    }
+
+    auto read_result = co_await read_object_as_iobuf(extent, as, g);
+    if (!read_result.has_value()) {
+        co_return std::unexpected(read_result.error());
+    }
+    auto footer_result = co_await footer::read(std::move(read_result).value());
+    if (!std::holds_alternative<footer>(footer_result)) {
+        vlog(cd_log.warn, "Failed to parse L1 footer for object {}", extent.id);
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    co_return std::make_unique<l1_native_object_handle>(
+      extent.id, std::get<footer>(std::move(footer_result)), this, g);
+}
+
 ss::future<std::expected<void, io::errc>> file_io::delete_keys(
   const cloud_storage_clients::bucket_name& bucket,
   chunked_vector<cloud_storage_clients::object_key> keys,
@@ -362,6 +721,40 @@ file_io::create_multipart_upload(
         co_return std::unexpected(io::errc::cloud_op_error);
     }
     co_return std::move(result.value());
+}
+
+ss::future<std::expected<iobuf, io::errc>>
+file_io::download_raw_iobuf(const ss::sstring& key, ss::abort_source* as) {
+    static constexpr auto timeout = 10s;
+    static constexpr auto backoff = 100ms;
+    retry_chain_node root(*as, ss::lowres_clock::now() + timeout, backoff);
+    iobuf result;
+    auto res_fut = co_await ss::coroutine::as_future<cloud_io::download_result>(
+      _remote->download_object({
+        .transfer_details = {
+          .bucket = _ts_bucket,
+          .key = cloud_storage_clients::object_key{key},
+          .parent_rtc = root,
+        },
+        .display_str = "ts_raw_download",
+        .payload = result,
+      }));
+    if (res_fut.failed()) {
+        auto ex = res_fut.get_exception();
+        vlog(cd_log.warn, "Error downloading raw object {}: {}", key, ex);
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    switch (res_fut.get()) {
+    case cloud_io::download_result::success:
+        co_return std::move(result);
+    case cloud_io::download_result::notfound:
+        co_return std::unexpected(io::errc::cloud_missing_object);
+    case cloud_io::download_result::timedout:
+        co_return std::unexpected(io::errc::cloud_op_timeout);
+    case cloud_io::download_result::failed:
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    std::unreachable();
 }
 
 } // namespace cloud_topics::l1

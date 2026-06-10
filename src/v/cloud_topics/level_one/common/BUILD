@@ -89,6 +89,35 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "object_handle",
+    hdrs = ["object_handle.h"],
+    deps = [
+        ":abstract_io",
+        ":object",
+        "//src/v/model",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "ts_reader",
+    srcs = ["ts_reader.cc"],
+    hdrs = ["ts_reader.h"],
+    visibility = ["//visibility:private"],
+    implementation_deps = [
+        "//src/v/bytes:iostream",
+        "//src/v/storage:record_batch_utils",
+        "@fmt",
+    ],
+    deps = [
+        ":object",
+        "//src/v/model",
+        "@abseil-cpp//absl/container:btree",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "file_io",
     srcs = ["file_io.cc"],
     hdrs = ["file_io.h"],
@@ -97,21 +126,25 @@ redpanda_cc_library(
         "//src/v/cloud_topics/level_one:__subpackages__",
         "//src/v/cloud_topics/read_replica:__pkg__",
     ],
+    implementation_deps = [
+        ":ts_reader",
+        "//src/v/bytes:iostream",
+        "//src/v/cloud_storage",
+        "@abseil-cpp//absl/container:btree",
+    ],
     deps = [
         ":abstract_io",
         ":object",
+        ":object_handle",
         ":object_id",
         ":object_utils",
-        "//src/v/bytes:iostream",
         "//src/v/cloud_io:cache",
         "//src/v/cloud_io:io_result",
         "//src/v/cloud_io:remote",
-        "//src/v/cloud_storage",
         "//src/v/cloud_storage_clients",
         "//src/v/cloud_topics:logger",
         "//src/v/config",
         "//src/v/model",
-        "@abseil-cpp//absl/container:btree",
         "@seastar",
     ],
 )
@@ -120,13 +153,19 @@ redpanda_cc_library(
     name = "fake_io",
     srcs = ["fake_io.cc"],
     hdrs = ["fake_io.h"],
+    implementation_deps = [
+        ":object",
+        ":ts_reader",
+    ],
     deps = [
         ":abstract_io",
+        ":object_handle",
         ":object_id",
         ":object_utils",
         "//src/v/bytes:iobuf",
         "//src/v/bytes:iostream",
         "//src/v/cloud_storage_clients",
+        "//src/v/model",
         "@abseil-cpp//absl/container:btree",
         "@seastar",
     ],

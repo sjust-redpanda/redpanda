@@ -9,6 +9,7 @@
  */
 
 #include "cloud_topics/level_one/common/fake_io.h"
+#include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/metastore/garbage_collector.h"
 #include "cloud_topics/level_one/metastore/simple_stm.h"
 #include "cloud_topics/level_one/metastore/state_update.h"
@@ -207,6 +208,13 @@ public:
     ss::future<std::expected<ss::input_stream<char>, errc>> read_object(
       object_extent ext, ss::abort_source* as, cloud_io::group_id g) override {
         return underlying_->read_object(ext, as, g);
+    }
+
+    ss::future<std::expected<std::unique_ptr<object_handle>, errc>>
+    open_object(object_extent, ss::abort_source*, cloud_io::group_id) override {
+        return ss::make_ready_future<
+          std::expected<std::unique_ptr<object_handle>, errc>>(
+          std::unexpected(errc::cloud_op_error));
     }
 
     ss::future<std::expected<void, errc>>
