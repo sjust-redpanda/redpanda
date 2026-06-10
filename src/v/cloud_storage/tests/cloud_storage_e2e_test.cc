@@ -18,6 +18,7 @@
 #include "cluster/controller_api.h"
 #include "cluster/health_monitor_frontend.h"
 #include "kafka/client/transport.h"
+#include "kafka/data/partition_proxy.h"
 #include "kafka/data/replicated_partition.h"
 #include "kafka/protocol/fetch.h"
 #include "kafka/protocol/find_coordinator.h"
@@ -344,6 +345,89 @@ TEST_F(ManualFixture, ReplicatedPartitionMidMigrationApiParity) {
     ASSERT_EQ(tec, kafka::error_code::none);
     RPTEST_REQUIRE_EVENTUALLY(
       10s, [&] { return rp_mig.start_offset() >= trunc; });
+}
+
+// A migrating partition whose live STM manifest has been fully offloaded to the
+// archive (spillover) -- manifest().size()==0 while get_archive_start_offset()
+// is set -- still holds tiered-storage data in the archive and must be served
+// as tiered storage, not misrouted to the (empty) cloud-topic path. Regression
+// for the make_partition_proxy structural gate, which once keyed only on the
+// live manifest and so would read a spilled, still-migrating partition as cut
+// over.
+TEST_F(ManualFixture, MigratingSpilledEmptyLiveManifestRoutesToTieredStorage) {
+    test_local_cfg.get("cloud_storage_disable_upload_loop_for_tests")
+      .set_value(true);
+    test_local_cfg.get("cloud_storage_spillover_manifest_max_segments")
+      .set_value(std::make_optional<size_t>(2));
+    test_local_cfg.get("cloud_storage_spillover_manifest_size")
+      .set_value(std::optional<size_t>{});
+    const model::topic topic_name("migrating-spilled");
+    model::ntp ntp(model::kafka_namespace, topic_name, 0);
+
+    cluster::topic_properties props;
+    props.shadow_indexing = model::shadow_indexing_mode::full;
+    props.cleanup_policy_bitflags = model::cleanup_policy_bitflags::deletion;
+    add_topic({model::kafka_namespace, topic_name}, 1, props).get();
+    wait_for_leader(ntp).get();
+
+    auto partition = app.partition_manager.local().get(ntp);
+    auto& archiver = partition->archiver().value().get();
+    archiver.initialize_probe();
+    tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
+    auto total_records = gen.num_segments(20)
+                           .batches_per_segment(5)
+                           .produce()
+                           .get();
+    ASSERT_GE(total_records, 50);
+    ASSERT_TRUE(archiver.sync_for_tests().get());
+    archiver.apply_spillover().get();
+
+    auto* stm = partition->archival_meta_stm().get();
+    // Spillover populated the archive.
+    ASSERT_NE(stm->get_archive_start_offset(), model::offset{});
+
+    // Drive the *live* manifest to empty while the archive remains: advance the
+    // live start offset past its last segment, then drop the truncated
+    // segments. This is the degenerate state the gate must handle -- live
+    // manifest empty, archive non-empty.
+    ss::abort_source as;
+    const auto past_last = model::next_offset(stm->manifest().get_last_offset());
+    auto ec
+      = stm->truncate(past_last, ss::lowres_clock::now() + 30s, as).get();
+    ASSERT_FALSE(ec) << "truncate failed: " << ec.message();
+    ec = stm->cleanup_metadata(ss::lowres_clock::now() + 30s, as).get();
+    ASSERT_FALSE(ec) << "cleanup_metadata failed: " << ec.message();
+    ASSERT_EQ(stm->manifest().size(), 0u)
+      << "precondition: live manifest must be empty";
+    ASSERT_NE(stm->get_archive_start_offset(), model::offset{})
+      << "precondition: archive must still hold data";
+
+    // Flip into the migrating state: cloud storage mode (cloud_topic_enabled) +
+    // the archival STM migration flag.
+    auto log = partition->log();
+    ASSERT_TRUE(log->config().has_overrides());
+    auto overrides = log->config().get_overrides();
+    overrides.storage_mode = model::redpanda_storage_mode::cloud;
+    log->set_overrides(overrides);
+    auto mec
+      = stm->set_migration_state(true, ss::lowres_clock::now() + 30s, as).get();
+    ASSERT_FALSE(mec) << "set_migration_state failed: " << mec.message();
+    ASSERT_TRUE(log->config().cloud_topic_enabled());
+    ASSERT_TRUE(stm->is_migrating());
+
+    // The structural gate (make_partition_proxy) must route this to tiered
+    // storage: the archive still holds the data. It must behave identically to
+    // a directly-constructed replicated_partition -- not the cloud-topic path,
+    // which would serve an empty L1 (or, with the cloud-topics subsystem
+    // uninitialized here, throw).
+    kafka::replicated_partition expected_ts(partition);
+    kafka::partition_proxy proxy = kafka::make_partition_proxy(partition);
+    EXPECT_EQ(proxy.start_offset(), expected_ts.start_offset());
+    EXPECT_EQ(proxy.high_watermark(), expected_ts.high_watermark());
+    // The high watermark covers the produced records (served from the archive),
+    // which the empty cloud-topic path could not do.
+    EXPECT_GT(proxy.high_watermark(), model::offset(0));
 }
 
 class EndToEndFixture
