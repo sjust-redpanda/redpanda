@@ -163,6 +163,17 @@ debug_encode_value(const proto::admin::metastore::row_value& val) {
           .len = static_cast<size_t>(v.get_len()),
           .oid = object_id{*uuid},
         };
+        if (v.has_imported()) {
+            const auto& isi = v.get_imported();
+            rv.imported = imported_segment_info{
+              .ts_path = ss::sstring{isi.get_ts_path()},
+              .delta_offset = model::offset_delta{isi.get_delta_offset()},
+              .delta_offset_end
+              = model::offset_delta{isi.get_delta_offset_end()},
+              .base_kafka_offset = kafka::offset{isi.get_base_kafka_offset()},
+              .last_kafka_offset = kafka::offset{isi.get_last_kafka_offset()},
+            };
+        }
         return serde::to_iobuf(std::move(rv));
     }
     if (val.has_term()) {
@@ -204,6 +215,17 @@ debug_encode_value(const proto::admin::metastore::row_value& val) {
           .last_updated = model::timestamp{v.get_last_updated()},
           .is_preregistration = v.get_is_preregistration(),
         };
+        if (v.has_imported()) {
+            const auto& isi = v.get_imported();
+            entry.imported = imported_segment_info{
+              .ts_path = ss::sstring{isi.get_ts_path()},
+              .delta_offset = model::offset_delta{isi.get_delta_offset()},
+              .delta_offset_end
+              = model::offset_delta{isi.get_delta_offset_end()},
+              .base_kafka_offset = kafka::offset{isi.get_base_kafka_offset()},
+              .last_kafka_offset = kafka::offset{isi.get_last_kafka_offset()},
+            };
+        }
         object_row_value rv{
           .object = std::move(entry),
         };
