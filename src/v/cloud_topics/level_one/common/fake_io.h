@@ -30,7 +30,7 @@ public:
       object_extent, ss::abort_source*, cloud_io::group_id g) override;
 
     ss::future<std::expected<void, errc>>
-    delete_objects(chunked_vector<object_id>, ss::abort_source*) override;
+    delete_objects(chunked_vector<object_extent>, ss::abort_source*) override;
 
     ss::future<std::expected<cloud_storage_clients::multipart_upload_ref, errc>>
     create_multipart_upload(

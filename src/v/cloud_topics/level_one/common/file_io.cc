@@ -10,18 +10,27 @@
 
 #include "cloud_topics/level_one/common/file_io.h"
 
+#include "bytes/iostream.h"
 #include "cloud_io/io_result.h"
 #include "cloud_io/remote.h"
+#include "cloud_storage/remote_segment.h"
+#include "cloud_storage/remote_segment_index.h"
+#include "cloud_storage/tx_range_manifest.h"
 #include "cloud_storage_clients/client.h"
 #include "cloud_topics/level_one/common/abstract_io.h"
+#include "cloud_topics/level_one/common/object.h"
 #include "cloud_topics/level_one/common/object_id.h"
 #include "cloud_topics/level_one/common/object_utils.h"
+#include "cloud_topics/level_one/common/ts_reader.h"
 #include "cloud_topics/logger.h"
 #include "config/configuration.h"
 
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 
+#include <absl/container/btree_set.h>
+
+#include <algorithm>
 #include <memory>
 
 using namespace std::chrono_literals;
@@ -93,9 +102,11 @@ file_io::file_io(
   std::filesystem::path staging_dir,
   cloud_io::remote* remote,
   cloud_storage_clients::bucket_name bucket,
-  cloud_io::cache* cache)
+  cloud_io::cache* cache,
+  std::optional<cloud_storage_clients::bucket_name> ts_bucket)
   : _remote(remote)
   , _bucket(std::move(bucket))
+  , _ts_bucket(ts_bucket.value_or(_bucket))
   , _staging_dir(std::move(staging_dir))
   , _cache(cache) {}
 
@@ -252,19 +263,14 @@ file_io::read_object(
     }
 }
 
-ss::future<std::expected<void, io::errc>>
-file_io::delete_objects(chunked_vector<object_id> ids, ss::abort_source* as) {
-    static constexpr auto timeout = 10s;
-    static constexpr auto backoff = 100ms;
-    retry_chain_node root(*as, ss::lowres_clock::now() + timeout, backoff);
-    chunked_vector<cloud_storage_clients::object_key> keys;
-    for (const auto& id : ids) {
-        keys.push_back(object_path_factory::level_one_path(id));
-    }
+ss::future<std::expected<void, io::errc>> file_io::delete_keys(
+  const cloud_storage_clients::bucket_name& bucket,
+  chunked_vector<cloud_storage_clients::object_key> keys,
+  retry_chain_node& root) {
     auto result_fut
       = co_await ss::coroutine::as_future<cloud_io::upload_result>(
         _remote->delete_objects(
-          _bucket, std::move(keys), root, [](size_t retry_count) {
+          bucket, std::move(keys), root, [](size_t retry_count) {
               std::ignore = retry_count;
           }));
     if (result_fut.failed()) {
@@ -282,6 +288,58 @@ file_io::delete_objects(chunked_vector<object_id> ids, ss::abort_source* as) {
         co_return std::unexpected(io::errc::cloud_op_error);
     }
     std::unreachable();
+}
+
+ss::future<std::expected<void, io::errc>> file_io::delete_objects(
+  chunked_vector<object_extent> extents, ss::abort_source* as) {
+    static constexpr auto timeout = 10s;
+    static constexpr auto backoff = 100ms;
+    retry_chain_node root(*as, ss::lowres_clock::now() + timeout, backoff);
+
+    chunked_vector<cloud_storage_clients::object_key> native_keys;
+    chunked_vector<cloud_storage_clients::object_key> ts_keys;
+    for (const auto& extent : extents) {
+        if (extent.imported.has_value()) {
+            // An imported segment owns three cloud objects (the segment, its
+            // .tx range manifest, and its .index), the same set the archiver
+            // would have deleted. Remove all three so nothing is orphaned.
+            cloud_storage::remote_segment_path seg_path{
+              std::filesystem::path{extent.imported->ts_path}};
+            ts_keys.push_back(
+              cloud_storage_clients::object_key{extent.imported->ts_path});
+            ts_keys.push_back(
+              cloud_storage_clients::object_key{
+                cloud_storage::generate_remote_tx_path(seg_path)().native()});
+            ts_keys.push_back(
+              cloud_storage_clients::object_key{
+                cloud_storage::generate_index_path(seg_path).native()});
+        } else {
+            native_keys.push_back(
+              object_path_factory::level_one_path(extent.id));
+        }
+    }
+
+    if (!native_keys.empty()) {
+        auto res = co_await delete_keys(_bucket, std::move(native_keys), root);
+        if (!res.has_value()) {
+            co_return res;
+        }
+    }
+    if (!ts_keys.empty()) {
+        auto ts_count = ts_keys.size();
+        // Best-effort: log and continue on failure. The archiver is no longer
+        // running on this partition so the segment will remain in cloud storage
+        // but be unreachable from any read path.
+        auto res = co_await delete_keys(_ts_bucket, std::move(ts_keys), root);
+        if (!res.has_value()) {
+            vlog(
+              cd_log.warn,
+              "Failed to delete {} imported TS segments: {}",
+              ts_count,
+              res.error());
+        }
+    }
+    co_return std::expected<void, io::errc>{};
 }
 
 ss::future<std::expected<cloud_storage_clients::multipart_upload_ref, io::errc>>
