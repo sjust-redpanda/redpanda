@@ -36,7 +36,7 @@ using stm_update_error = named_type<ss::sstring, struct update_error_tag>;
 
 struct new_object
   : public serde::
-      envelope<new_object, serde::version<0>, serde::compat_version<0>> {
+      envelope<new_object, serde::version<1>, serde::compat_version<0>> {
     struct metadata
       : public serde::
           envelope<metadata, serde::version<0>, serde::compat_version<0>> {
@@ -55,7 +55,7 @@ struct new_object
 
     friend bool operator==(const new_object&, const new_object&) = default;
     auto serde_fields() {
-        return std::tie(oid, footer_pos, object_size, extent_metas);
+        return std::tie(oid, footer_pos, object_size, extent_metas, imported);
     }
 
     object_id oid;
@@ -65,6 +65,13 @@ struct new_object
       model::topic_id,
       chunked_hash_map<model::partition_id, metadata>>
       extent_metas;
+
+    // Set for objects imported from a tiered-storage segment (the TS->CT
+    // migration import path); nullopt for natively written L1 objects. An
+    // imported object carries a single extent covering the segment. apply()
+    // decomposes it: the location (ts_path) lands on the object row, the
+    // segment descriptor (delta/term) on the extent row.
+    std::optional<imported_ts_info> imported;
 
     // Returns the sum of lengths of the extents collected.
     size_t collect_extents_by_tidp(sorted_extents_by_tidp_t*) const;

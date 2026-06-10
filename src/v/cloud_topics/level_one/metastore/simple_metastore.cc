@@ -96,6 +96,15 @@ simple_object_builder::add(
 std::expected<void, metastore::object_metadata_builder::error>
 simple_object_builder::finish(
   object_id oid, size_t footer_pos, size_t object_size) {
+    return finish(oid, footer_pos, object_size, std::nullopt);
+}
+
+std::expected<void, metastore::object_metadata_builder::error>
+simple_object_builder::finish(
+  object_id oid,
+  size_t footer_pos,
+  size_t object_size,
+  std::optional<imported_ts_info> imported) {
     auto it = pending_objects_.find(oid);
     if (it == pending_objects_.end()) {
         return std::unexpected(
@@ -107,6 +116,7 @@ simple_object_builder::finish(
         .footer_pos = footer_pos,
         .object_size = object_size,
         .ntp_metas = std::move(it->second),
+        .imported = std::move(imported),
       });
     pending_objects_.erase(it);
     return {};
@@ -134,6 +144,7 @@ new_object make_new_object(const metastore::object_metadata& o) {
       .oid = o.oid,
       .footer_pos = o.footer_pos,
       .object_size = o.object_size,
+      .imported = o.imported,
     };
     for (const auto& c : o.ntp_metas) {
         auto& extents = new_o.extent_metas[c.tidp.topic_id];
@@ -251,6 +262,12 @@ simple_metastore::add_objects(
       apply_res.has_value(),
       "Apply must succeed if can_apply() is true: {}",
       apply_res.error());
+    for (const auto& o : objects) {
+        if (o.imported.has_value()) {
+            state_.objects[o.oid].imported_ts_location = o.imported.transform(
+              to_object_location);
+        }
+    }
     co_return resp;
 }
 
@@ -369,6 +386,10 @@ simple_metastore::get_first_ge(
           .object_size = object_size,
           .first_offset = it->base_offset,
           .last_offset = it->last_offset,
+          .imported = to_imported_ts_info(
+            object_it->second.imported_ts_location,
+            it->imported_ts_delta,
+            it->last_offset),
         };
     }
     return std::unexpected(metastore::errc::out_of_range);
@@ -409,6 +430,10 @@ simple_metastore::get_first_ge(
               .object_size = object_size,
               .first_offset = obj.base_offset,
               .last_offset = obj.last_offset,
+              .imported = to_imported_ts_info(
+                object_it->second.imported_ts_location,
+                obj.imported_ts_delta,
+                obj.last_offset),
             };
         }
     }
@@ -902,6 +927,10 @@ simple_metastore::get_extent_metadata_forwards(
               .oid = ext.oid,
               .footer_pos = object_it->second.footer_pos,
               .object_size = object_it->second.object_size,
+              .imported = to_imported_ts_info(
+                object_it->second.imported_ts_location,
+                ext.imported_ts_delta,
+                ext.last_offset),
             };
         }
 

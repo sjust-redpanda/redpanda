@@ -267,6 +267,7 @@ new_object::collect_extents_by_tidp(sorted_extents_by_tidp_t* ret) const {
                 .filepos = extent_meta.filepos,
                 .len = extent_meta.len,
                 .oid = oid,
+                .imported_ts_delta = imported.transform(to_segment_info),
               });
         }
     }
