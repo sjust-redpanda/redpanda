@@ -39,9 +39,14 @@ class DatalakeTsToCtMigrationTest(RedpandaTest):
     DatalakeVerifier consumes the Kafka topic and cross-checks every offset
     against the Iceberg table, catching any gap/duplicate introduced at cutover.
     """
+
     MSG_SIZE = 1024
-    PHASE1_ROWS = 2000
-    PHASE2_ROWS = 2000
+    # Sized to run on a single dev box: the Iceberg verifier cross-checks every
+    # offset through Trino, so the row count drives the bulk of the load. A few
+    # hundred rows per phase is enough to span several TS segments before
+    # migration and a residual after cutover while keeping Trino comfortable.
+    PHASE1_ROWS = 500
+    PHASE2_ROWS = 500
 
     def __init__(self, test_ctx, *args, **kwargs):
         super().__init__(
@@ -56,6 +61,12 @@ class DatalakeTsToCtMigrationTest(RedpandaTest):
                 "log_segment_size_min": 1,
                 "log_segment_ms_min": 1000,
                 "cloud_storage_housekeeping_interval_ms": 1000,
+                # Bound the uploaded (remote) segment size so the TS section
+                # yields several segments even for the small dev-box data
+                # volume -- otherwise the archiver coalesces it into a single
+                # remote segment and the >=2-segments precondition never holds.
+                "cloud_storage_segment_size_target": 64 * 1024,
+                "cloud_storage_segment_size_min": 32 * 1024,
                 # Reconcile the post-cutover residual into L1 promptly.
                 "cloud_topics_long_term_flush_interval": 2000,
             },
@@ -91,10 +102,12 @@ class DatalakeTsToCtMigrationTest(RedpandaTest):
             # DatalakeServices starts the cluster (setUp is a no-op), so the
             # features must be toggled here, once the cluster is up.
             self.redpanda.set_feature_active(
-                "tiered_to_cloud_migration", True, timeout_sec=30)
+                "tiered_to_cloud_migration", True, timeout_sec=30
+            )
             if storage_mode == TopicSpec.STORAGE_MODE_TIERED_CLOUD:
                 self.redpanda.set_feature_active(
-                    "tiered_cloud_topics", True, timeout_sec=30)
+                    "tiered_cloud_topics", True, timeout_sec=30
+                )
 
             # Iceberg-enabled tiered-storage topic. A moderate target lag lets
             # translation run alongside the produce so the migration lands
@@ -104,8 +117,7 @@ class DatalakeTsToCtMigrationTest(RedpandaTest):
                 iceberg_mode="key_value",
                 target_lag_ms=10000,
                 config={
-                    TopicSpec.PROPERTY_STORAGE_MODE:
-                    TopicSpec.STORAGE_MODE_TIERED,
+                    TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED,
                     "segment.bytes": str(32 * 1024),
                     "segment.ms": "1000",
                     # finite (so migration is permitted) but large (so time
@@ -115,11 +127,16 @@ class DatalakeTsToCtMigrationTest(RedpandaTest):
                 },
             )
 
-            # Phase 1: pre-migration data archived to tiered storage.
+            # Phase 1: pre-migration data archived to tiered storage. Rate-limit
+            # the produce so the small dev-box volume still spans several
+            # segment.ms (1s) windows and rolls into multiple segments -- a fast
+            # bulk produce of this little data would land in a single segment and
+            # the >=2-segments precondition below would never hold.
             dl.produce_to_topic(
                 self.topic_name,
                 msg_size=self.MSG_SIZE,
                 msg_count=self.PHASE1_ROWS,
+                rate_limit_bps=64 * 1024,
             )
 
             # Wait for real TS segments so the migration splits the partition at
@@ -154,13 +171,23 @@ class DatalakeTsToCtMigrationTest(RedpandaTest):
 
             # Wait for the partition to cut over (archival manifest empties).
             wait_until(
-                lambda: len(self.admin.get_partition_manifest(
-                    self.topic_name, 0).get("segments", {})) == 0,
+                lambda: len(
+                    self.admin.get_partition_manifest(self.topic_name, 0).get(
+                        "segments", {}
+                    )
+                )
+                == 0,
                 timeout_sec=240,
                 backoff_sec=5,
                 err_msg="topic did not cut over within 240s",
                 retry_on_exc=True,
             )
+
+            # Trino may still be initializing after DatalakeServices started it
+            # (it rejects queries with SERVER_STARTING_UP until ready); wait
+            # before the first query below so the translation/verification
+            # read-backs do not race its startup.
+            dl.trino().wait_for_ready()
 
             # Translation must catch up to the partition high watermark across
             # the whole range (TS section + CT section), then the Iceberg table
@@ -170,8 +197,6 @@ class DatalakeTsToCtMigrationTest(RedpandaTest):
                 self.topic_name, hwm - 1, timeout=120, backoff_sec=5
             )
 
-            verifier = DatalakeVerifier(
-                self.redpanda, self.topic_name, dl.trino()
-            )
+            verifier = DatalakeVerifier(self.redpanda, self.topic_name, dl.trino())
             verifier.start()
             verifier.wait()
