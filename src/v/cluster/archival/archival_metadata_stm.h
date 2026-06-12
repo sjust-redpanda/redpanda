@@ -252,6 +252,15 @@ public:
     model::offset get_last_offset() const;
     model::offset get_archive_start_offset() const;
     model::offset get_archive_clean_offset() const;
+
+    /// True if the partition still has data in tiered storage -- either in the
+    /// live STM manifest or offloaded to the spillover archive. Spillover and
+    /// retention can empty the live manifest while the archive still holds data,
+    /// so callers asking "does this partition hold tiered-storage data" (e.g.
+    /// the read routing gate, archiver construction, cloud-topic dormancy, and
+    /// the local-log trim clamp) must consult both; keying on the live manifest
+    /// alone is a bug.
+    bool holds_archived_data() const;
     kafka::offset get_start_kafka_offset() const;
 
     // Return list of all segments that has to be
