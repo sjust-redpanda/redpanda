@@ -1375,6 +1375,15 @@ model::offset archival_metadata_stm::max_removable_local_log_offset() {
         collect_all = false;
     }
 
+    // A partition mid tiered->cloud migration has is_archival_enabled() ==
+    // false once its storage mode is flipped, which would otherwise make us
+    // collect_all and stop constraining local-log truncation -- evicting
+    // tiered-storage data that has not yet been uploaded. While the partition
+    // still holds archived data (a non-empty live manifest or a spillover
+    // archive) it is still served from tiered storage, so keep constraining via
+    // cloud_recoverable_offset() until the manifest is cleared.
+    collect_all = collect_all && !holds_archived_data();
+
     if (collect_all || is_read_replica || (uploads_paused && gaps_allowed)) {
         // The archival is disabled but the state machine still exists so we
         // shouldn't stop eviction from happening.
@@ -1690,6 +1699,11 @@ model::offset archival_metadata_stm::get_last_offset() const {
 
 model::offset archival_metadata_stm::get_archive_start_offset() const {
     return _manifest->get_archive_start_offset();
+}
+
+bool archival_metadata_stm::holds_archived_data() const {
+    return _manifest->size() > 0
+           || _manifest->get_archive_start_offset() != model::offset{};
 }
 
 model::offset archival_metadata_stm::get_archive_clean_offset() const {
