@@ -31,7 +31,9 @@ public:
       std::filesystem::path staging_dir,
       cloud_io::remote* remote,
       cloud_storage_clients::bucket_name bucket,
-      cloud_io::cache* cache);
+      cloud_io::cache* cache,
+      std::optional<cloud_storage_clients::bucket_name> ts_bucket
+      = std::nullopt);
     ss::future<std::expected<std::unique_ptr<staging_file>, errc>>
     create_tmp_file() override;
 
@@ -58,8 +60,14 @@ private:
       std::filesystem::path,
       uint64_t content_length);
 
+    // Download a raw object by key into an iobuf, using _ts_bucket.
+    ss::future<std::expected<iobuf, errc>>
+    download_raw_iobuf(const ss::sstring& key, ss::abort_source* as);
+
     cloud_io::remote* _remote;
-    cloud_storage_clients::bucket_name _bucket;
+    cloud_storage_clients::bucket_name _bucket; // L1 objects
+    cloud_storage_clients::bucket_name
+      _ts_bucket; // imported TS segments (may equal _bucket)
     std::filesystem::path _staging_dir;
     cloud_io::cache* _cache;
 };
