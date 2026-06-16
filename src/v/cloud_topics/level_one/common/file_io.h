@@ -68,22 +68,6 @@ public:
       object_id, size_t part_size, ss::abort_source*) override;
 
 private:
-    ss::future<uint64_t> save_to_cache(
-      ss::input_stream<char>,
-      cloud_io::space_reservation_guard*,
-      std::filesystem::path,
-      uint64_t content_length);
-
-    /// Reserve cache space, run the S3 GET, and stream the bytes into
-    /// the cloud cache under `cache_key`. Succeeds, or fails with the
-    /// mapped errc on reservation / download failure.
-    ss::future<std::expected<void, errc>> do_download_to_cache(
-      const object_extent& extent,
-      const std::filesystem::path& cache_key,
-      retry_chain_node& root,
-      ss::abort_source& as,
-      cloud_io::group_id gid);
-
     cloud_io::remote* _remote;
     cloud_storage_clients::bucket_name _bucket;
     std::filesystem::path _staging_dir;
