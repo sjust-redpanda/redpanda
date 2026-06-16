@@ -115,6 +115,24 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "ts_reader",
+    srcs = ["ts_reader.cc"],
+    hdrs = ["ts_reader.h"],
+    visibility = ["//visibility:private"],
+    implementation_deps = [
+        "//src/v/bytes:iostream",
+        "//src/v/storage:record_batch_utils",
+        "@fmt",
+    ],
+    deps = [
+        ":object",
+        "//src/v/model",
+        "@abseil-cpp//absl/container:btree",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "ts_chunk_data_source",
     srcs = ["ts_chunk_data_source.cc"],
     hdrs = ["ts_chunk_data_source.h"],
@@ -124,6 +142,25 @@ redpanda_cc_library(
     ],
     deps = [
         ":abstract_io",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "ts_object",
+    srcs = ["ts_object.cc"],
+    hdrs = ["ts_object.h"],
+    visibility = ["//visibility:private"],
+    implementation_deps = [
+        ":ts_reader",
+    ],
+    deps = [
+        ":abstract_io",
+        ":object_handle",
+        ":ts_chunk_data_source",
+        "//src/v/cloud_storage:offset_index",
+        "//src/v/model",
+        "@abseil-cpp//absl/container:btree",
         "@seastar",
     ],
 )
