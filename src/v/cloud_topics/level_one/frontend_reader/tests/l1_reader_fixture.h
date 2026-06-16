@@ -57,6 +57,48 @@ protected:
         return std::make_pair(ntp, tidp);
     }
 
+    /// Register a raw TS-format segment as an imported extent in the metastore
+    /// and inject it into fake_io. `segment_bytes` must already be in the
+    /// on-disk format (packed header + raw records, no L1 framing).
+    ss::future<> register_imported_extent(
+      const model::topic_id_partition& tidp,
+      iobuf segment_bytes,
+      kafka::offset base_kafka_offset,
+      kafka::offset last_kafka_offset,
+      model::offset_delta delta,
+      ss::sstring ts_path = "test/0-1-v1.log") {
+        size_t seg_size = segment_bytes.size_bytes();
+
+        _io.put_ts_segment(
+          ts_path,
+          segment_bytes.share(0, seg_size),
+          base_kafka_offset,
+          last_kafka_offset,
+          delta);
+
+        // Imported objects go through the append_imported_objects path (the
+        // migration mirror's entry point), not the native object builder. The
+        // partition must be marked migrating first so the metastore adopts its
+        // log at the imported extents' (non-zero) base.
+        co_await _metastore.set_migrating(tidp, true);
+        chunked_vector<l1::metastore::imported_object> objs;
+        objs.push_back(
+          l1::metastore::imported_object{
+            .tidp = tidp,
+            .term = model::term_id{1},
+            .max_timestamp = model::timestamp::now(),
+            .size_bytes = seg_size,
+            .base_kafka_offset = base_kafka_offset,
+            .imported = l1::imported_ts_info{
+              .ts_path = ts_path,
+              .delta_offset = delta,
+              .delta_offset_end = delta,
+              .last_kafka_offset = last_kafka_offset,
+            },
+          });
+        co_await _metastore.append_imported_objects(std::move(objs));
+    }
+
     ss::future<> make_l1_objects(std::vector<tidp_batches_t> batches_by_tidp) {
         auto meta_builder = (co_await _metastore.object_builder()).value();
 

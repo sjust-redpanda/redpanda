@@ -11,8 +11,12 @@
 #pragma once
 
 #include "absl/container/btree_map.h"
+#include "absl/container/btree_set.h"
 #include "bytes/iobuf.h"
 #include "cloud_topics/level_one/common/abstract_io.h"
+#include "model/record.h"
+
+#include <optional>
 
 namespace cloud_topics::l1 {
 
@@ -51,8 +55,35 @@ public:
     // Return a list of the object IDs that haven't been removed.
     chunked_vector<object_id> list_objects() const;
 
+    /// Inject a raw TS-format segment for use with open_object on imported
+    /// extents whose ts_path matches. open_object always seeks through the real
+    /// ts_segment_index: with index_bytes (a serialized offset_index, as
+    /// file_io downloads) it is deserialized; without one the index is empty,
+    /// so seeks fall back to a full-segment scan from 0 (file_io's
+    /// missing-.index path).
+    void put_ts_segment(
+      ss::sstring ts_path,
+      iobuf segment_bytes,
+      kafka::offset base_kafka_offset,
+      kafka::offset last_kafka_offset,
+      model::offset_delta delta_offset,
+      absl::btree_set<model::tx_range, std::greater<>> aborted = {},
+      std::optional<iobuf> index_bytes = std::nullopt);
+
 private:
+    struct ts_segment_fixture {
+        iobuf bytes;
+        kafka::offset base_kafka_offset;
+        kafka::offset last_kafka_offset;
+        model::offset_delta delta_offset;
+        absl::btree_set<model::tx_range, std::greater<>> aborted;
+        // Serialized offset_index (.index) for an index-backed seek; nullopt
+        // means the full-segment-scan fallback.
+        std::optional<iobuf> index_bytes;
+    };
+
     absl::btree_map<object_id, iobuf> _storage;
+    absl::btree_map<ss::sstring, ts_segment_fixture> _ts_storage;
 };
 
 } // namespace cloud_topics::l1
