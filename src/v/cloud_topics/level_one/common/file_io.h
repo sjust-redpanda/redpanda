@@ -47,7 +47,7 @@ public:
       object_extent, ss::abort_source*, cloud_io::group_id g) override;
 
     ss::future<std::expected<void, errc>>
-    delete_objects(chunked_vector<object_id>, ss::abort_source*) override;
+    delete_objects(chunked_vector<object_location>, ss::abort_source*) override;
 
     ss::future<std::expected<cloud_storage_clients::multipart_upload_ref, errc>>
     create_multipart_upload(
@@ -63,6 +63,12 @@ private:
     // Download a raw object by key into an iobuf, using _ts_bucket.
     ss::future<std::expected<iobuf, errc>>
     download_raw_iobuf(const ss::sstring& key, ss::abort_source* as);
+
+    // Delete a batch of keys from the given bucket.
+    ss::future<std::expected<void, errc>> delete_keys(
+      const cloud_storage_clients::bucket_name& bucket,
+      chunked_vector<cloud_storage_clients::object_key> keys,
+      retry_chain_node& parent);
 
     cloud_io::remote* _remote;
     cloud_storage_clients::bucket_name _bucket; // L1 objects
