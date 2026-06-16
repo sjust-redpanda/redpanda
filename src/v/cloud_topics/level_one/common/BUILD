@@ -114,6 +114,42 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "ts_reader",
+    srcs = ["ts_reader.cc"],
+    hdrs = ["ts_reader.h"],
+    visibility = ["//visibility:private"],
+    implementation_deps = [
+        "//src/v/bytes:iostream",
+        "//src/v/storage:record_batch_utils",
+        "@fmt",
+    ],
+    deps = [
+        ":object",
+        "//src/v/model",
+        "@abseil-cpp//absl/container:btree",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "ts_object",
+    srcs = ["ts_object.cc"],
+    hdrs = ["ts_object.h"],
+    visibility = ["//visibility:private"],
+    implementation_deps = [
+        ":ts_reader",
+    ],
+    deps = [
+        ":abstract_io",
+        ":object_handle",
+        "//src/v/cloud_storage",
+        "//src/v/model",
+        "@abseil-cpp//absl/container:btree",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "file_io",
     srcs = ["file_io.cc"],
     hdrs = ["file_io.h"],
