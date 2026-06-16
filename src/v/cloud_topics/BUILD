@@ -132,6 +132,7 @@ redpanda_cc_library(
         "//src/v/base",
         "//src/v/cloud_topics:state_accessors",
         "//src/v/cloud_topics/level_one/common:file_io",
+        "//src/v/cloud_topics/level_one/common:io_probe",
         "//src/v/cloud_topics/level_one/domain:domain_supervisor",
         "//src/v/cloud_topics/level_one/frontend_reader:l1_reader_cache",
         "//src/v/cloud_topics/level_one/frontend_reader:level_one_reader_probe",
