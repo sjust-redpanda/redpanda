@@ -51,6 +51,11 @@ private:
     virtual ss::future<ss::input_stream<char>> input_stream() = 0;
 };
 
+// Forward declaration -- full definition in object_handle.h.
+// Do not #include object_handle.h here: object_handle.h already includes this
+// header (for io::errc), so the dependency must run one way.
+class object_handle;
+
 // An abstraction for IO in level one.
 class io {
 public:
@@ -102,6 +107,18 @@ public:
       ss::abort_source*,
       cloud_io::group_id g,
       bool skip_cache = false);
+
+    // Open an object for reading: returns a handle that exposes the object's
+    // index (seek by offset/timestamp) and opens readers at a seek point.
+    // `skip_cache` has the same meaning as for read_object and is propagated to
+    // the reads the handle performs (both the index read here and the data
+    // reads via open_reader).
+    virtual ss::future<std::expected<std::unique_ptr<object_handle>, errc>>
+    open_object(
+      object_extent,
+      ss::abort_source*,
+      cloud_io::group_id g,
+      bool skip_cache = false) = 0;
 
     // Delete the specified objects from object storage.
     virtual ss::future<std::expected<void, errc>>

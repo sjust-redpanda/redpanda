@@ -14,6 +14,9 @@
 #include "cloud_io/remote.h"
 #include "cloud_storage_clients/client.h"
 #include "cloud_topics/level_one/common/abstract_io.h"
+#include "cloud_topics/level_one/common/file_io_probe.h"
+#include "cloud_topics/level_one/common/object.h"
+#include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
 #include "cloud_topics/level_one/common/object_utils.h"
 #include "cloud_topics/logger.h"
@@ -461,6 +464,32 @@ file_io::read_object(
             }
         }
     }
+}
+
+ss::future<std::expected<std::unique_ptr<object_handle>, io::errc>>
+file_io::open_object(
+  object_extent extent,
+  ss::abort_source* as,
+  cloud_io::group_id g,
+  bool skip_cache) {
+    if (_probe != nullptr) {
+        _probe->register_footer_read(extent.size);
+    }
+    auto read_result = co_await read_object_as_iobuf(extent, as, g, skip_cache);
+    if (!read_result.has_value()) {
+        co_return std::unexpected(read_result.error());
+    }
+    auto footer_result = co_await footer::read(std::move(read_result).value());
+    if (!std::holds_alternative<footer>(footer_result)) {
+        vlog(cd_log.warn, "Failed to parse L1 footer for object {}", extent.id);
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    co_return std::make_unique<l1_native_object_handle>(
+      extent.id,
+      std::get<footer>(std::move(footer_result)),
+      this,
+      g,
+      skip_cache);
 }
 
 ss::future<std::expected<void, io::errc>>
