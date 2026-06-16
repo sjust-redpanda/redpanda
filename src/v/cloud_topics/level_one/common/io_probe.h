@@ -11,25 +11,24 @@
 
 #include "metrics/metrics.h"
 
-namespace cloud_topics {
+namespace cloud_topics::l1 {
 
-class level_one_reader_probe {
+/// Probe for the L1 io layer, which counts bytes read for objects whose reads
+/// happen below the reader. Registered under the cloud_topics_level_one_reader
+/// metric group so footer_read_bytes is unchanged from when the reader owned
+/// it.
+class io_probe {
 public:
-    level_one_reader_probe();
+    io_probe();
 
-    void register_bytes_read(size_t bytes_read) { _bytes_read += bytes_read; }
-
-    void register_bytes_skipped(size_t bytes_skipped) {
-        _bytes_skipped += bytes_skipped;
-    }
+    void register_footer_read(size_t bytes) { _footer_bytes_read += bytes; }
 
 private:
     void setup_metrics();
 
-    uint64_t _bytes_read{0};
-    uint64_t _bytes_skipped{0};
+    uint64_t _footer_bytes_read{0};
 
     metrics::internal_metric_groups _metrics;
 };
 
-} // namespace cloud_topics
+} // namespace cloud_topics::l1

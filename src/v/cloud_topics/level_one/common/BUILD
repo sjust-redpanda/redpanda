@@ -90,6 +90,31 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "object_handle",
+    srcs = ["object_handle.cc"],
+    hdrs = ["object_handle.h"],
+    deps = [
+        ":abstract_io",
+        ":object",
+        ":object_id",
+        "//src/v/model",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "io_probe",
+    srcs = ["io_probe.cc"],
+    hdrs = ["io_probe.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/config",
+        "//src/v/metrics",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "file_io",
     srcs = ["file_io.cc"],
     hdrs = ["file_io.h"],
@@ -100,6 +125,9 @@ redpanda_cc_library(
     ],
     deps = [
         ":abstract_io",
+        ":io_probe",
+        ":object",
+        ":object_handle",
         ":object_id",
         ":object_utils",
         "//src/v/cloud_io:cache",
@@ -119,6 +147,8 @@ redpanda_cc_library(
     hdrs = ["fake_io.h"],
     deps = [
         ":abstract_io",
+        ":object",
+        ":object_handle",
         ":object_id",
         ":object_utils",
         "//src/v/bytes:iobuf",

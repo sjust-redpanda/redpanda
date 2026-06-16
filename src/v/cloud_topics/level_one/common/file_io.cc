@@ -14,6 +14,9 @@
 #include "cloud_io/remote.h"
 #include "cloud_storage_clients/client.h"
 #include "cloud_topics/level_one/common/abstract_io.h"
+#include "cloud_topics/level_one/common/io_probe.h"
+#include "cloud_topics/level_one/common/object.h"
+#include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
 #include "cloud_topics/level_one/common/object_utils.h"
 #include "cloud_topics/logger.h"
@@ -93,11 +96,13 @@ file_io::file_io(
   std::filesystem::path staging_dir,
   cloud_io::remote* remote,
   cloud_storage_clients::bucket_name bucket,
-  cloud_io::cache* cache)
+  cloud_io::cache* cache,
+  io_probe* probe)
   : _remote(remote)
   , _bucket(std::move(bucket))
   , _staging_dir(std::move(staging_dir))
-  , _cache(cache) {}
+  , _cache(cache)
+  , _probe(probe) {}
 
 ss::future<std::expected<std::unique_ptr<staging_file>, io::errc>>
 file_io::create_tmp_file() {
@@ -246,6 +251,25 @@ file_io::read_object(
         }
         std::unreachable();
     }
+}
+
+ss::future<std::expected<std::unique_ptr<object_handle>, io::errc>>
+file_io::open_object(
+  object_extent extent, ss::abort_source* as, cloud_io::group_id g) {
+    if (_probe != nullptr) {
+        _probe->register_footer_read(extent.size);
+    }
+    auto read_result = co_await read_object_as_iobuf(extent, as, g);
+    if (!read_result.has_value()) {
+        co_return std::unexpected(read_result.error());
+    }
+    auto footer_result = co_await footer::read(std::move(read_result).value());
+    if (!std::holds_alternative<footer>(footer_result)) {
+        vlog(cd_log.warn, "Failed to parse L1 footer for object {}", extent.id);
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    co_return std::make_unique<l1_native_object_handle>(
+      extent.id, std::get<footer>(std::move(footer_result)), this, g);
 }
 
 ss::future<std::expected<void, io::errc>>
