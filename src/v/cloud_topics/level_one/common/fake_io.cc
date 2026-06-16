@@ -12,6 +12,8 @@
 
 #include "bytes/iostream.h"
 #include "cloud_storage_clients/multipart_upload.h"
+#include "cloud_topics/level_one/common/object.h"
+#include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
 
 namespace cloud_topics::l1 {
@@ -123,6 +125,22 @@ fake_io::read_object(
               data.share(extent.position, extent.size));
         })
       .value_or(std::unexpected(io::errc::cloud_missing_object));
+}
+
+ss::future<std::expected<std::unique_ptr<object_handle>, io::errc>>
+fake_io::open_object(
+  object_extent extent, ss::abort_source* as, cloud_io::group_id g) {
+    auto stream_result = co_await read_object(extent, as, g);
+    if (!stream_result.has_value()) {
+        co_return std::unexpected(stream_result.error());
+    }
+    auto footer_buf = co_await read_iobuf_exactly(*stream_result, extent.size);
+    auto footer_result = co_await l1::footer::read(std::move(footer_buf));
+    if (!std::holds_alternative<l1::footer>(footer_result)) {
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    co_return std::make_unique<l1_native_object_handle>(
+      extent.id, std::get<l1::footer>(std::move(footer_result)), this, g);
 }
 
 ss::future<std::expected<void, io::errc>>
