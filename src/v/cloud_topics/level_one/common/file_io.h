@@ -18,6 +18,8 @@
 
 namespace cloud_topics::l1 {
 
+class io_probe;
+
 // The IO implementation that hides caching and other complexities of
 // interacting with persistent storage of L1 objects.
 //
@@ -31,7 +33,8 @@ public:
       std::filesystem::path staging_dir,
       cloud_io::remote* remote,
       cloud_storage_clients::bucket_name bucket,
-      cloud_io::cache* cache);
+      cloud_io::cache* cache,
+      io_probe* probe = nullptr);
     ss::future<std::expected<std::unique_ptr<staging_file>, errc>>
     create_tmp_file() override;
 
@@ -39,6 +42,9 @@ public:
     put_object(object_id, staging_file*, ss::abort_source*) override;
 
     ss::future<std::expected<ss::input_stream<char>, errc>> read_object(
+      object_extent, ss::abort_source*, cloud_io::group_id g) override;
+
+    ss::future<std::expected<std::unique_ptr<object_handle>, errc>> open_object(
       object_extent, ss::abort_source*, cloud_io::group_id g) override;
 
     ss::future<std::expected<void, errc>>
@@ -59,6 +65,7 @@ private:
     cloud_storage_clients::bucket_name _bucket;
     std::filesystem::path _staging_dir;
     cloud_io::cache* _cache;
+    io_probe* _probe;
 };
 
 } // namespace cloud_topics::l1

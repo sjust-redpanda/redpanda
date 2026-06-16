@@ -8,18 +8,18 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
-#include "cloud_topics/level_one/frontend_reader/level_one_reader_probe.h"
+#include "cloud_topics/level_one/common/io_probe.h"
 
 #include "config/configuration.h"
 #include "metrics/prometheus_sanitize.h"
 
 #include <seastar/core/metrics.hh>
 
-namespace cloud_topics {
+namespace cloud_topics::l1 {
 
-level_one_reader_probe::level_one_reader_probe() { setup_metrics(); }
+io_probe::io_probe() { setup_metrics(); }
 
-void level_one_reader_probe::setup_metrics() {
+void io_probe::setup_metrics() {
     if (config::shard_local_cfg().disable_metrics()) {
         return;
     }
@@ -29,14 +29,10 @@ void level_one_reader_probe::setup_metrics() {
       prometheus_sanitize::metrics_name("cloud_topics_level_one_reader"),
       {
         sm::make_counter(
-          "read_bytes",
-          [this] { return _bytes_read; },
-          sm::description("Number of bytes read by L1 readers.")),
-        sm::make_counter(
-          "skipped_bytes",
-          [this] { return _bytes_skipped; },
-          sm::description("Number of bytes skipped by L1 readers.")),
+          "footer_read_bytes",
+          [this] { return _footer_bytes_read; },
+          sm::description("Number of footer bytes read by L1 readers.")),
       });
 }
 
-} // namespace cloud_topics
+} // namespace cloud_topics::l1
