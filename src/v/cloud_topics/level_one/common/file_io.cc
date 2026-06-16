@@ -90,6 +90,104 @@ struct one_time_stream_provider : public stream_provider {
     std::optional<ss::input_stream<char>> _st;
 };
 
+ss::future<uint64_t> save_to_cache(
+  cloud_io::cache* cache,
+  ss::input_stream<char> stream,
+  cloud_io::space_reservation_guard* reservation,
+  std::filesystem::path cache_key,
+  uint64_t content_length) {
+    co_await cache->put(std::move(cache_key), stream, *reservation);
+    co_return content_length;
+}
+
+// Returns a stream over [offset, offset+size) of the object at `key` in
+// `bucket`, caching the downloaded range locally under `cache_key`. Shared by
+// the native L1 read path and (in a later commit) the imported TS-segment
+// fetch.
+ss::future<std::expected<ss::input_stream<char>, io::errc>>
+download_cached_range(
+  cloud_io::remote* remote,
+  cloud_io::cache* cache,
+  const cloud_storage_clients::bucket_name& bucket,
+  cloud_storage_clients::object_key key,
+  std::filesystem::path cache_key,
+  size_t offset,
+  size_t size,
+  cloud_io::group_id group,
+  std::string_view download_label,
+  ss::abort_source* as) {
+    static constexpr auto timeout = 10s;
+    static constexpr auto backoff = 100ms;
+    retry_chain_node root(*as, ss::lowres_clock::now() + timeout, backoff);
+    while (true) {
+        auto stream_fut = co_await ss::coroutine::as_future<
+          std::optional<cloud_io::cache_item_stream>>(cache->get_stream(
+          cache_key,
+          config::shard_local_cfg().storage_read_buffer_size(),
+          config::shard_local_cfg().storage_read_readahead_count()));
+        if (stream_fut.failed()) {
+            auto ex = stream_fut.get_exception();
+            vlog(
+              cd_log.warn,
+              "Error reading from cache for {}: {}",
+              cache_key,
+              ex);
+            co_return std::unexpected(io::errc::file_io_error);
+        }
+        auto stream = stream_fut.get();
+        if (stream) {
+            co_return std::move(stream->body);
+        }
+        auto reservation_fut = co_await ss::coroutine::as_future<
+          cloud_io::space_reservation_guard>(cache->reserve_space(size, 1));
+        if (reservation_fut.failed()) {
+            auto ex = reservation_fut.get_exception();
+            vlog(
+              cd_log.warn,
+              "Error reserving cache space for {}: {}",
+              cache_key,
+              ex);
+            co_return std::unexpected(io::errc::file_io_error);
+        }
+        cloud_io::try_consume_stream consumer =
+          [cache, r = reservation_fut.get(), &cache_key](
+            uint64_t content_length, ss::input_stream<char> s) mutable {
+              return save_to_cache(
+                cache, std::move(s), &r, cache_key, content_length);
+          };
+        auto result_fut
+          = co_await ss::coroutine::as_future<cloud_io::download_result>(
+            remote->download_stream(
+              cloud_io::transfer_details{
+                .bucket = bucket,
+                .key = key,
+                .parent_rtc = root,
+              },
+              consumer,
+              download_label,
+              /*acquire_hydration_units=*/true,
+              cloud_storage_clients::http_byte_range{offset, offset + size - 1},
+              {},
+              group));
+        if (result_fut.failed()) {
+            auto ex = result_fut.get_exception();
+            vlog(cd_log.warn, "Error downloading {}: {}", cache_key, ex);
+            co_return std::unexpected(io::errc::cloud_op_error);
+        }
+        switch (result_fut.get()) {
+        case cloud_io::download_result::success:
+            continue;
+        case cloud_io::download_result::notfound:
+            co_return std::unexpected(io::errc::cloud_missing_object);
+        case cloud_io::download_result::timedout:
+            co_return std::unexpected(io::errc::cloud_op_timeout);
+        case cloud_io::download_result::failed:
+            co_return std::unexpected(io::errc::cloud_op_error);
+        }
+        std::unreachable();
+    }
+}
+
 } // namespace
 
 file_io::file_io(
@@ -159,98 +257,29 @@ file_io::put_object(object_id oid, staging_file* file, ss::abort_source* as) {
     std::unreachable();
 }
 
-ss::future<uint64_t> file_io::save_to_cache(
-  ss::input_stream<char> stream,
-  cloud_io::space_reservation_guard* reservation,
-  std::filesystem::path cache_key,
-  uint64_t content_length) {
-    co_await _cache->put(std::move(cache_key), stream, *reservation);
-    co_return content_length;
-}
-
 ss::future<std::expected<ss::input_stream<char>, io::errc>>
 file_io::read_object(
   object_extent extent, ss::abort_source* as, cloud_io::group_id gid) {
-    static constexpr auto timeout = 10s;
-    static constexpr auto backoff = 100ms;
-    retry_chain_node root(*as, ss::lowres_clock::now() + timeout, backoff);
     // TODO(cloud_topics): Optimize the cache such that it understands partial
     // objects? Or we assert somehow there are no overlaps (or just live with
     // them).
     // TODO(cloud_topics): If reading just a footer, we should skip the cache.
     // Maybe we need another method for that which is iobuf based?
-    std::filesystem::path cache_key = fmt::format(
-      "l1_{}_position_{}_size_{}.partial",
-      extent.id,
+    return download_cached_range(
+      _remote,
+      _cache,
+      _bucket,
+      object_path_factory::level_one_path(extent.id),
+      fmt::format(
+        "l1_{}_position_{}_size_{}.partial",
+        extent.id,
+        extent.position,
+        extent.size),
       extent.position,
-      extent.size);
-    while (true) {
-        auto stream_fut = co_await ss::coroutine::as_future<
-          std::optional<cloud_io::cache_item_stream>>(_cache->get_stream(
-          cache_key,
-          config::shard_local_cfg().storage_read_buffer_size(),
-          config::shard_local_cfg().storage_read_readahead_count()));
-        if (stream_fut.failed()) {
-            auto ex = stream_fut.get_exception();
-            vlog(
-              cd_log.warn, "Error reading from cache for {}: {}", extent, ex);
-            co_return std::unexpected(io::errc::file_io_error);
-        }
-        auto stream = stream_fut.get();
-        if (stream) {
-            co_return std::move(stream->body);
-        }
-        // TODO(cloud_topics): reserving space should also take an abort_source
-        auto reservation_fut = co_await ss::coroutine::as_future<
-          cloud_io::space_reservation_guard>(
-          _cache->reserve_space(extent.size, 1));
-        if (reservation_fut.failed()) {
-            auto ex = reservation_fut.get_exception();
-            vlog(
-              cd_log.warn,
-              "Error reserving cache space for download of {}: {}",
-              extent,
-              ex);
-            co_return std::unexpected(io::errc::file_io_error);
-        }
-        cloud_io::try_consume_stream consumer =
-          [this, r = reservation_fut.get(), &cache_key](
-            uint64_t content_length, ss::input_stream<char> stream) mutable {
-              return save_to_cache(
-                std::move(stream), &r, cache_key, content_length);
-          };
-        auto result_fut
-          = co_await ss::coroutine::as_future<cloud_io::download_result>(
-            _remote->download_stream(
-              cloud_io::transfer_details{
-                .bucket = _bucket,
-                .key = object_path_factory::level_one_path(extent.id),
-                .parent_rtc = root,
-              },
-              consumer,
-              "l1_file_download",
-              /*acquire_hydration_units=*/true,
-              cloud_storage_clients::http_byte_range{
-                extent.position, extent.position + extent.size - 1},
-              {},
-              gid));
-        if (result_fut.failed()) {
-            auto ex = result_fut.get_exception();
-            vlog(cd_log.warn, "Error downloading object {}: {}", extent, ex);
-            co_return std::unexpected(io::errc::cloud_op_error);
-        }
-        switch (result_fut.get()) {
-        case cloud_io::download_result::success:
-            continue; // Now that it's in the cache the lookup should succeed.
-        case cloud_io::download_result::notfound:
-            co_return std::unexpected(io::errc::cloud_missing_object);
-        case cloud_io::download_result::timedout:
-            co_return std::unexpected(io::errc::cloud_op_timeout);
-        case cloud_io::download_result::failed:
-            co_return std::unexpected(io::errc::cloud_op_error);
-        }
-        std::unreachable();
-    }
+      extent.size,
+      gid,
+      "l1_file_download",
+      as);
 }
 
 ss::future<std::expected<std::unique_ptr<object_handle>, io::errc>>
