@@ -69,6 +69,8 @@ public:
 
 private:
     cloud_io::remote* _remote;
+    // Holds both native L1 objects and imported tiered-storage segments: a
+    // single cluster always stores both in the one configured object bucket.
     cloud_storage_clients::bucket_name _bucket;
     std::filesystem::path _staging_dir;
     cloud_io::cache* _cache;

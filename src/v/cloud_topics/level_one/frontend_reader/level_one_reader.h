@@ -18,6 +18,8 @@
 #include "model/record_batch_reader.h"
 #include "utils/prefix_logger.h"
 
+#include <seastar/core/abort_source.hh>
+
 #include <deque>
 #include <expected>
 #include <variant>
@@ -196,6 +198,16 @@ private:
     size_t _bytes_consumed{0};
     size_t _max_slice_bytes;
     bool _was_cached{false};
+
+    // Fallback abort source for object fetches. Normal usage supplies one via
+    // the read config (the Kafka fetch path threads its request abort source
+    // through, see kafka_to_cloud_topic_log_reader_config), so this is only
+    // used by readers built without an abort source (internal/non-fetch
+    // consumers and tests). Declared before _current_stream so it outlives it:
+    // an imported segment's chunk data source captures this pointer and is
+    // re-read across slices (do_load_slice reuses a persisted _current_stream),
+    // long after the read call that opened it returned.
+    ss::abort_source _fallback_read_abort_source;
 
     // Open stream for the current object. Non-null while the reader is
     // positioned within an object; null before the first read, when

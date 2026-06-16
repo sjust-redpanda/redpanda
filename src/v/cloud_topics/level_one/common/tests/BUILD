@@ -72,6 +72,7 @@ redpanda_cc_gtest(
     deps = [
         "//src/v/bytes:iostream",
         "//src/v/cloud_io:scheduler_types",
+        "//src/v/cloud_storage",
         "//src/v/cloud_topics/level_one/common:fake_io",
         "//src/v/cloud_topics/level_one/common:object",
         "//src/v/cloud_topics/level_one/common:object_handle",
@@ -85,3 +86,4 @@ redpanda_cc_gtest(
         "@seastar",
     ],
 )
+
