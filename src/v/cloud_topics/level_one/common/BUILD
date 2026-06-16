@@ -102,6 +102,19 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "object_handle",
+    srcs = ["object_handle.cc"],
+    hdrs = ["object_handle.h"],
+    deps = [
+        ":abstract_io",
+        ":object",
+        ":object_id",
+        "//src/v/model",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "file_io",
     srcs = [
         "file_io.cc",
@@ -121,6 +134,8 @@ redpanda_cc_library(
     ],
     deps = [
         ":abstract_io",
+        ":object",
+        ":object_handle",
         ":object_id",
         ":object_utils",
         ":single_flight",
@@ -144,6 +159,8 @@ redpanda_cc_library(
     hdrs = ["fake_io.h"],
     deps = [
         ":abstract_io",
+        ":object",
+        ":object_handle",
         ":object_id",
         ":object_utils",
         "//src/v/bytes:iobuf",

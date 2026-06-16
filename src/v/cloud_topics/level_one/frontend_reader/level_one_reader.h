@@ -11,7 +11,7 @@
 
 #include "base/units.h"
 #include "cloud_topics/level_one/common/abstract_io.h"
-#include "cloud_topics/level_one/common/object.h"
+#include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
 #include "cloud_topics/level_one/metastore/metastore.h"
 #include "cloud_topics/log_reader_config.h"
@@ -114,7 +114,7 @@ public:
 private:
     struct object_info {
         l1::object_id oid;
-        l1::footer footer;
+        std::unique_ptr<l1::object_handle> handle;
         kafka::offset last_offset;
     };
 
@@ -164,9 +164,6 @@ private:
     ss::future<chunked_circular_buffer<model::record_batch>>
     read_batches(l1::object_reader& reader);
 
-    ss::future<l1::footer>
-    read_footer(l1::object_id oid, size_t footer_pos, size_t object_size);
-
     /*
      * Returns batches starting at next offset. It will continue to advance next
      * offset until batches are read or end-of-stream is reached.
@@ -181,14 +178,6 @@ private:
     bool is_over_limit_with_bytes(size_t size) const;
 
     ss::future<> close_reader_safe(l1::object_reader&);
-
-    /// Open an object reader at the start of an extent, storing into
-    /// _current_stream.
-    ss::future<std::expected<std::monostate, l1::io::errc>> open_reader_at(
-      l1::object_id oid,
-      kafka::offset last_object_offset,
-      size_t extent_position,
-      size_t extent_size);
 
     /// Close _current_stream if present, swallowing exceptions.
     ss::future<> close_current_stream();
