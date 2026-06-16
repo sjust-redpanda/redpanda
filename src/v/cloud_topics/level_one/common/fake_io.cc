@@ -11,10 +11,13 @@
 #include "cloud_topics/level_one/common/fake_io.h"
 
 #include "bytes/iostream.h"
+#include "cloud_storage/remote_segment.h"
+#include "cloud_storage/remote_segment_index.h"
 #include "cloud_storage_clients/multipart_upload.h"
 #include "cloud_topics/level_one/common/object.h"
 #include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
+#include "cloud_topics/level_one/common/ts_object.h"
 
 namespace cloud_topics::l1 {
 
@@ -127,9 +130,67 @@ fake_io::read_object(
       .value_or(std::unexpected(io::errc::cloud_missing_object));
 }
 
+void fake_io::put_ts_segment(
+  ts_segment_path ts_path,
+  iobuf segment_bytes,
+  aborted_transactions aborted,
+  std::optional<iobuf> index_bytes) {
+    _ts_storage.insert_or_assign(
+      std::move(ts_path),
+      ts_segment_fixture{
+        .bytes = std::move(segment_bytes),
+        .aborted = std::move(aborted),
+        .index_bytes = std::move(index_bytes),
+      });
+}
+
 ss::future<std::expected<std::unique_ptr<object_handle>, io::errc>>
 fake_io::open_object(
   object_extent extent, ss::abort_source* as, cloud_io::group_id g) {
+    if (extent.imported.has_value()) {
+        auto it = _ts_storage.find(extent.imported->ts_path);
+        if (it == _ts_storage.end()) {
+            co_return std::unexpected(io::errc::cloud_missing_object);
+        }
+        auto& fixture = it->second;
+        size_t segment_size = fixture.bytes.size_bytes();
+        // Seek through the real ts_segment_index, exactly as file_io does: an
+        // injected .index is deserialized (from_iobuf); without one the index
+        // stays empty, so seeks fall back to a full-segment scan from position
+        // 0, with the delta taken from the segment's base delta --
+        // file_io's missing-.index behavior.
+        cloud_storage::offset_index oi(
+          model::offset{0},
+          kafka::offset{0},
+          0,
+          cloud_storage::remote_segment_sampling_step_bytes,
+          model::timestamp::missing());
+        if (fixture.index_bytes.has_value()) {
+            oi.from_iobuf(fixture.index_bytes->copy());
+        }
+        auto idx = std::make_unique<ts_segment_index>(
+          std::move(oi), extent.imported->delta_base, segment_size);
+        // Mirror file_io's tx_state gating: when the .tx manifest is known
+        // absent, the real read path skips the download, so the segment must
+        // present no aborted ranges regardless of what the fixture holds. This
+        // makes the gating observable in tests -- inject aborted ranges with
+        // tx_state=absent and assert they take no effect.
+        aborted_transactions aborted = extent.imported->tx_state
+                                           == tx_manifest_state::absent
+                                         ? aborted_transactions{}
+                                         : fixture.aborted;
+        co_return std::make_unique<ts_object_handle>(
+          std::move(idx),
+          extent.imported->segment_term,
+          std::move(aborted),
+          [bytes = fixture.bytes.copy()](
+            size_t pos, size_t len, ss::abort_source*) mutable
+            -> ss::future<std::expected<ss::input_stream<char>, io::errc>> {
+              return ss::make_ready_future<
+                std::expected<ss::input_stream<char>, io::errc>>(
+                make_iobuf_input_stream(bytes.share(pos, len)));
+          });
+    }
     auto stream_result = co_await read_object(extent, as, g);
     if (!stream_result.has_value()) {
         co_return std::unexpected(stream_result.error());
