@@ -204,12 +204,22 @@ fake_io::open_object(
       extent.id, std::get<l1::footer>(std::move(footer_result)), this, g);
 }
 
-ss::future<std::expected<void, io::errc>>
-fake_io::delete_objects(chunked_vector<object_id> oids, ss::abort_source*) {
-    for (const auto& oid : oids) {
-        remove_object(oid);
+ss::future<std::expected<void, io::errc>> fake_io::delete_objects(
+  chunked_vector<object_location> objects, ss::abort_source*) {
+    for (const auto& obj : objects) {
+        if (obj.ts_path.has_value()) {
+            // Imported object: its backing segment is addressed by ts_path
+            // (mirrors file_io's path routing).
+            _ts_storage.erase(*obj.ts_path);
+        } else {
+            remove_object(obj.id);
+        }
     }
     co_return std::expected<void, io::errc>{};
+}
+
+bool fake_io::has_ts_segment(const ts_segment_path& ts_path) const {
+    return _ts_storage.contains(ts_path);
 }
 
 std::optional<iobuf> fake_io::get_object(object_id id) {
