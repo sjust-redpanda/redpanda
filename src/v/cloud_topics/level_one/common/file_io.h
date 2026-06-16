@@ -52,12 +52,6 @@ public:
       object_id, size_t part_size, ss::abort_source*) override;
 
 private:
-    ss::future<uint64_t> save_to_cache(
-      ss::input_stream<char>,
-      cloud_io::space_reservation_guard*,
-      std::filesystem::path,
-      uint64_t content_length);
-
     cloud_io::remote* _remote;
     cloud_storage_clients::bucket_name _bucket;
     std::filesystem::path _staging_dir;
