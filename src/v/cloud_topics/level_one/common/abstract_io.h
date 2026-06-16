@@ -25,6 +25,11 @@
 
 namespace cloud_topics::l1 {
 
+// Forward declaration — full definition in object_handle.h.
+// Do not #include object_handle.h here: object_handle.h already includes
+// abstract_io.h for io::errc, so including it here creates a cycle.
+class object_handle;
+
 // An abstraction for a local file that is used for staging uploads to object
 // storage.
 class staging_file {
@@ -50,11 +55,6 @@ private:
     // Return an input stream for reading from this file.
     virtual ss::future<ss::input_stream<char>> input_stream() = 0;
 };
-
-// Forward declaration -- full definition in object_handle.h.
-// Do not #include object_handle.h here: object_handle.h already includes this
-// header (for io::errc), so the dependency must run one way.
-class object_handle;
 
 // An abstraction for IO in level one.
 class io {
@@ -108,8 +108,14 @@ public:
       cloud_io::group_id g,
       bool skip_cache = false);
 
-    // Open an object for reading: returns a handle that exposes the object's
-    // index (seek by offset/timestamp) and opens readers at a seek point.
+    // Open an object for indexed read access, returning a handle that exposes
+    // both an index (for seeking) and readers (for streaming batches).
+    //
+    // For native L1 objects (extent.imported == nullopt), the handle reads the
+    // L1 footer and implements the native seek path. For imported TS extents
+    // (extent.imported.has_value()), the handle loads the TS segment index and
+    // translates log offsets to Kafka offsets while reading.
+    //
     // `skip_cache` has the same meaning as for read_object and is propagated to
     // the reads the handle performs (both the index read here and the data
     // reads via open_reader).
@@ -120,9 +126,11 @@ public:
       cloud_io::group_id g,
       bool skip_cache = false) = 0;
 
-    // Delete the specified objects from object storage.
+    // Delete the specified objects from object storage. An entry with a ts_path
+    // is addressed by that tiered-storage segment path; otherwise the native L1
+    // object path is used. Both live in the one configured object bucket.
     virtual ss::future<std::expected<void, errc>>
-    delete_objects(chunked_vector<object_id>, ss::abort_source*) = 0;
+    delete_objects(chunked_vector<object_location>, ss::abort_source*) = 0;
 
     // Create a multipart upload for streaming data directly to object storage.
     virtual ss::future<

@@ -67,13 +67,19 @@ public:
       bool skip_cache) override;
 
     ss::future<std::expected<void, errc>>
-    delete_objects(chunked_vector<object_id>, ss::abort_source*) override;
+    delete_objects(chunked_vector<object_location>, ss::abort_source*) override;
 
     ss::future<std::expected<cloud_storage_clients::multipart_upload_ref, errc>>
     create_multipart_upload(
       object_id, size_t part_size, ss::abort_source*) override;
 
 private:
+    // Delete a batch of keys from the given bucket.
+    ss::future<std::expected<void, errc>> delete_keys(
+      const cloud_storage_clients::bucket_name& bucket,
+      chunked_vector<cloud_storage_clients::object_key> keys,
+      retry_chain_node& parent);
+
     cloud_io::remote* _remote;
     // Holds both native L1 objects and imported tiered-storage segments: a
     // single cluster always stores both in the one configured object bucket.

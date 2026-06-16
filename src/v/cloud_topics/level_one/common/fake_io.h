@@ -42,7 +42,7 @@ public:
       bool skip_cache) override;
 
     ss::future<std::expected<void, errc>>
-    delete_objects(chunked_vector<object_id>, ss::abort_source*) override;
+    delete_objects(chunked_vector<object_location>, ss::abort_source*) override;
 
     ss::future<std::expected<cloud_storage_clients::multipart_upload_ref, errc>>
     create_multipart_upload(
@@ -59,6 +59,10 @@ public:
 
     // Return a list of the object IDs that haven't been removed.
     chunked_vector<object_id> list_objects() const;
+
+    // Whether an injected TS segment (see put_ts_segment) is still present.
+    // For tests that exercise imported-object deletion.
+    bool has_ts_segment(const ts_segment_path& ts_path) const;
 
     /// Inject a raw TS-format segment for use with open_object on imported
     /// extents whose ts_path matches. open_object always seeks through the real
