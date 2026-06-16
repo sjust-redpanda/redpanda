@@ -374,9 +374,13 @@ level_one_log_reader_impl::materialize_batches_from_object_offset(
         };
     }
 
-    ss::abort_source default_abort_source;
+    // Use the read config's abort source, which the Kafka fetch path normally
+    // supplies; only readers built without one fall back to the impl-owned
+    // source. Not a local: an imported segment's chunk data source captures
+    // this pointer and fetches lazily across later slices (do_load_slice
+    // reuses a persisted _current_stream), so it must outlive this call.
     auto* as = _config.abort_source ? &_config.abort_source.value().get()
-                                    : &default_abort_source;
+                                    : &_fallback_read_abort_source;
 
     auto reader_fut = co_await ss::coroutine::as_future(
       object.handle->open_reader(*seek_res, as));

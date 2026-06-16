@@ -157,6 +157,7 @@ redpanda_cc_library(
     deps = [
         ":abstract_io",
         ":object_handle",
+        ":ts_chunk_data_source",
         "//src/v/cloud_storage:offset_index",
         "//src/v/model",
         "@abseil-cpp//absl/container:btree",
@@ -172,6 +173,12 @@ redpanda_cc_library(
         "//src/v/cloud_topics:__pkg__",
         "//src/v/cloud_topics/level_one:__subpackages__",
         "//src/v/cloud_topics/read_replica:__pkg__",
+    ],
+    implementation_deps = [
+        ":ts_object",
+        "//src/v/bytes:iostream",
+        "//src/v/cloud_storage",
+        "@abseil-cpp//absl/container:btree",
     ],
     deps = [
         ":abstract_io",
@@ -195,15 +202,20 @@ redpanda_cc_library(
     name = "fake_io",
     srcs = ["fake_io.cc"],
     hdrs = ["fake_io.h"],
+    implementation_deps = [
+        ":object",
+        ":ts_object",
+        "//src/v/cloud_storage",
+    ],
     deps = [
         ":abstract_io",
-        ":object",
         ":object_handle",
         ":object_id",
         ":object_utils",
         "//src/v/bytes:iobuf",
         "//src/v/bytes:iostream",
         "//src/v/cloud_storage_clients",
+        "//src/v/model",
         "@abseil-cpp//absl/container:btree",
         "@seastar",
     ],

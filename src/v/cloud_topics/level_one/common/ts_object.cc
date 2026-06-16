@@ -57,20 +57,37 @@ ts_object_handle::ts_object_handle(
   std::unique_ptr<object_index> index,
   model::term_id term,
   aborted_transactions aborted,
-  fetch_range_fn fetch)
+  fetch_range_fn fetch,
+  size_t chunk_size)
   : _index(std::move(index))
   , _term(term)
   , _aborted(std::move(aborted))
-  , _fetch(std::move(fetch)) {}
+  , _fetch(std::move(fetch))
+  , _chunk_size(chunk_size) {}
 
 ss::future<std::expected<std::unique_ptr<object_reader>, io::errc>>
 ts_object_handle::open_reader(const seek_result& seek, ss::abort_source* as) {
-    auto stream_result = co_await _fetch(seek.file_position, seek.length, as);
-    if (!stream_result.has_value()) {
-        co_return std::unexpected(stream_result.error());
+    if (_chunk_size == 0) {
+        // Chunking disabled: download the whole suffix [file_position, end) in
+        // one range. A fetch failure here is reported up front as an error.
+        auto stream_result = co_await _fetch(
+          seek.file_position, seek.length, as);
+        if (!stream_result.has_value()) {
+            co_return std::unexpected(stream_result.error());
+        }
+        co_return std::make_unique<tiered_storage_object_reader>(
+          std::move(*stream_result), seek.delta.value(), _term, _aborted);
     }
+    // Serve the segment as lazily-fetched fixed-size chunks: only the chunks
+    // the read actually consumes are downloaded. The data source owns its own
+    // copy of the fetch and uses the (long-lived) abort source from the read
+    // config, so it is safe for the reader to outlive this handle. A
+    // chunk-fetch failure surfaces as an exception during read.
+    ss::input_stream<char> stream{
+      ss::data_source{std::make_unique<ts_chunk_data_source>(
+        _fetch, seek.file_position, seek.length, _chunk_size, as)}};
     co_return std::make_unique<tiered_storage_object_reader>(
-      std::move(*stream_result), seek.delta.value(), _term, _aborted);
+      std::move(stream), seek.delta.value(), _term, _aborted);
 }
 
 } // namespace cloud_topics::l1

@@ -12,13 +12,13 @@
 #include "cloud_storage/offset_index.h"
 #include "cloud_topics/level_one/common/abstract_io.h"
 #include "cloud_topics/level_one/common/object_handle.h"
+#include "cloud_topics/level_one/common/ts_chunk_data_source.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/iostream.hh>
-#include <seastar/util/noncopyable_function.hh>
 
 #include <expected>
 #include <memory>
@@ -69,16 +69,21 @@ private:
 class ts_object_handle final : public object_handle {
 public:
     /// Returns a stream over the segment's bytes [file_position,
-    /// file_position+length).
-    using fetch_range_fn = ss::noncopyable_function<
-      ss::future<std::expected<ss::input_stream<char>, io::errc>>(
-        size_t file_position, size_t length, ss::abort_source*)>;
+    /// file_position+length). Copyable (see ts_fetch_range_fn): the reader's
+    /// chunk data source owns its own copy, decoupled from this handle.
+    using fetch_range_fn = ts_fetch_range_fn;
 
+    /// `chunk_size` is the download granularity: open_reader serves the segment
+    /// as a lazily-fetched sequence of fixed-size chunks (only the chunks a
+    /// read touches are downloaded). `chunk_size == 0` disables chunking and
+    /// downloads the whole suffix from the seek point in one range (the legacy
+    /// behavior / `cloud_storage_disable_chunk_reads`).
     ts_object_handle(
       std::unique_ptr<object_index> index,
       model::term_id term,
       aborted_transactions aborted,
-      fetch_range_fn fetch);
+      fetch_range_fn fetch,
+      size_t chunk_size);
 
     const object_index& index() const override { return *_index; }
 
@@ -90,6 +95,7 @@ private:
     model::term_id _term;
     aborted_transactions _aborted;
     fetch_range_fn _fetch;
+    size_t _chunk_size;
 };
 
 } // namespace cloud_topics::l1
