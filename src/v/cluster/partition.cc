@@ -495,6 +495,17 @@ ss::future<> partition::start(
       = _raft->stm_manager()->get<cluster::archival_metadata_stm>();
 
     if (_archival_meta_stm) {
+        // While a cloud-mode partition still holds archived data (mid
+        // tiered->cloud migration) it is served from its tiered manifest and
+        // must keep applying local retention, which is_locally_collectable()
+        // disables for cloud topics. Let the storage gc fall back to the
+        // migrating path; the archival STM raw pointer shares raft's lifetime
+        // with the log, so capturing it avoids a shared_ptr cycle.
+        _raft->log()->set_migrating_provider(
+          [stm = _archival_meta_stm.get()] {
+              return stm->holds_archived_data();
+          });
+
         // A cloud-topic partition's archiver is constructed only once it holds
         // archived data (a tiered->cloud migration). On recovery the archival
         // STM restores its manifest from the log asynchronously, so that can
