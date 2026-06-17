@@ -95,6 +95,12 @@ public:
         co_return;
     }
 
+    bool is_migrating(const model::topic_id_partition&) override {
+        return _migrating;
+    }
+
+    void set_migrating(bool migrating) { _migrating = migrating; }
+
     void set_max_allowed_start_offset(kafka::offset offset) {
         _max_allowed_start_offset = offset;
     }
@@ -129,6 +135,8 @@ private:
     model::topic_id_partition _tidp;
     kafka::offset _start_offset;
     kafka::offset _max_allowed_start_offset;
+
+    bool _migrating{false};
 
     // Epoch-related state
     std::optional<cloud_topics::cluster_epoch> _estimated_inactive_epoch
@@ -298,6 +306,8 @@ public:
     }
 
     void reset_epoch_call_tracking() { _l0_metastore.reset_call_tracking(); }
+
+    void set_migrating(bool m) { _l0_metastore.set_migrating(m); }
 
 private:
     model::topic_id_partition _tidp{
@@ -785,6 +795,35 @@ TEST_F(HousekeeperTest, BumpEpochIdleTriggersAdvance) {
     housekeeper.do_bump_epoch().get();
     ASSERT_EQ(advance_epoch_calls().size(), 1);
     EXPECT_EQ(advance_epoch_calls()[0], cloud_topics::cluster_epoch{5});
+    EXPECT_EQ(sync_to_next_placeholder_calls(), 1);
+}
+
+TEST_F(HousekeeperTest, MigratingPartitionSkipsHousekeeping) {
+    // A partition still migrating from tiered storage is served from TS and its
+    // ctp_stm is idle; CT housekeeping must not run against it -- do_bump_epoch
+    // would seed a meaningless reconciled offset and pin local-log GC. do_loop
+    // gates on is_migrating().
+    auto housekeeper = make_housekeeper({});
+
+    // The idle scenario that WOULD force an epoch advance + sync when not
+    // migrating (cf. BumpEpochIdleTriggersAdvance): a stable inactive epoch.
+    set_estimated_inactive_epoch(cloud_topics::cluster_epoch{1});
+    set_current_cluster_epoch(cloud_topics::cluster_epoch{5});
+    set_migrating(true);
+
+    // Even the second iteration (which forces advance + sync when not migrating)
+    // must be skipped entirely while migrating.
+    housekeeper.do_loop().get();
+    housekeeper.do_loop().get();
+    EXPECT_TRUE(advance_epoch_calls().empty());
+    EXPECT_EQ(sync_to_next_placeholder_calls(), 0);
+
+    // Control: once migration completes, the same idle scenario advances.
+    set_migrating(false);
+    reset_epoch_call_tracking();
+    housekeeper.do_loop().get(); // re-initializes _last_epoch
+    housekeeper.do_loop().get(); // idle -> forces advance + sync
+    ASSERT_EQ(advance_epoch_calls().size(), 1);
     EXPECT_EQ(sync_to_next_placeholder_calls(), 1);
 }
 

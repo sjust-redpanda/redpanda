@@ -125,6 +125,12 @@ public:
         co_return;
     }
 
+    bool is_migrating(const model::topic_id_partition& tidp) override {
+        auto& state = _state->at(tidp);
+        const auto& stm = state.partition->archival_meta_stm();
+        return stm != nullptr && stm->holds_archived_data();
+    }
+
 private:
     ctp_stm_api get_api(const model::topic_id_partition& tidp) {
         auto& state = _state->at(tidp);
