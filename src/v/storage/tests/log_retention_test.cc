@@ -341,6 +341,47 @@ TEST_F(gc_fixture, retention_by_size_with_remote_write) {
     builder.stop().get();
 }
 
+TEST_F(gc_fixture, local_retention_runs_only_while_migrating) {
+    // A cloud-mode (cloud_topic_enabled) partition is not locally collectable,
+    // so do_gc normally short-circuits local retention. While the partition is
+    // still migrating from tiered storage it is served from TS and must keep
+    // applying local retention -- the migrating provider opens that path. The
+    // eviction is still clamped by max_removable, so only uploaded data is
+    // dropped. Without this the local log grows unbounded for the whole
+    // migration (the head_prune stall).
+    storage::ntp_config config{
+      storage::log_builder_ntp(), builder.get_log_config().base_dir};
+    storage::ntp_config::default_overrides overrides;
+    overrides.storage_mode = model::redpanda_storage_mode::cloud;
+    overrides.cleanup_policy_bitflags
+      = model::cleanup_policy_bitflags::deletion;
+    config.set_overrides(overrides);
+    ASSERT_TRUE(config.cloud_topic_enabled());
+    ASSERT_FALSE(config.is_locally_collectable());
+
+    builder.start(std::move(config)).get();
+    builder | storage::add_segment(0)
+      | storage::add_random_batch(0, 100, storage::maybe_compress_batches::yes)
+      | storage::add_random_batch(100, 2, storage::maybe_compress_batches::yes)
+      | storage::add_segment(102)
+      | storage::add_random_batch(102, 2, storage::maybe_compress_batches::yes)
+      | storage::add_segment(104) | storage::add_random_batches(104, 3);
+    ASSERT_EQ(builder.get_log()->segment_count(), 3);
+
+    // Not migrating: cloud-mode gc short-circuits, so even a zero size budget
+    // collects nothing.
+    builder.get_log()->set_migrating_provider([] { return false; });
+    builder.gc(model::timestamp(1), std::optional<size_t>(0)).get();
+    EXPECT_EQ(builder.get_log()->segment_count(), 3);
+
+    // Migrating: the same gc now applies local retention and collects.
+    builder.get_log()->set_migrating_provider([] { return true; });
+    builder.gc(model::timestamp(1), std::optional<size_t>(0)).get();
+    EXPECT_EQ(builder.get_log()->segment_count(), 0);
+
+    builder.stop().get();
+}
+
 TEST_F(gc_fixture, retention_by_time_with_remote_write) {
     /*
      * This test sets the time retention limit on a cloud storage topic
