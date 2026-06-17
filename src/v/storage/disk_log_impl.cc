@@ -1799,7 +1799,16 @@ ss::future<std::optional<model::offset>> disk_log_impl::do_gc(gc_config cfg) {
         co_return request_eviction_until_offset(offset);
     }
 
-    if (!config().is_locally_collectable()) {
+    // A cloud-mode partition mid tiered->cloud migration is still served from
+    // its tiered manifest and must keep applying local retention, but
+    // is_locally_collectable() is false for cloud topics. Fall back to the
+    // deletion-policy check while migrating, mirroring partition::prefix_truncate.
+    // The eviction stm still clamps the truncation to max_removable (what has
+    // been uploaded), so this only trims data that is safe to drop locally.
+    const bool migrating_collectable = _migrating_provider
+                                       && _migrating_provider()
+                                       && config().is_remotely_collectable();
+    if (!config().is_locally_collectable() && !migrating_collectable) {
         co_return std::nullopt;
     }
 
@@ -4290,6 +4299,11 @@ disk_log_impl::cloud_gc_eligible_segments() {
     }
 
     return segments;
+}
+
+void disk_log_impl::set_migrating_provider(
+  ss::noncopyable_function<bool()> provider) {
+    _migrating_provider = std::move(provider);
 }
 
 void disk_log_impl::set_cloud_gc_offset(model::offset offset) {

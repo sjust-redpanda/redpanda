@@ -169,6 +169,7 @@ public:
     uint64_t size_bytes_after_offset(model::offset o) const override;
     void set_overrides(ntp_config::default_overrides) final;
     bool notify_compaction_update() final;
+    void set_migrating_provider(ss::noncopyable_function<bool()>) final;
 
     int64_t compaction_backlog() final;
 
@@ -519,6 +520,11 @@ private:
     size_t _suffix_truncation_indicator{0};
 
     std::optional<model::offset> _cloud_gc_offset;
+
+    // When set, returns true while this cloud-mode partition is still serving
+    // tiered data (mid TS->CT migration), permitting local retention that
+    // is_locally_collectable() would otherwise short-circuit. See do_gc.
+    ss::noncopyable_function<bool()> _migrating_provider;
 
     // The offset at which the last window compaction finished, above which keys
     // have been fully deduplicated. The next round of window compaction
