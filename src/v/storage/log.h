@@ -26,6 +26,7 @@
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/util/noncopyable_function.hh>
 
 #include <optional>
 #include <utility>
@@ -226,6 +227,14 @@ public:
     /// Notifies the log about a possible change to the log compaction config.
     /// Returns true if the log compaction changed.
     virtual bool notify_compaction_update() = 0;
+
+    /// Install a predicate the local-retention gc path consults to permit
+    /// trimming on a cloud-mode partition that is still serving tiered-storage
+    /// data (a tiered->cloud migration in progress). Without it,
+    /// is_locally_collectable() short-circuits local retention for cloud topics,
+    /// so the local log would not follow retention for the duration of the
+    /// migration while the partition is still served from its tiered manifest.
+    virtual void set_migrating_provider(ss::noncopyable_function<bool()>) {}
 
     virtual int64_t compaction_backlog() = 0;
 
