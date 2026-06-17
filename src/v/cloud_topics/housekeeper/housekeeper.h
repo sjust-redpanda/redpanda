@@ -80,6 +80,13 @@ public:
         virtual ss::future<> sync_to_next_placeholder(
           const model::topic_id_partition& tidp,
           ss::abort_source*) noexcept = 0;
+
+        // Whether the partition is still being migrated from tiered storage
+        // (served from TS and mirrored into L1). While migrating, the ctp_stm
+        // is idle and CT housekeeping must not run against it.
+        virtual bool is_migrating(const model::topic_id_partition&) {
+            return false;
+        }
     };
 
     // A wrapper around a source of configuration for a give topic id +
@@ -123,8 +130,13 @@ public:
 
     ss::future<> do_bump_epoch();
 
-private:
+    // Run a single iteration of the housekeeping loop (sleep + the migration
+    // guard + do_housekeeping + do_bump_epoch).
+    //
+    // Public for testing.
     ss::future<> do_loop();
+
+private:
     ss::future<kafka::offset> do_bytes_retention(size_t size);
     ss::future<kafka::offset> do_time_retention(std::chrono::milliseconds);
     // Syncs the start offset from L0 metadata storage to L1 metastore.
