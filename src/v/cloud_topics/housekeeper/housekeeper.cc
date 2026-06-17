@@ -116,6 +116,20 @@ ss::future<> housekeeper::do_loop() {
     simple_time_jitter<ss::lowres_clock> jitter(_loop_interval());
     co_await ss::sleep_abortable<ss::lowres_clock>(jitter.next_duration(), _as);
     try {
+        // A partition still migrating from tiered storage is served from TS and
+        // mirrored into L1; its ctp_stm is idle. Running CT housekeeping against
+        // it would force epoch/placeholder maintenance that seeds a meaningless
+        // reconciled offset and pins local-log GC, freezing retention. L1 head
+        // trimming during migration is owned by the archiver's migration mirror.
+        // Skip until cutover, mirroring the reconciler.
+        if (_l0_metastore->is_migrating(_tidp)) {
+            vlog(
+              cd_log.trace,
+              "{}: partition is migrating from tiered storage, skipping "
+              "housekeeping",
+              _tidp);
+            co_return;
+        }
         co_await do_housekeeping();
         co_await do_bump_epoch();
     } catch (...) {
