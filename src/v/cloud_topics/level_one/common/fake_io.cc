@@ -157,7 +157,7 @@ fake_io::open_object(
         // Seek through the real ts_segment_index, exactly as file_io does: an
         // injected .index is deserialized (from_iobuf); without one the index
         // stays empty, so seeks fall back to a full-segment scan from position
-        // 0, with the delta derived from the segment's base Kafka offset --
+        // 0, with the delta taken from the segment's base delta --
         // file_io's missing-.index behavior.
         cloud_storage::offset_index oi(
           model::offset{0},
@@ -169,10 +169,7 @@ fake_io::open_object(
             oi.from_iobuf(fixture.index_bytes->copy());
         }
         auto idx = std::make_unique<ts_segment_index>(
-          std::move(oi),
-          extent.imported->base_kafka_offset,
-          extent.imported->last_kafka_offset,
-          segment_size);
+          std::move(oi), extent.imported->delta_base, segment_size);
         co_return std::make_unique<ts_object_handle>(
           std::move(idx),
           extent.imported->segment_term,

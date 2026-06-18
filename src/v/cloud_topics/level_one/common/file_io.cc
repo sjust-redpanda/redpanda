@@ -364,10 +364,7 @@ file_io::open_object(
             co_return std::unexpected(index_iobuf.error());
         }
         auto idx = std::make_unique<ts_segment_index>(
-          std::move(ts_index),
-          extent.imported->base_kafka_offset,
-          extent.imported->last_kafka_offset,
-          extent.size);
+          std::move(ts_index), extent.imported->delta_base, extent.size);
 
         // Aborted-transaction ranges for this segment, so the reader can strip
         // aborted data and make the imported region committed-only (like native

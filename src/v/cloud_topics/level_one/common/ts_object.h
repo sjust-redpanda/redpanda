@@ -29,18 +29,26 @@
 namespace cloud_topics::l1 {
 
 /// object_index over a tiered-storage segment's offset_index. Translates a
-/// target Kafka offset/timestamp into a byte position plus the Kafka offset at
-/// that position using the segment's downloaded .index. A seek before the first
-/// index entry (or with no index at all) returns the segment start, whose Kafka
-/// offset is base_kafka_offset. (find_kaf_offset/find_timestamp are non-const
-/// on offset_index -- they flush a write buffer internally -- so _index is
-/// mutable.)
+/// target Kafka offset/timestamp into a byte position plus the offset
+/// translation delta at that position using the segment's downloaded .index.
+/// At an index entry the delta is the entry's (log - Kafka) offset; a seek
+/// before the first index entry (or with no index at all) returns the segment
+/// start, whose delta is the segment base delta (delta_base). Returning the
+/// base delta -- rather than the base Kafka offset for the reader to infer the
+/// delta from the first batch -- keeps translation correct when compaction has
+/// removed the segment's leading records. (find_kaf_offset/find_timestamp are
+/// non-const on offset_index -- they flush a write buffer internally -- so
+/// _index is mutable.)
+///
+/// Seeks are not upper-bounded by the segment's last offset: the caller only
+/// dispatches a target the segment's extent range covers (the metastore read
+/// path discards objects whose last_offset is below the target), so the bound
+/// would never reject anything.
 class ts_segment_index final : public object_index {
 public:
     ts_segment_index(
       cloud_storage::offset_index index,
-      kafka::offset base_kafka_offset,
-      kafka::offset max_kafka_offset,
+      model::offset_delta delta_base,
       size_t segment_size);
 
     std::optional<seek_result> seek_to_offset(
@@ -51,8 +59,7 @@ public:
 
 private:
     mutable cloud_storage::offset_index _index;
-    kafka::offset _base_kafka_offset;
-    kafka::offset _max_kafka_offset;
+    model::offset_delta _delta_base;
     size_t _segment_size;
 };
 

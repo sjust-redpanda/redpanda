@@ -72,10 +72,7 @@ snapshot_metastore::get_first_ge(
       .first_offset = extent.base_offset,
       .last_offset = extent.last_offset,
       .imported = l1::to_imported_ts_info(
-        obj.imported_ts_location,
-        extent.imported_ts_info,
-        extent.base_offset,
-        extent.last_offset),
+        obj.imported_ts_location, extent.imported_ts_info),
     };
 }
 
@@ -128,10 +125,7 @@ snapshot_metastore::get_first_ge(
               .first_offset = key->base_offset,
               .last_offset = extent.last_offset,
               .imported = l1::to_imported_ts_info(
-                obj.imported_ts_location,
-                extent.imported_ts_info,
-                key->base_offset,
-                extent.last_offset),
+                obj.imported_ts_location, extent.imported_ts_info),
             };
         }
     }
@@ -323,10 +317,7 @@ snapshot_metastore::get_extent_metadata_forwards(
               .footer_pos = obj.footer_pos,
               .object_size = obj.object_size,
               .imported = l1::to_imported_ts_info(
-                obj.imported_ts_location,
-                val.imported_ts_info,
-                key->base_offset,
-                val.last_offset),
+                obj.imported_ts_location, val.imported_ts_info),
             };
         }
         extents.push_back(std::move(em));

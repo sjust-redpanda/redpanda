@@ -1599,10 +1599,7 @@ db_domain_manager::get_extent_metadata(rpc::get_extent_metadata_request req) {
               .footer_pos = object.footer_pos,
               .object_size = object.object_size,
               .imported = to_imported_ts_info(
-                object.imported_ts_location,
-                extent.val.imported_ts_info,
-                key->base_offset,
-                extent.val.last_offset),
+                object.imported_ts_location, extent.val.imported_ts_info),
             };
         }
         extents.push_back(std::move(em));

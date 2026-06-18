@@ -24,17 +24,18 @@
 namespace cloud_topics::l1 {
 
 /// Result of an index seek. `file_position` is always a byte offset within
-/// the object. `kafka_offset` is the Kafka offset of the batch at
-/// `file_position`, set by TS-backed indexes so the reader can derive the
-/// log-to-Kafka delta from the first batch; it is `nullopt` for native L1
-/// objects (which are already in Kafka-offset space).
+/// the object. `delta` is the log-to-Kafka offset-translation delta at
+/// `file_position`, set by TS-backed indexes so the reader translates log
+/// offsets to Kafka offsets directly (rather than inferring the delta from the
+/// first batch, which mis-translates a compacted front hole); it is `nullopt`
+/// for native L1 objects (which are already in Kafka-offset space).
 struct seek_result {
     size_t file_position{0};
     /// Bytes from file_position to the end of the readable range.
     /// Always non-zero for a valid seek; both native and TS indexes populate
     /// it.
     size_t length{0};
-    std::optional<kafka::offset> kafka_offset;
+    std::optional<model::offset_delta> delta;
 };
 
 /// An index over a single L1 or imported TS object.

@@ -25,6 +25,10 @@ kafka::offset operator""_o(unsigned long long o) {
     return kafka::offset{static_cast<int64_t>(o)};
 }
 
+model::offset_delta operator""_od(unsigned long long d) {
+    return model::offset_delta{static_cast<int64_t>(d)};
+}
+
 model::record_batch make_data_batch(
   kafka::offset base, kafka::offset last, model::timestamp ts = {}) {
     int count = static_cast<int>(last - base) + 1;
@@ -73,7 +77,8 @@ TEST_F(ReaderImportedTest, ReadImportedExtentReturnsKafkaOffsets) {
           make_data_batch(kafka::offset{5 + i}, kafka::offset{5 + i})));
     }
 
-    register_imported_extent(tidp, std::move(seg), 0_o, 4_o, "t/seg-a.log")
+    register_imported_extent(
+      tidp, std::move(seg), 0_o, 4_o, 5_od, "t/seg-a.log")
       .get();
 
     auto batches = read_all(make_reader(ntp, tidp, /*start_offset=*/0_o));
@@ -99,7 +104,8 @@ TEST_F(ReaderImportedTest, ReadImportedExtentRespectsStartOffset) {
           make_data_batch(kafka::offset{5 + i}, kafka::offset{5 + i})));
     }
 
-    register_imported_extent(tidp, std::move(seg), 0_o, 4_o, "t/seg-b.log")
+    register_imported_extent(
+      tidp, std::move(seg), 0_o, 4_o, 5_od, "t/seg-b.log")
       .get();
 
     auto batches = read_all(make_reader(ntp, tidp, /*start_offset=*/2_o));
@@ -125,7 +131,8 @@ TEST_F(ReaderImportedTest, ReadImportedExtentSkipsNonDataBatches) {
     // data at log offset 2 → kafka offset 2 - 1 = 1
     seg.append(batch_to_ts_bytes(make_data_batch(2_o, 2_o)));
 
-    register_imported_extent(tidp, std::move(seg), 0_o, 1_o, "t/seg-c.log")
+    register_imported_extent(
+      tidp, std::move(seg), 0_o, 1_o, 0_od, "t/seg-c.log")
       .get();
 
     auto batches = read_all(make_reader(ntp, tidp, /*start_offset=*/0_o));
@@ -137,6 +144,35 @@ TEST_F(ReaderImportedTest, ReadImportedExtentSkipsNonDataBatches) {
     }
     EXPECT_EQ(batches[0].base_offset(), kafka::offset_cast(0_o));
     EXPECT_EQ(batches[1].base_offset(), kafka::offset_cast(1_o));
+}
+
+// A compacted segment whose leading records were removed. Compaction does not
+// move a segment's base: the extent still declares base kafka offset 0, but the
+// first surviving physical batch is at log offset 7 (kafka offset 2) -- log
+// offsets 5,6 (kafka 0,1) were compacted away, leaving a two-offset front hole.
+// delta is 5 throughout. The reader must report the survivors at their true
+// kafka offsets 2,3,4; it must NOT renumber them down into the hole (0,1,2),
+// which is what happens when the delta is inferred from the first batch's
+// position rather than the segment's authoritative base delta.
+TEST_F(ReaderImportedTest, ReadImportedExtentFrontHoleCompacted) {
+    auto [ntp, tidp] = make_ntidp("test_topic_front_hole");
+
+    iobuf seg;
+    for (int log = 7; log <= 9; ++log) {
+        seg.append(batch_to_ts_bytes(
+          make_data_batch(kafka::offset{log}, kafka::offset{log})));
+    }
+
+    register_imported_extent(
+      tidp, std::move(seg), 0_o, 4_o, 5_od, "t/seg-fh.log")
+      .get();
+
+    auto batches = read_all(make_reader(ntp, tidp, /*start_offset=*/0_o));
+
+    ASSERT_EQ(batches.size(), 3u);
+    EXPECT_EQ(batches[0].base_offset(), kafka::offset_cast(2_o));
+    EXPECT_EQ(batches[1].base_offset(), kafka::offset_cast(3_o));
+    EXPECT_EQ(batches[2].base_offset(), kafka::offset_cast(4_o));
 }
 
 // One imported extent covers kafka offsets 0-4 (log offsets 0-4, delta=0),
@@ -151,7 +187,8 @@ TEST_F(ReaderImportedTest, ReadImportedExtentThenNative) {
         seg.append(batch_to_ts_bytes(
           make_data_batch(kafka::offset{i}, kafka::offset{i})));
     }
-    register_imported_extent(tidp, std::move(seg), 0_o, 4_o, "t/seg-d.log")
+    register_imported_extent(
+      tidp, std::move(seg), 0_o, 4_o, 0_od, "t/seg-d.log")
       .get();
 
     // Native: 5 batches at kafka offsets 5-9

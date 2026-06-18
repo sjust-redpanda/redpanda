@@ -172,6 +172,7 @@ debug_reader::decode_value(row_type type, iobuf value) {
             if (rv.imported_ts_info.has_value()) {
                 proto::admin::metastore::imported_ts_segment_info isi;
                 isi.set_segment_term(rv.imported_ts_info->segment_term());
+                isi.set_delta_base(rv.imported_ts_info->delta_base());
                 ev.set_imported_ts_info(std::move(isi));
             }
             pv.set_extent(std::move(ev));

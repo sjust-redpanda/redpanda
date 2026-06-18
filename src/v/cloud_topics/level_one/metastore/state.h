@@ -68,13 +68,17 @@ struct imported_ts_segment_info
       = default;
     std::strong_ordering
     operator<=>(const imported_ts_segment_info&) const = default;
-    auto serde_fields() { return std::tie(segment_term); }
+    auto serde_fields() { return std::tie(segment_term, delta_base); }
 
     /// Raft term the segment was written in. Stamped onto every imported batch
     /// as its partition leader epoch (a tiered-storage segment is single-term),
     /// so a Kafka fetch of the imported region reports the original leader
     /// epoch rather than -1.
     model::term_id segment_term{};
+    /// Offset-translation delta at the segment's base (source segment_meta's
+    /// delta_offset). Seeds the reader's running delta at the segment start so
+    /// translation survives a compacted front hole. See l1::imported_ts_info.
+    model::offset_delta delta_base{};
 };
 
 // Translate between the storage split (object-owned location + extent-owned
@@ -85,31 +89,26 @@ to_object_location(const imported_ts_info& i) {
     return imported_ts_object_location{.ts_path = i.ts_path};
 }
 inline imported_ts_segment_info to_segment_info(const imported_ts_info& i) {
-    return imported_ts_segment_info{.segment_term = i.segment_term};
+    return imported_ts_segment_info{
+      .segment_term = i.segment_term, .delta_base = i.delta_base};
 }
 inline imported_ts_info to_imported_ts_info(
-  const imported_ts_object_location& loc,
-  const imported_ts_segment_info& seg,
-  kafka::offset base_kafka_offset,
-  kafka::offset last_kafka_offset) {
+  const imported_ts_object_location& loc, const imported_ts_segment_info& seg) {
     return imported_ts_info{
       .ts_path = loc.ts_path,
       .segment_term = seg.segment_term,
-      .base_kafka_offset = base_kafka_offset,
-      .last_kafka_offset = last_kafka_offset};
+      .delta_base = seg.delta_base};
 }
-// Recompose a read response's imported_ts_info from the object row's location,
-// the extent row's segment descriptor, and the extent's Kafka offset bounds
-// (location + segment are set together for an imported extent, both nullopt for
-// native L1).
+// Recompose a read response's imported_ts_info from the object row's location
+// and the extent row's segment descriptor (set together for an imported extent,
+// both nullopt for native L1). The extent's Kafka offset bounds live on the
+// extent itself (base_offset/last_offset); the read path does not need them
+// here.
 inline std::optional<imported_ts_info> to_imported_ts_info(
   const std::optional<imported_ts_object_location>& loc,
-  const std::optional<imported_ts_segment_info>& seg,
-  kafka::offset base_kafka_offset,
-  kafka::offset last_kafka_offset) {
+  const std::optional<imported_ts_segment_info>& seg) {
     if (loc.has_value() && seg.has_value()) {
-        return to_imported_ts_info(
-          *loc, *seg, base_kafka_offset, last_kafka_offset);
+        return to_imported_ts_info(*loc, *seg);
     }
     return std::nullopt;
 }

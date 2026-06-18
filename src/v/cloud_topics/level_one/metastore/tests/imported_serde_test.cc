@@ -93,6 +93,7 @@ TEST(ImportedSerdeTest, ExtentRowValueV1RoundTrip) {
     v1.oid = create_object_id();
     v1.imported_ts_info = imported_ts_segment_info{
       .segment_term = model::term_id{7},
+      .delta_base = model::offset_delta{5},
     };
 
     iobuf buf = serde::to_iobuf(v1);

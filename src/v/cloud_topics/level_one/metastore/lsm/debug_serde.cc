@@ -168,6 +168,7 @@ debug_encode_value(const proto::admin::metastore::row_value& val) {
             const auto& isi = v.get_imported_ts_info();
             rv.imported_ts_info = imported_ts_segment_info{
               .segment_term = model::term_id{isi.get_segment_term()},
+              .delta_base = model::offset_delta{isi.get_delta_base()},
             };
         }
         return serde::to_iobuf(std::move(rv));

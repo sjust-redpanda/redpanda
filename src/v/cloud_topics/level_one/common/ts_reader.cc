@@ -48,11 +48,11 @@ bool is_aborted(
 
 tiered_storage_object_reader::tiered_storage_object_reader(
   ss::input_stream<char> stream,
-  kafka::offset position_kafka_offset,
+  model::offset_delta initial_delta,
   model::term_id term,
   absl::btree_set<model::tx_range, std::greater<>> aborted)
   : _stream(std::move(stream))
-  , _position_kafka_offset(position_kafka_offset)
+  , _running_delta(initial_delta)
   , _term(term)
   , _aborted(std::move(aborted)) {}
 
@@ -109,15 +109,6 @@ tiered_storage_object_reader::fetch_next_translated() {
                 "truncated TS segment: expected {} record bytes, got {}",
                 records_size,
                 records_buf.size_bytes()));
-        }
-        // Derive the delta from the first batch: its log offset minus the
-        // Kafka offset at the stream's start is the log-to-Kafka delta there.
-        // Set before the type-based delta advance below so non-data first
-        // batches are handled.
-        if (!_delta_initialized) {
-            _running_delta = model::offset_delta{
-              header.base_offset() - _position_kafka_offset()};
-            _delta_initialized = true;
         }
         // Non-data batches that the offset translator strips: advance the
         // running delta by the number of log offsets they consume (matching

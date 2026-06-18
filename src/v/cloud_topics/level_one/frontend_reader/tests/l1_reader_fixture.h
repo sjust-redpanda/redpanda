@@ -65,6 +65,7 @@ protected:
       iobuf segment_bytes,
       kafka::offset base_kafka_offset,
       kafka::offset last_kafka_offset,
+      model::offset_delta delta_base,
       ss::sstring ts_path = "test/0-1-v1.log") {
         size_t seg_size = segment_bytes.size_bytes();
 
@@ -88,8 +89,7 @@ protected:
                   .size = seg_size,
                   .imported = l1::imported_ts_info{
                     .ts_path = ts_path,
-                    .base_kafka_offset = base_kafka_offset,
-                    .last_kafka_offset = last_kafka_offset,
+                    .delta_base = delta_base,
                   },
                 })
               .value();

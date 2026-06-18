@@ -43,10 +43,7 @@ struct imported_ts_info
       envelope<imported_ts_info, serde::version<0>, serde::compat_version<0>> {
     friend bool
     operator==(const imported_ts_info&, const imported_ts_info&) = default;
-    auto serde_fields() {
-        return std::tie(
-          ts_path, segment_term, base_kafka_offset, last_kafka_offset);
-    }
+    auto serde_fields() { return std::tie(ts_path, segment_term, delta_base); }
 
     /// Opaque path within the TS bucket (sname_format path).
     ss::sstring ts_path;
@@ -55,19 +52,18 @@ struct imported_ts_info
     /// so a Kafka fetch of the imported region reports the original leader
     /// epoch rather than -1.
     model::term_id segment_term{};
-    /// First and last Kafka offset of the segment (inclusive). Redundant with
-    /// the extent's base/last offset (from which they are populated on read),
-    /// kept here so the IO read view is self-contained. base_kafka_offset seeds
-    /// the reader's offset delta when a seek scans from the segment start (the
-    /// log-to-Kafka delta there is the first batch's log offset minus this);
-    /// last_kafka_offset bounds seeks in the imported segment index.
-    kafka::offset base_kafka_offset{0};
-    kafka::offset last_kafka_offset{0};
+    /// Offset-translation delta at the segment's base (the source
+    /// segment_meta's delta_offset: base log offset minus base Kafka offset).
+    /// Seeds the reader's running delta when a seek scans from the segment
+    /// start, so translation is correct even when compaction has removed the
+    /// leading records -- the first surviving batch may sit past the declared
+    /// base, and inferring the delta from it would renumber survivors down into
+    /// the hole.
+    model::offset_delta delta_base{};
 };
 
 /// An L1 object or imported TS segment, as seen by the IO read path. For an
-/// imported extent `imported` is the segment descriptor (path + term + Kafka
-/// offset bounds); the bounds come from the metastore.
+/// imported extent `imported` is the segment descriptor (path + term + delta).
 ///
 /// `position` and `size` carry format-specific semantics:
 ///   native (imported == nullopt):
@@ -81,7 +77,7 @@ struct object_extent {
     size_t position = 0;
     size_t size = 0;
     /// Set for an imported extent (nullopt for native L1); carries the
-    /// segment's path, term, and Kafka offset bounds.
+    /// segment's path, term, and offset-translation delta.
     std::optional<imported_ts_info> imported;
 
     fmt::iterator format_to(fmt::iterator it) const;

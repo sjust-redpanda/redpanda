@@ -251,6 +251,9 @@ message ImportedTsObjectLocation {
 // property, alongside the extent's Kafka offset bounds (base/last_offset).
 message ImportedTsSegmentInfo {
     int64 segment_term = 1;
+    // Offset-translation delta at the segment's base (source segment_meta's
+    // delta_offset).
+    int64 delta_base = 2;
 }
 
 // Value for an extent row.

@@ -87,7 +87,8 @@ public:
             size_t size;
             // Set when this extent is an imported tiered-storage segment (the
             // TS->CT migration mirror): the segment descriptor (path + delta +
-            // term + last_kafka_offset). nullopt for a native L1 extent.
+            // term). The extent's Kafka offset bounds come from
+            // base_offset/last_offset above. nullopt for a native L1 extent.
             std::optional<imported_ts_info> imported;
         };
         using ntp_metas_list_t = chunked_vector<ntp_metadata>;

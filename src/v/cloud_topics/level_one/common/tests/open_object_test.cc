@@ -35,6 +35,10 @@ kafka::offset operator""_o(unsigned long long o) {
     return kafka::offset{static_cast<int64_t>(o)};
 }
 
+model::offset_delta operator""_od(unsigned long long d) {
+    return model::offset_delta{static_cast<int64_t>(d)};
+}
+
 model::record_batch
 make_batch(kafka::offset base, kafka::offset last, model::timestamp ts = {}) {
     int count = static_cast<int>(last - base) + 1;
@@ -101,7 +105,7 @@ TEST(OpenObjectTest, SeekReturnsNonzeroPosition) {
     auto seek = handle->index().seek_to_offset(tidp, 10_o);
     ASSERT_TRUE(seek.has_value());
     EXPECT_GT(seek->file_position, size_t{0});
-    EXPECT_FALSE(seek->kafka_offset.has_value());
+    EXPECT_FALSE(seek->delta.has_value());
 }
 
 // After seeking to the second batch, open a reader and verify that only batches
@@ -265,8 +269,8 @@ iobuf make_ts_segment_multi(std::vector<model::record_batch> batches) {
 
 // With no injected .index, open_object builds an empty ts_segment_index (as
 // file_io does when the segment's .index is absent): seek_to_offset falls back
-// to {file_position=0, length=segment_size, kafka_offset=base} -- a
-// full-segment scan whose delta the reader derives from the base Kafka offset.
+// to {file_position=0, length=segment_size, delta=delta_base} -- a
+// full-segment scan with the segment's authoritative base delta.
 TEST(OpenObjectTsTest, SeekReturnsFullSegment) {
     fake_io fio;
     const ss::sstring ts_path = "00000000000000000000-1-v1.log";
@@ -284,8 +288,7 @@ TEST(OpenObjectTsTest, SeekReturnsFullSegment) {
       .id = create_object_id(),
       .position = 0,
       .size = segment_size,
-      .imported
-      = imported_ts_info{.ts_path = ts_path, .base_kafka_offset = 0_o, .last_kafka_offset = 9_o},
+      .imported = imported_ts_info{.ts_path = ts_path, .delta_base = 5_od},
     };
     auto handle_result
       = fio.open_object(extent, &as, cloud_io::group_id::default_group).get();
@@ -296,37 +299,10 @@ TEST(OpenObjectTsTest, SeekReturnsFullSegment) {
     ASSERT_TRUE(seek.has_value());
     EXPECT_EQ(seek->file_position, size_t{0});
     EXPECT_EQ(seek->length, segment_size);
-    // No index entry: the seek reports the segment's base Kafka offset, which
-    // the reader uses to derive the delta from the first batch.
-    ASSERT_TRUE(seek->kafka_offset.has_value());
-    EXPECT_EQ(*seek->kafka_offset, 0_o);
-}
-
-// Seeking past last_kafka_offset must return nullopt.
-TEST(OpenObjectTsTest, SeekBeyondLastOffsetReturnsNullopt) {
-    fake_io fio;
-    const ss::sstring ts_path = "00000000000000000000-1-v1.log";
-
-    auto segment = make_ts_segment(make_batch(0_o, 9_o));
-    size_t sz = segment.size_bytes();
-    fio.put_ts_segment(ts_path, std::move(segment));
-
-    auto tidp = model::topic_id_partition{
-      model::topic_id(uuid_t::create()), model::partition_id{0}};
-    ss::abort_source as;
-    object_extent extent{
-      .id = create_object_id(),
-      .position = 0,
-      .size = sz,
-      .imported
-      = imported_ts_info{.ts_path = ts_path, .last_kafka_offset = 9_o},
-    };
-    auto handle_result
-      = fio.open_object(extent, &as, cloud_io::group_id::default_group).get();
-    ASSERT_TRUE(handle_result.has_value());
-
-    EXPECT_FALSE(
-      (*handle_result)->index().seek_to_offset(tidp, 10_o).has_value());
+    // No index entry: the seek reports the segment's authoritative base delta,
+    // which the reader applies directly.
+    ASSERT_TRUE(seek->delta.has_value());
+    EXPECT_EQ(*seek->delta, 5_od);
 }
 
 // open_reader on an imported handle reads batches with delta-translated kafka
@@ -348,8 +324,7 @@ TEST(OpenObjectTsTest, ReadBatchesWithDeltaTranslation) {
       .id = create_object_id(),
       .position = 0,
       .size = sz,
-      .imported
-      = imported_ts_info{.ts_path = ts_path, .base_kafka_offset = 10_o, .last_kafka_offset = 14_o},
+      .imported = imported_ts_info{.ts_path = ts_path, .delta_base = 5_od},
     };
     auto handle_result
       = fio.open_object(extent, &as, cloud_io::group_id::default_group).get();
@@ -418,8 +393,7 @@ TEST(OpenObjectTsTest, IndexBackedSeekFindsBatchPosition) {
       .id = create_object_id(),
       .position = 0,
       .size = sz,
-      .imported
-      = imported_ts_info{.ts_path = ts_path, .base_kafka_offset = 0_o, .last_kafka_offset = 14_o},
+      .imported = imported_ts_info{.ts_path = ts_path, .delta_base = 5_od},
     };
     auto handle_result
       = fio.open_object(extent, &as, cloud_io::group_id::default_group).get();
@@ -427,12 +401,12 @@ TEST(OpenObjectTsTest, IndexBackedSeekFindsBatchPosition) {
     auto& handle = *handle_result;
 
     // Seek to a kafka offset inside batch1 -> its (non-zero) byte position,
-    // reporting the indexed entry's Kafka offset (5) at that position.
+    // reporting the offset delta (log 10 - kafka 5 = 5) at that indexed entry.
     auto seek = handle->index().seek_to_offset(tidp, 5_o);
     ASSERT_TRUE(seek.has_value());
     EXPECT_EQ(seek->file_position, static_cast<size_t>(p1));
-    ASSERT_TRUE(seek->kafka_offset.has_value());
-    EXPECT_EQ(*seek->kafka_offset, 5_o);
+    ASSERT_TRUE(seek->delta.has_value());
+    EXPECT_EQ(*seek->delta, 5_od);
 
     // Batch boundaries either side: first batch at 0, third batch at p2.
     auto seek0 = handle->index().seek_to_offset(tidp, 0_o);
@@ -485,8 +459,7 @@ TEST(OpenObjectTsTest, ReadImportedExtentEmitsOnlyRaftData) {
       .id = create_object_id(),
       .position = 0,
       .size = sz,
-      .imported
-      = imported_ts_info{.ts_path = ts_path, .base_kafka_offset = 0_o, .last_kafka_offset = 3_o},
+      .imported = imported_ts_info{.ts_path = ts_path, .delta_base = 0_od},
     };
     auto handle_result
       = fio.open_object(extent, &as, cloud_io::group_id::default_group).get();
@@ -545,8 +518,7 @@ TEST(OpenObjectTsTest, ReadImportedExtentDropsControlBatches) {
       .id = create_object_id(),
       .position = 0,
       .size = sz,
-      .imported
-      = imported_ts_info{.ts_path = ts_path, .base_kafka_offset = 0_o, .last_kafka_offset = 5_o},
+      .imported = imported_ts_info{.ts_path = ts_path, .delta_base = 0_od},
     };
     auto handle_result
       = fio.open_object(extent, &as, cloud_io::group_id::default_group).get();
@@ -611,8 +583,7 @@ TEST(OpenObjectTsTest, ReadImportedExtentStripsAbortedData) {
       .id = create_object_id(),
       .position = 0,
       .size = sz,
-      .imported
-      = imported_ts_info{.ts_path = ts_path, .base_kafka_offset = 0_o, .last_kafka_offset = 5_o},
+      .imported = imported_ts_info{.ts_path = ts_path, .delta_base = 0_od},
     };
     auto handle_result
       = fio.open_object(extent, &as, cloud_io::group_id::default_group).get();
@@ -665,8 +636,7 @@ TEST(OpenObjectTsTest, ReadImportedExtentAllAborted) {
       .id = create_object_id(),
       .position = 0,
       .size = sz,
-      .imported
-      = imported_ts_info{.ts_path = ts_path, .base_kafka_offset = 0_o, .last_kafka_offset = 4_o},
+      .imported = imported_ts_info{.ts_path = ts_path, .delta_base = 0_od},
     };
     auto handle_result
       = fio.open_object(extent, &as, cloud_io::group_id::default_group).get();
@@ -694,8 +664,7 @@ TEST(OpenObjectTsTest, MissingTsSegmentReturnsError) {
       .id = create_object_id(),
       .position = 0,
       .size = 100,
-      .imported
-      = imported_ts_info{.ts_path = "no-such-segment.log", .last_kafka_offset = 9_o},
+      .imported = imported_ts_info{.ts_path = "no-such-segment.log"},
     };
     auto result
       = fio.open_object(extent, &as, cloud_io::group_id::default_group).get();
