@@ -1462,10 +1462,21 @@ class TsToCtMigrationTest(RedpandaTest):
         self._wait_for_cutover(self.TOPIC_HEADPRUNE)
 
         # The trimmed start carried through cutover: the partition begins above
-        # 0, with no stale imported extents below it.
-        trimmed_start = self._partition_start_offset(self.TOPIC_HEADPRUNE)
-        assert trimmed_start > 0, \
-            f"head-pruned start was lost across cutover: start={trimmed_start}"
+        # 0, with no stale imported extents below it. Poll rather than assert
+        # once: _wait_for_cutover only observes the archival manifest emptying,
+        # and the cloud-topic (L1) start offset can take a moment longer to
+        # surface on the describe/list-offsets path.
+        def trimmed_start_carried() -> bool:
+            start = self._partition_start_offset(self.TOPIC_HEADPRUNE)
+            self.logger.info(f"head_prune post-cutover start={start}")
+            return start > 0
+
+        wait_until(
+            trimmed_start_carried,
+            timeout_sec=60,
+            backoff_sec=2,
+            err_msg="head-pruned start was lost across cutover (start stayed 0)",
+        )
 
         consumer = KgoVerifierSeqConsumer(
             self.test_context,
