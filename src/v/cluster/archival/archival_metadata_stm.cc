@@ -1375,6 +1375,15 @@ model::offset archival_metadata_stm::max_removable_local_log_offset() {
         collect_all = false;
     }
 
+    // A partition mid tiered->cloud migration has is_archival_enabled() ==
+    // false once its storage mode is flipped, which would otherwise make us
+    // collect_all and stop constraining local-log truncation -- evicting
+    // tiered-storage data that has not yet been uploaded. While the partition
+    // still holds archived data (a non-empty live manifest or a spillover
+    // archive) it is still served from tiered storage, so keep constraining via
+    // cloud_recoverable_offset() until the manifest is cleared.
+    collect_all = collect_all && !holds_archived_data();
+
     if (collect_all || is_read_replica || (uploads_paused && gaps_allowed)) {
         // The archival is disabled but the state machine still exists so we
         // shouldn't stop eviction from happening.
@@ -1692,6 +1701,11 @@ model::offset archival_metadata_stm::get_archive_start_offset() const {
     return _manifest->get_archive_start_offset();
 }
 
+bool archival_metadata_stm::holds_archived_data() const {
+    return _manifest->size() > 0
+           || _manifest->get_archive_start_offset() != model::offset{};
+}
+
 model::offset archival_metadata_stm::get_archive_clean_offset() const {
     return _manifest->get_archive_clean_offset();
 }
@@ -1731,10 +1745,14 @@ archival_metadata_stm_factory::archival_metadata_stm_factory(
 
 bool archival_metadata_stm_factory::is_applicable_for(
   const storage::ntp_config& ntp_cfg) const {
+    // The archival STM is created on cloud-topic partitions too (no
+    // cloud_topic_enabled() == false guard). For a partition migrated from
+    // tiered storage it is reconstructed from its snapshot and its manifest
+    // stays available to gate local-log truncation. For a partition that was
+    // always a cloud topic the manifest is empty, so it is an inert passenger.
     return _cloud_storage_enabled && _cloud_storage_api.local_is_initialized()
            && ntp_cfg.ntp().tp.topic != model::kafka_consumer_offsets_topic
-           && ntp_cfg.ntp().ns == model::kafka_namespace
-           && ntp_cfg.cloud_topic_enabled() == false;
+           && ntp_cfg.ntp().ns == model::kafka_namespace;
 }
 
 void archival_metadata_stm_factory::create(
