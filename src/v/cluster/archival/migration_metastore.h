@@ -56,6 +56,12 @@ public:
         ss::sstring ts_path;
         kafka::offset base_kafka_offset;
         kafka::offset last_kafka_offset;
+        // Offset-translation delta at the segment's base (segment_meta's
+        // delta_offset). Carried so the reader translates log offsets directly
+        // rather than inferring the delta from the first batch, which is wrong
+        // for a compacted front hole (base_kafka_offset stays put while the
+        // first surviving batch sits past it).
+        model::offset_delta delta_base;
     };
 
     /// The partition's current L1 offsets -- the mirror's durable progress

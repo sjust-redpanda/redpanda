@@ -86,8 +86,7 @@ ss::future<errc> migration_metastore_sink::append_imported(
             .imported = l1::imported_ts_info{
               .ts_path = std::move(s.ts_path),
               .segment_term = s.term,
-              .base_kafka_offset = s.base_kafka_offset,
-              .last_kafka_offset = s.last_kafka_offset,
+              .delta_base = s.delta_base,
             },
           });
         if (!added.has_value()) {

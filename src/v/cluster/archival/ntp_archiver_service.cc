@@ -2952,17 +2952,19 @@ ss::future<> ntp_archiver::run_migration_mirror() {
               if (meta.base_kafka_offset() >= meta.next_kafka_offset()) {
                   continue;
               }
-              to_append.push_back(migration_metastore::imported_segment{
-                .term = meta.segment_term,
-                .max_timestamp = meta.max_timestamp,
-                .size_bytes = meta.size_bytes,
-                .ts_path = sm.generate_segment_path(
-                              meta, remote_path_provider())()
-                             .native(),
-                .base_kafka_offset = meta.base_kafka_offset(),
-                .last_kafka_offset = kafka::prev_offset(
-                  meta.next_kafka_offset()),
-              });
+              to_append.push_back(
+                migration_metastore::imported_segment{
+                  .term = meta.segment_term,
+                  .max_timestamp = meta.max_timestamp,
+                  .size_bytes = meta.size_bytes,
+                  .ts_path = sm.generate_segment_path(
+                                 meta, remote_path_provider())()
+                               .native(),
+                  .base_kafka_offset = meta.base_kafka_offset(),
+                  .last_kafka_offset = kafka::prev_offset(
+                    meta.next_kafka_offset()),
+                  .delta_base = meta.delta_offset,
+                });
           }
           return ss::stop_iteration::no;
       });
