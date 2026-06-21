@@ -41,6 +41,18 @@ public:
         invalid,
     };
 
+    /// Whether the segment has an aborted-transaction (.tx) manifest, resolved
+    /// from the source segment_meta at mirror time so the L1 read path can skip
+    /// the object-storage probe where the answer is already known. Mirrors what
+    /// native tiered storage knows without a probe (see remote_segment.cc): a
+    /// v3 segment records its .tx size in metadata_size_hint (0 => none), and a
+    /// compacted segment has no aborted batches by construction; only v1/v2
+    /// non-compacted segments are unknowable without looking. Duplicated here
+    /// (rather than reusing the cloud_topics l1 enum) to keep cluster/archival
+    /// independent of cloud_topics; the sink maps it onto
+    /// l1::tx_manifest_state.
+    enum class tx_manifest_state { unknown, absent, present };
+
     /// One tiered-storage segment to register as an imported L1 extent. Carries
     /// the segment's location (ts_path) and data descriptor (delta/term) plus
     /// the per-segment timestamp/size/offset bounds needed to build the
@@ -62,6 +74,8 @@ public:
         // for a compacted front hole (base_kafka_offset stays put while the
         // first surviving batch sits past it).
         model::offset_delta delta_base;
+        // Whether this segment has a .tx manifest (resolved from segment_meta).
+        tx_manifest_state tx_state{tx_manifest_state::unknown};
     };
 
     /// The partition's current L1 offsets -- the mirror's durable progress

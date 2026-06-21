@@ -33,6 +33,23 @@ errc to_errc(l1::metastore::errc e) {
     }
     return errc::invalid;
 }
+
+// Map the archiver-side .tx-presence state onto the l1 read-path enum. The two
+// enums are kept separate so cluster/archival need not depend on cloud_topics;
+// this is the single point that bridges them.
+l1::tx_manifest_state
+to_l1_tx_state(archival::migration_metastore::tx_manifest_state s) {
+    using src = archival::migration_metastore::tx_manifest_state;
+    switch (s) {
+    case src::unknown:
+        return l1::tx_manifest_state::unknown;
+    case src::absent:
+        return l1::tx_manifest_state::absent;
+    case src::present:
+        return l1::tx_manifest_state::present;
+    }
+    return l1::tx_manifest_state::unknown;
+}
 } // namespace
 
 std::optional<model::topic_id_partition>
@@ -87,6 +104,7 @@ ss::future<errc> migration_metastore_sink::append_imported(
               .ts_path = l1::ts_segment_path{std::move(s.ts_path)},
               .segment_term = s.term,
               .delta_base = s.delta_base,
+              .tx_state = to_l1_tx_state(s.tx_state),
             },
           });
         if (!added.has_value()) {

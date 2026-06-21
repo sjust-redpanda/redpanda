@@ -31,6 +31,7 @@
 #include "cluster/archival/archival_policy.h"
 #include "cluster/archival/logger.h"
 #include "cluster/archival/migration_metastore.h"
+#include "cluster/archival/migration_segment.h"
 #include "cluster/archival/replica_state_validator.h"
 #include "cluster/archival/retention_calculator.h"
 #include "cluster/archival/scrubber.h"
@@ -2942,29 +2943,18 @@ ss::future<> ntp_archiver::run_migration_mirror() {
               if (meta.base_kafka_offset() < append_from) {
                   continue;
               }
-              // Skip segments with no kafka-addressable records (e.g. one
-              // holding only control/config batches, or a fully-compacted-away
-              // segment): next_kafka_offset == base_kafka_offset. L1 is keyed on
-              // kafka offsets, so such a segment imports nothing; building an
-              // extent for it yields last_kafka_offset = base_kafka_offset - 1,
-              // an inverted (base > last) extent that the metastore rejects --
-              // failing the whole append and stalling the mirror.
-              if (meta.base_kafka_offset() >= meta.next_kafka_offset()) {
-                  continue;
+              // Resolve the per-segment imported descriptor (offset bounds, the
+              // delta-base sentinel guard, and the .tx-presence state) from
+              // segment_meta; nullopt means the segment has no
+              // Kafka-addressable records and is skipped. See
+              // make_imported_segment.
+              auto seg = make_imported_segment(
+                meta,
+                sm.generate_segment_path(meta, remote_path_provider())()
+                  .native());
+              if (seg.has_value()) {
+                  to_append.push_back(std::move(*seg));
               }
-              to_append.push_back(
-                migration_metastore::imported_segment{
-                  .term = meta.segment_term,
-                  .max_timestamp = meta.max_timestamp,
-                  .size_bytes = meta.size_bytes,
-                  .ts_path = sm.generate_segment_path(
-                                 meta, remote_path_provider())()
-                               .native(),
-                  .base_kafka_offset = meta.base_kafka_offset(),
-                  .last_kafka_offset = kafka::prev_offset(
-                    meta.next_kafka_offset()),
-                  .delta_base = meta.delta_offset,
-                });
           }
           return ss::stop_iteration::no;
       });
