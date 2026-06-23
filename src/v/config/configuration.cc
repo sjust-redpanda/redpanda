@@ -5040,6 +5040,19 @@ configuration::configuration()
       "removal.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       1h)
+  , cloud_topics_preserve_imported_ts_backing_objects(
+      *this,
+      "cloud_topics_preserve_imported_ts_backing_objects",
+      "When true (the default), the cloud-topics garbage collector does not "
+      "delete the backing tiered-storage objects (segment, .tx, and .index) of "
+      "an imported extent -- only its L1 metadata row is removed. This "
+      "preserves the original tiered-storage data of a topic migrated from "
+      "tiered storage so the migration can be recovered as a tiered-storage "
+      "topic; the leftover objects of a confirmed-good migration are reclaimed "
+      "out of band. Set false to let the GC delete imported backing objects "
+      "(pre-migration behavior). Has no effect on native cloud-topic objects.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      true)
   , cloud_topics_num_metastore_partitions(
       *this,
       "cloud_topics_num_metastore_partitions",

@@ -503,11 +503,23 @@ ss::future<std::expected<void, io::errc>> file_io::delete_objects(
     static constexpr auto backoff = 100ms;
     retry_chain_node root(*as, ss::lowres_clock::now() + timeout, backoff);
 
+    // When set, keep the backing tiered-storage objects of imported extents in
+    // place: the caller still drops the L1 row, but the segment/.tx/.index stay
+    // so a topic migrated from tiered storage remains recoverable as TS. Native
+    // L1 objects are unaffected.
+    const bool preserve_imported
+      = config::shard_local_cfg()
+          .cloud_topics_preserve_imported_ts_backing_objects();
     chunked_vector<cloud_storage_clients::object_key> native_keys;
     chunked_vector<cloud_storage_clients::object_key> ts_keys;
     size_t ts_count = 0;
+    size_t preserved_count = 0;
     for (const auto& obj : objects) {
         if (obj.ts_path.has_value()) {
+            if (preserve_imported) {
+                ++preserved_count;
+                continue;
+            }
             ++ts_count;
             // An imported segment owns three cloud objects (the segment, its
             // .tx range manifest, and its .index), the same set the archiver
@@ -551,6 +563,14 @@ ss::future<std::expected<void, io::errc>> file_io::delete_objects(
               res.error());
             co_return res;
         }
+    }
+    if (preserved_count > 0) {
+        vlog(
+          cd_log.debug,
+          "Preserved backing tiered-storage objects for {} imported extent(s) "
+          "(cloud_topics_preserve_imported_ts_backing_objects); their L1 rows "
+          "are still removed",
+          preserved_count);
     }
     co_return std::expected<void, io::errc>{};
 }

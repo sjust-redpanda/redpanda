@@ -18,6 +18,7 @@
 #include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
 #include "cloud_topics/level_one/common/ts_object.h"
+#include "config/configuration.h"
 
 namespace cloud_topics::l1 {
 
@@ -206,11 +207,18 @@ fake_io::open_object(
 
 ss::future<std::expected<void, io::errc>> fake_io::delete_objects(
   chunked_vector<object_location> objects, ss::abort_source*) {
+    const bool preserve_imported
+      = config::shard_local_cfg()
+          .cloud_topics_preserve_imported_ts_backing_objects();
     for (const auto& obj : objects) {
         if (obj.ts_path.has_value()) {
             // Imported object: its backing segment is addressed by ts_path
-            // (mirrors file_io's path routing).
-            _ts_storage.erase(*obj.ts_path);
+            // (mirrors file_io's path routing). When preservation is enabled,
+            // keep the backing in place (only the L1 row is dropped by the
+            // caller) so a migrated-from-TS topic stays recoverable.
+            if (!preserve_imported) {
+                _ts_storage.erase(*obj.ts_path);
+            }
         } else {
             remove_object(obj.id);
         }
