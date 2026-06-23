@@ -129,7 +129,18 @@ model::offset replicated_partition::high_watermark() const {
             return model::offset(0);
         }
     }
-    return _translator->from_log_offset(_partition->high_watermark());
+    auto hwm = _translator->from_log_offset(_partition->high_watermark());
+    // A partition served from tiered storage whose local log does not cover its
+    // cloud data reports the cloud high watermark. This is the case for a
+    // partition mid tiered->cloud migration whose local log was wiped by cluster
+    // recovery: its data lives in the cloud manifest, so without this the (empty)
+    // local log would report high watermark 0 and hide the recovered prefix from
+    // ListOffsets and consumers. For a healthy partition the cloud watermark
+    // never exceeds the local one (uploads lag production), so this is a no-op.
+    if (_partition->cloud_data_available()) {
+        hwm = std::max(hwm, _partition->next_cloud_offset());
+    }
+    return hwm;
 }
 /**
  * According to Kafka protocol semantics a log_end_offset is an offset that
@@ -292,7 +303,7 @@ replicated_partition::aborted_transactions_remote(
  */
 bool replicated_partition::may_read_from_cloud(
   kafka::offset start_offset) const {
-    return _partition->is_remote_fetch_enabled()
+    return _partition->is_remote_fetch_enabled_or_migrating()
            && _partition->cloud_data_available()
            && (start_offset < model::offset_cast(_translator->from_log_offset(_partition->raft_start_offset())));
 }
@@ -472,7 +483,7 @@ model::offset replicated_partition::partition_kafka_start_offset() const {
     auto local_kafka_start_offset = _translator->from_log_offset(
       _partition->raft_start_offset());
     if (
-      _partition->is_remote_fetch_enabled()
+      _partition->is_remote_fetch_enabled_or_migrating()
       && _partition->cloud_data_available()
       && (_partition->start_cloud_offset() < local_kafka_start_offset)) {
         return _partition->start_cloud_offset();
@@ -555,7 +566,7 @@ replicated_partition::get_leader_epoch_last_offset_unbounded(
     // Check cloud storage for a viable offset.
     if (
       is_read_replica
-      || (_partition->is_remote_fetch_enabled() && _partition->cloud_data_available())) {
+      || (_partition->is_remote_fetch_enabled_or_migrating() && _partition->cloud_data_available())) {
         if (is_read_replica && !_partition->cloud_data_available()) {
             // If we didn't sync the manifest yet the cloud_data_available will
             // return false. We can't call `get_cloud_term_last_offset` in this
