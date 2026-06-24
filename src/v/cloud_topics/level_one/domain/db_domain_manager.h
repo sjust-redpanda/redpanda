@@ -42,7 +42,8 @@ public:
       cloud_storage_clients::bucket_name bucket,
       io* object_io,
       ss::scheduling_group sg,
-      domain_manager_probe* probe);
+      domain_manager_probe* probe,
+      preserve_imported_backing_fn preserve_imported = {});
 
     void start() override;
     ss::future<> stop_and_wait() override;
@@ -245,6 +246,9 @@ private:
     cloud_storage_clients::bucket_name bucket_;
     io* object_io_;
     ss::scheduling_group sg_;
+    // Per-topic decision for whether GC preserves an imported segment's backing
+    // tiered-storage objects (recover-as-TS). Passed to each GC pass.
+    preserve_imported_backing_fn preserve_imported_;
 
     ss::shared_ptr<stm> stm_;
 

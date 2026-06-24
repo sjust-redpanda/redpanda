@@ -21,6 +21,7 @@
 #include <seastar/core/sstring.hh>
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 
 namespace cloud_topics::l1 {
@@ -127,5 +128,13 @@ struct object_location {
     object_id id;
     std::optional<ts_segment_path> ts_path;
 };
+
+/// Decides whether to preserve an imported segment's backing tiered-storage
+/// objects (segment + .tx + .index) when garbage collection drops its L1
+/// extent. true => keep them in object storage (the L1 row is still removed) so
+/// a topic migrated from tiered storage stays recoverable as TS. Resolved per
+/// topic, so the GC consults it with the imported object's owning partition.
+using preserve_imported_backing_fn
+  = std::function<bool(const model::topic_id_partition&)>;
 
 } // namespace cloud_topics::l1

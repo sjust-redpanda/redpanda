@@ -75,12 +75,15 @@ meta_to_rpc_extent_metadata(metastore::extent_metadata_vec v) {
 } // namespace
 
 simple_domain_manager::simple_domain_manager(
-  ss::shared_ptr<simple_stm> stm, io* io)
+  ss::shared_ptr<simple_stm> stm,
+  io* io,
+  preserve_imported_backing_fn preserve_imported)
   : gc_interval_(
       config::shard_local_cfg()
         .cloud_topics_long_term_garbage_collection_interval)
   , stm_(std::move(stm))
-  , object_io_(io) {
+  , object_io_(io)
+  , preserve_imported_(std::move(preserve_imported)) {
     gc_interval_.watch([this]() { sem_.signal(); });
 }
 
@@ -897,7 +900,7 @@ ss::future<> simple_domain_manager::gc_loop() {
     }
 
     // TODO: make configurable.
-    garbage_collector gc(stm_.get(), object_io_);
+    garbage_collector gc(stm_.get(), object_io_, preserve_imported_);
     auto ntp = stm_->raft()->log()->config().ntp();
     while (!as_.abort_requested()) {
         vlog(cd_log.debug, "{} - Running garbage collection now...", ntp);

@@ -84,7 +84,6 @@ redpanda_cc_gtest(
         "//src/v/raft/tests:raft_fixture",
         "//src/v/storage:record_batch_builder",
         "//src/v/test_utils:gtest",
-        "//src/v/test_utils:scoped_config",
         "@googletest//:gtest",
     ],
 )

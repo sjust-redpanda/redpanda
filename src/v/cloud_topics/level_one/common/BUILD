@@ -191,7 +191,6 @@ redpanda_cc_library(
         ":object",
         ":ts_object",
         "//src/v/cloud_storage",
-        "//src/v/config",
     ],
     deps = [
         ":abstract_io",

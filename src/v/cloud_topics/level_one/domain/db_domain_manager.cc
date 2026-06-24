@@ -245,13 +245,15 @@ db_domain_manager::db_domain_manager(
   cloud_storage_clients::bucket_name bucket,
   io* object_io,
   ss::scheduling_group sg,
-  domain_manager_probe* probe)
+  domain_manager_probe* probe,
+  preserve_imported_backing_fn preserve_imported)
   : expected_term_(expected_term)
   , cache_(cache)
   , remote_(remote)
   , bucket_(std::move(bucket))
   , object_io_(object_io)
   , sg_(sg)
+  , preserve_imported_(std::move(preserve_imported))
   , stm_(std::move(stm))
   , gc_interval_(
       config::shard_local_cfg()
@@ -1847,7 +1849,7 @@ ss::future<> db_domain_manager::gc_loop() {
     }
 
     auto ntp = stm_->raft()->log()->config().ntp();
-    db_garbage_collector gc(object_io_, probe_);
+    db_garbage_collector gc(object_io_, probe_, preserve_imported_);
     while (!as_.abort_requested()) {
         // NOTE: even though the garbage collector will remove objects and
         // actually write to the database, we don't need to take entity locks.

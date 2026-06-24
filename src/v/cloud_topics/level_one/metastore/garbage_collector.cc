@@ -17,9 +17,11 @@
 
 namespace cloud_topics::l1 {
 
-garbage_collector::garbage_collector(simple_stm* stm, io* io)
+garbage_collector::garbage_collector(
+  simple_stm* stm, io* io, preserve_imported_backing_fn preserve)
   : stm_(stm)
-  , io_(io) {}
+  , io_(io)
+  , preserve_imported_(std::move(preserve)) {}
 
 ss::future<std::expected<void, garbage_collector::error>>
 garbage_collector::remove_unreferenced_objects(ss::abort_source* as) {
@@ -32,6 +34,9 @@ garbage_collector::remove_unreferenced_objects(ss::abort_source* as) {
     const auto& s = stm_->state();
 
     chunked_vector<object_location> to_remove;
+    // Subset whose backing object storage should be deleted (excludes imported
+    // segments whose topic opts to preserve its tiered-storage data).
+    chunked_vector<object_location> to_delete;
     for (const auto& [oid, obj_entry] : s.objects) {
         if (obj_entry.is_preregistration) {
             continue;
@@ -42,24 +47,32 @@ garbage_collector::remove_unreferenced_objects(ss::abort_source* as) {
 
         // TODO: split these into multiple updates in case we've got a lot of
         // objects to remove.
-        to_remove.push_back(
-          object_location{
-            .id = oid,
-            .ts_path = obj_entry.imported_ts_location.transform(
-              [](const imported_ts_object_location& loc) {
-                  return loc.ts_path;
-              })});
+        object_location loc{
+          .id = oid,
+          .ts_path = obj_entry.imported_ts_location.transform(
+            [](const imported_ts_object_location& l) { return l.ts_path; })};
+        const bool preserve = obj_entry.imported_ts_location.has_value()
+                              && preserve_imported_
+                              && preserve_imported_(
+                                obj_entry.imported_ts_location->tidp);
+        if (!preserve) {
+            to_delete.push_back(loc);
+        }
+        to_remove.push_back(std::move(loc));
         vlog(cd_log.debug, "Deleting L1 object: {}", oid);
     }
     if (to_remove.empty()) {
         co_return std::expected<void, error>{};
     }
-    co_return co_await remove_objects(std::move(to_remove), as);
+    co_return co_await remove_objects(
+      std::move(to_remove), std::move(to_delete), as);
 }
 
 ss::future<std::expected<void, garbage_collector::error>>
 garbage_collector::remove_objects(
-  chunked_vector<object_location> to_remove, ss::abort_source* as) {
+  chunked_vector<object_location> to_remove,
+  chunked_vector<object_location> to_delete,
+  ss::abort_source* as) {
     if (to_remove.empty()) {
         co_return std::expected<void, error>{};
     }
@@ -67,7 +80,9 @@ garbage_collector::remove_objects(
     if (!sync_res.has_value()) {
         co_return std::unexpected(error{"sync error"});
     }
-    auto del_res = co_await io_->delete_objects(to_remove.copy(), as);
+    // Delete backing storage only for the to_delete subset; preserved imported
+    // segments keep their objects but still have their rows dropped below.
+    auto del_res = co_await io_->delete_objects(std::move(to_delete), as);
     if (!del_res.has_value()) {
         co_return std::unexpected(error{"io error"});
     }

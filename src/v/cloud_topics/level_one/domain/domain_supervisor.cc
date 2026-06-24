@@ -325,6 +325,18 @@ private:
           dm_id,
           *expected_term);
 
+        // Whether GC preserves an imported segment's backing tiered-storage
+        // objects (so a topic migrated from tiered storage stays recoverable as
+        // TS). The supervisor owns the controller, so this is the seam for a
+        // per-topic decision; for now it is a single cluster-wide switch.
+        // TODO: resolve per topic via _controller's topic config keyed on the
+        // imported object's topic_id_partition.
+        preserve_imported_backing_fn preserve_imported =
+          [](const model::topic_id_partition&) {
+              return config::shard_local_cfg()
+                .cloud_topics_preserve_imported_ts_backing_objects();
+          };
+
         ss::shared_ptr<domain_manager> domain_mgr;
         auto& stm_manager = (*partition)->raft()->stm_manager();
         if (stm_manager->get<stm>()) {
@@ -336,10 +348,13 @@ private:
               _bucket,
               _object_io,
               _sg,
-              &_probe);
+              &_probe,
+              preserve_imported);
         } else {
             domain_mgr = ss::make_shared<simple_domain_manager>(
-              stm_manager->get<simple_stm>(), _object_io);
+              stm_manager->get<simple_stm>(),
+              _object_io,
+              std::move(preserve_imported));
         }
         domain_mgr->start();
         _domains.emplace(dm_id, std::move(domain_mgr));

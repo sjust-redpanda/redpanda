@@ -26,21 +26,27 @@ class simple_stm;
 
 class garbage_collector {
 public:
-    garbage_collector(simple_stm* stm, io* io);
+    garbage_collector(
+      simple_stm* stm, io* io, preserve_imported_backing_fn preserve = {});
 
     using error = named_type<ss::sstring, struct gc_error_tag>;
     ss::future<std::expected<void, error>>
     remove_unreferenced_objects(ss::abort_source*);
 
-    // Deletes the given objects' backing storage from object storage (for an
-    // imported segment, also its .tx and .index) and drops their metastore rows.
+    // Drops the metastore rows for `to_remove`, and deletes the backing object
+    // storage (for an imported segment, the segment + .tx + .index) only for
+    // `to_delete` -- a subset excluding imported segments whose topic opts to
+    // preserve its tiered-storage data for recover-as-TS.
     ss::future<std::expected<void, error>> remove_objects(
-      chunked_vector<object_location> to_remove, ss::abort_source*);
+      chunked_vector<object_location> to_remove,
+      chunked_vector<object_location> to_delete,
+      ss::abort_source*);
 
 private:
     // Callers are expected to ensure this object outlives the stm and io.
     simple_stm* stm_;
     io* io_;
+    preserve_imported_backing_fn preserve_imported_;
 };
 
 } // namespace cloud_topics::l1

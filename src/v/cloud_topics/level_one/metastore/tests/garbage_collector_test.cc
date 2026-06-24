@@ -18,7 +18,6 @@
 #include "model/fundamental.h"
 #include "raft/tests/raft_fixture.h"
 #include "storage/record_batch_builder.h"
-#include "test_utils/scoped_config.h"
 
 using namespace cloud_topics::l1;
 
@@ -256,13 +255,6 @@ TEST_F(GarbageCollectorTest, TestGarbageCollectPartiallyRemovedObjects) {
 }
 
 TEST_F(GarbageCollectorTest, TestGarbageCollectImportedObject) {
-    // Exercise the deletion path: clear the preservation gate (default-on) so
-    // GC removes the backing TS objects rather than retaining them for
-    // recover-as-tiered-storage.
-    scoped_config cfg;
-    cfg.get("cloud_topics_preserve_imported_ts_backing_objects")
-      .set_value(false);
-
     initialize_state_machines(1).get();
     wait_for_leader(5s).get();
     auto stm = get_stm<0>(*nodes().begin()->second);
@@ -276,6 +268,7 @@ TEST_F(GarbageCollectorTest, TestGarbageCollectImportedObject) {
     // Trim past the imported extent so the object becomes unreferenced.
     set_start_offset(stm.get(), tp, o{105}).get();
 
+    // Default GC (no preserve predicate): the backing is deleted.
     garbage_collector gc(stm.get(), &_io);
     auto gc_res = gc.remove_unreferenced_objects(&never_abort).get();
     ASSERT_TRUE(gc_res.has_value());
@@ -284,6 +277,32 @@ TEST_F(GarbageCollectorTest, TestGarbageCollectImportedObject) {
     // (routed by ts_path, not the object id).
     EXPECT_EQ(0, stm->state().objects.size());
     EXPECT_FALSE(_io.has_ts_segment(ts_path));
+}
+
+TEST_F(GarbageCollectorTest, TestGarbageCollectImportedObjectPreserved) {
+    initialize_state_machines(1).get();
+    wait_for_leader(5s).get();
+    auto stm = get_stm<0>(*nodes().begin()->second);
+
+    auto tp = make_tp(0);
+    const ts_segment_path ts_path{"imported/seg-100-104.log"};
+    add_imported_object(stm.get(), tp, ts_path, o{100}, o{104}).get();
+    EXPECT_EQ(1, stm->state().objects.size());
+    EXPECT_TRUE(_io.has_ts_segment(ts_path));
+
+    set_start_offset(stm.get(), tp, o{105}).get();
+
+    // A predicate that preserves this topic's backing: the L1 row is still
+    // dropped, but the tiered-storage segment is kept for recover-as-TS.
+    garbage_collector gc(
+      stm.get(), &_io, [tp](const model::topic_id_partition& t) {
+          return t == tp;
+      });
+    auto gc_res = gc.remove_unreferenced_objects(&never_abort).get();
+    ASSERT_TRUE(gc_res.has_value());
+
+    EXPECT_EQ(0, stm->state().objects.size());
+    EXPECT_TRUE(_io.has_ts_segment(ts_path));
 }
 
 // A fake_io wrapper that fails on delete_objects

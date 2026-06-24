@@ -82,9 +82,11 @@ db_garbage_collector::error wrap_db_err(
 }
 } // namespace
 
-db_garbage_collector::db_garbage_collector(io* io, domain_manager_probe* probe)
+db_garbage_collector::db_garbage_collector(
+  io* io, domain_manager_probe* probe, preserve_imported_backing_fn preserve)
   : io_(io)
-  , probe_(probe) {}
+  , probe_(probe)
+  , preserve_imported_(std::move(preserve)) {}
 
 ss::future<std::expected<std::optional<object_id>, db_garbage_collector::error>>
 db_garbage_collector::remove_unreferenced_batch(
@@ -118,6 +120,10 @@ db_garbage_collector::remove_unreferenced_batch(
     }
     auto object_gen = object_range_res.value().get_rows();
     chunked_vector<object_location> to_remove;
+    // Subset of `to_remove` whose backing object storage should actually be
+    // deleted: excludes imported segments whose topic opts to preserve its
+    // tiered-storage data for recover-as-TS (their L1 rows are still dropped).
+    chunked_vector<object_location> to_delete;
     size_t batch_expire_count = 0;
     std::optional<object_id> next_batch_start{std::nullopt};
     while (auto obj_ref_opt = co_await object_gen()) {
@@ -178,13 +184,22 @@ db_garbage_collector::remove_unreferenced_batch(
           obj_entry.removed_data_size == obj_entry.total_data_size
           && obj_entry.last_updated <= deletion_delay_cutoff) {
             vlog(cd_log.debug, "Deleting L1 object: {}", oid);
-            to_remove.push_back(
-              object_location{
-                .id = oid,
-                .ts_path = obj_entry.imported_ts_location.transform(
-                  [](const imported_ts_object_location& loc) {
-                      return loc.ts_path;
-                  })});
+            object_location loc{
+              .id = oid,
+              .ts_path = obj_entry.imported_ts_location.transform(
+                [](const imported_ts_object_location& l) {
+                    return l.ts_path;
+                })};
+            // Keep an imported segment's backing objects when its topic opts to
+            // preserve them (recover-as-TS); the L1 row is still removed.
+            const bool preserve = obj_entry.imported_ts_location.has_value()
+                                  && preserve_imported_
+                                  && preserve_imported_(
+                                    obj_entry.imported_ts_location->tidp);
+            if (!preserve) {
+                to_delete.push_back(loc);
+            }
+            to_remove.push_back(std::move(loc));
             if (to_remove.size() + batch_expire_count == batch_size) {
                 // Set an explicit next starting object if we had more than one
                 // batch of objects so we can make incremental progress.
@@ -205,7 +220,8 @@ db_garbage_collector::remove_unreferenced_batch(
         co_return next_batch_start;
     }
 
-    auto remove_res = co_await remove_objects(db, std::move(to_remove), as);
+    auto remove_res = co_await remove_objects(
+      db, std::move(to_remove), std::move(to_delete), as);
     if (!remove_res.has_value()) {
         co_return std::unexpected(std::move(remove_res.error()));
     }
@@ -216,12 +232,16 @@ ss::future<std::expected<void, db_garbage_collector::error>>
 db_garbage_collector::remove_objects(
   replicated_database* db,
   chunked_vector<object_location> to_remove,
+  chunked_vector<object_location> to_delete,
   ss::abort_source* as) {
     if (to_remove.empty()) {
         co_return std::expected<void, error>{};
     }
     auto num_to_remove = to_remove.size();
-    auto del_res = co_await io_->delete_objects(to_remove.copy(), as);
+    // Delete the backing object storage only for the to_delete subset;
+    // preserved imported segments are excluded but their rows are still dropped
+    // below.
+    auto del_res = co_await io_->delete_objects(std::move(to_delete), as);
     if (!del_res.has_value()) {
         co_return std::unexpected(error(
           errc::io_error, "Error deleting objects: {}", del_res.error()));

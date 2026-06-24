@@ -46,7 +46,10 @@ public:
     };
     using error = detailed_error<errc>;
 
-    explicit db_garbage_collector(io* io, domain_manager_probe* probe);
+    explicit db_garbage_collector(
+      io* io,
+      domain_manager_probe* probe,
+      preserve_imported_backing_fn preserve_imported = {});
 
     // Removes all unreferenced objects from cloud storage, and collects stale
     // preregistered objects that need expiry. Returns the list of object IDs
@@ -60,11 +63,15 @@ public:
       model::timestamp prereg_expiry_cutoff,
       model::timestamp deletion_delay_cutoff);
 
-    // Deletes the given objects' backing storage from object storage (for an
-    // imported segment, also its .tx and .index) and drops their metastore rows.
+    // Drops the metastore rows for `to_remove`, and deletes the backing object
+    // storage (for an imported segment, the segment + .tx + .index) only for
+    // `to_delete` -- a subset that excludes imported segments whose topic opts
+    // to preserve its tiered-storage data for recover-as-TS. `to_delete` must
+    // be a subset of `to_remove`.
     ss::future<std::expected<void, error>> remove_objects(
       replicated_database*,
       chunked_vector<object_location> to_remove,
+      chunked_vector<object_location> to_delete,
       ss::abort_source*);
 
 private:
@@ -84,6 +91,7 @@ private:
 
     io* io_;
     domain_manager_probe* probe_;
+    preserve_imported_backing_fn preserve_imported_;
 };
 
 inline fmt::iterator

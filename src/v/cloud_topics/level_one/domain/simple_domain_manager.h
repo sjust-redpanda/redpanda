@@ -25,7 +25,10 @@ class io;
 // 2. TODO: reconciles the STM state with cloud-recoverable state.
 class simple_domain_manager final : public domain_manager {
 public:
-    explicit simple_domain_manager(ss::shared_ptr<simple_stm> stm, io* io);
+    explicit simple_domain_manager(
+      ss::shared_ptr<simple_stm> stm,
+      io* io,
+      preserve_imported_backing_fn preserve_imported = {});
 
     void start() override;
     ss::future<> stop_and_wait() override;
@@ -126,6 +129,7 @@ private:
     ss::abort_source as_;
     ss::shared_ptr<simple_stm> stm_;
     io* object_io_;
+    preserve_imported_backing_fn preserve_imported_;
 };
 
 } // namespace cloud_topics::l1

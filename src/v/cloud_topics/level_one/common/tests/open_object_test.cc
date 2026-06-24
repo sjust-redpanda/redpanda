@@ -16,13 +16,11 @@
 #include "cloud_topics/level_one/common/object.h"
 #include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
-#include "container/chunked_vector.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/record_batch_types.h"
 #include "model/tests/random_batch.h"
 #include "storage/record_batch_utils.h"
-#include "test_utils/scoped_config.h"
 
 #include <seastar/util/defer.hh>
 
@@ -735,57 +733,4 @@ TEST(OpenObjectTsTest, MissingTsSegmentReturnsError) {
       = fio.open_object(extent, &as, cloud_io::group_id::default_group).get();
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), io::errc::cloud_missing_object);
-}
-
-// ── Group D: delete_objects imported-backing preservation gate ───────────────
-
-// With cloud_topics_preserve_imported_ts_backing_objects set (the default),
-// delete_objects must keep an imported extent's backing TS segment in place
-// (only its L1 row is dropped, by the GC caller) so a topic migrated from
-// tiered storage stays recoverable -- while still deleting native L1 objects.
-TEST(OpenObjectTsTest, DeleteObjectsPreservesImportedBackingWhenSet) {
-    scoped_config cfg;
-    cfg.get("cloud_topics_preserve_imported_ts_backing_objects")
-      .set_value(true);
-
-    fake_io fio;
-    const ts_segment_path ts_path{"00000000000000000000-1-v1.log"};
-    fio.put_ts_segment(ts_path, make_ts_segment(make_batch(0_o, 9_o)));
-    auto native = make_and_store(fio);
-    ASSERT_TRUE(fio.has_ts_segment(ts_path));
-    ASSERT_TRUE(fio.get_object(native.oid).has_value());
-
-    chunked_vector<object_location> to_delete;
-    to_delete.push_back(
-      object_location{.id = create_object_id(), .ts_path = ts_path});
-    to_delete.push_back(object_location{.id = native.oid});
-    ss::abort_source as;
-    auto res = fio.delete_objects(std::move(to_delete), &as).get();
-    ASSERT_TRUE(res.has_value());
-
-    // Imported backing preserved; native object deleted.
-    EXPECT_TRUE(fio.has_ts_segment(ts_path));
-    EXPECT_FALSE(fio.get_object(native.oid).has_value());
-}
-
-// With the gate cleared, delete_objects removes the imported backing too
-// (pre-migration behavior).
-TEST(OpenObjectTsTest, DeleteObjectsRemovesImportedBackingWhenClear) {
-    scoped_config cfg;
-    cfg.get("cloud_topics_preserve_imported_ts_backing_objects")
-      .set_value(false);
-
-    fake_io fio;
-    const ts_segment_path ts_path{"00000000000000000000-1-v1.log"};
-    fio.put_ts_segment(ts_path, make_ts_segment(make_batch(0_o, 9_o)));
-    ASSERT_TRUE(fio.has_ts_segment(ts_path));
-
-    chunked_vector<object_location> to_delete;
-    to_delete.push_back(
-      object_location{.id = create_object_id(), .ts_path = ts_path});
-    ss::abort_source as;
-    auto res = fio.delete_objects(std::move(to_delete), &as).get();
-    ASSERT_TRUE(res.has_value());
-
-    EXPECT_FALSE(fio.has_ts_segment(ts_path));
 }
