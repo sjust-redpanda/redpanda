@@ -109,6 +109,7 @@ redpanda_cc_library(
         "//src/v/redpanda/admin:kafka_connections_service",
         "//src/v/redpanda/admin/proxy:client",
         "//src/v/redpanda/admin/proxy:service",
+        "//src/v/redpanda/admin/services:cloud_topic_migration",
         "//src/v/redpanda/admin/services:cluster",
         "//src/v/redpanda/admin/services:features",
         "//src/v/redpanda/admin/services:security",

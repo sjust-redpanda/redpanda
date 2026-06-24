@@ -45,7 +45,12 @@ from ducktape.utils.util import wait_until
 
 from connectrpc.errors import ConnectError, ConnectErrorCode
 
-from rptest.clients.admin.v2 import Admin as AdminV2, metastore_pb, ntp_pb
+from rptest.clients.admin.v2 import (
+    Admin as AdminV2,
+    cloud_topic_migration_pb,
+    metastore_pb,
+    ntp_pb,
+)
 from rptest.clients.rpk import RpkTool, RpkException
 from rptest.clients.types import TopicSpec
 from rptest.services.admin import Admin
@@ -85,6 +90,7 @@ class TsToCtMigrationTest(RedpandaTest):
     TOPIC_NO_ARCHIVE_LOCAL = "ts-ct-migration-no-archive-local-test"
     TOPIC_NO_ARCHIVE_EMPTY = "ts-ct-migration-no-archive-empty-test"
     TOPIC_COMPACT_REUP = "ts-ct-migration-compact-reupload-test"
+    TOPIC_RECLAIM = "ts-ct-migration-reclaim-test"
 
     # Transactional parameters. msgs_per_transaction is intentionally large so
     # that when the migration trigger fires mid-stream at least one in-flight
@@ -191,6 +197,38 @@ class TsToCtMigrationTest(RedpandaTest):
             if e.code == ConnectErrorCode.NOT_FOUND:
                 return None
             raise
+
+    def _l1_start_offset(self, topic: str, partition: int = 0) -> int | None:
+        """The L1 metastore's start_offset for the partition. Imported extents
+        whose entire range sits at or below this have been retention-expired by
+        the cloud topic and are reclaim candidates. None if the partition is
+        absent from the metastore."""
+        metastore = AdminV2(self.redpanda).metastore()
+        req = metastore_pb.GetOffsetsRequest(
+            partition=ntp_pb.TopicPartition(topic=topic, partition=partition))
+        try:
+            resp = metastore.get_offsets(req=req)
+            return resp.offsets.start_offset
+        except ConnectError as e:
+            if e.code == ConnectErrorCode.NOT_FOUND:
+                return None
+            raise
+
+    def _reclaim_migrated_backing(self, topic: str, delete: bool):
+        """Invoke the reclaim sweep admin endpoint for `topic`."""
+        client = AdminV2(self.redpanda).cloud_topic_migration()
+        req = cloud_topic_migration_pb.ReclaimMigratedBackingRequest(
+            topic=topic, delete_unreferenced=delete)
+        return client.reclaim_migrated_backing(req=req)
+
+    def _count_topic_objects(self, topic: str) -> int:
+        """Count tiered-storage objects in the bucket for `topic`. The TS
+        objects (migrated segments, .tx, .index, manifests) are keyed by topic
+        name; the native L1 objects are keyed by topic id, so this counts only
+        the migration backing."""
+        objs = self.redpanda.cloud_storage_client.list_objects(
+            self.redpanda.si_settings.cloud_storage_bucket, topic=topic)
+        return sum(1 for _ in objs)
 
     def _wait_for_cutover_all(self, topic: str, num_partitions: int):
         """Wait until every partition of the topic has cut over (its archival
@@ -1933,6 +1971,118 @@ class TsToCtMigrationTest(RedpandaTest):
         assert status.valid_reads >= acked, \
             f"records lost across restart: read {status.valid_reads} < " \
             f"acked {acked}"
+        consumer.stop()
+        consumer.free()
+
+    @cluster(num_nodes=2)
+    def test_ts_to_ct_migration_reclaim(self):
+        """Reclaim the leftover tiered-storage backing of a fully migrated
+        topic. After cutover a prefix trim advances the L1 start offset so the
+        cloud topic retention-expires the oldest imported extents; their TS
+        backing is preserved (redpanda.cloud_topic.preserve_migrated_ts defaults
+        on), accumulating orphans. The reclaim endpoint then: (1) dry-run reports
+        the unreferenced backing without touching the bucket; (2) refuses to
+        delete while preserve is still set; (3) after preserve is disabled,
+        deletes the unreferenced objects, leaving the live cloud topic intact."""
+        self._enable_migration()
+        topic = self.TOPIC_RECLAIM
+        produced = 4000
+        self.rpk.create_topic(
+            topic,
+            partitions=1,
+            replicas=1,
+            config={
+                TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED,
+                "segment.bytes": str(32 * 1024),
+                "retention.local.target.bytes": str(64 * 1024),
+            },
+        )
+        KgoVerifierProducer.oneshot(
+            self.test_context,
+            self.redpanda,
+            topic,
+            msg_size=self.MSG_SIZE,
+            msg_count=produced,
+            timeout_sec=120,
+        )
+
+        # Several uploaded TS segments so a post-cutover trim leaves whole
+        # imported extents below the new start (the reclaim candidates).
+        wait_until(
+            lambda: len(self.admin.get_partition_manifest(topic, 0).get(
+                "segments", {})) >= 3,
+            timeout_sec=120,
+            backoff_sec=2,
+            err_msg="not enough TS segments uploaded to reclaim",
+            retry_on_exc=True,
+        )
+
+        self._trigger_migration(topic, TopicSpec.STORAGE_MODE_CLOUD)
+        self._wait_for_cutover(topic)
+
+        # The imported TS backing is present and preserved after cutover.
+        backing_before = self._count_topic_objects(topic)
+        assert backing_before > 0, "no TS backing present after cutover"
+
+        # Advance the L1 start offset past the oldest imported extents. Post
+        # cutover L1 owns retention, so the dropped extents' backing is
+        # preserved (default), turning them into orphans.
+        trim_offset = produced // 2
+        self.rpk.trim_prefix(topic, trim_offset, partitions=[0])
+        wait_until(
+            lambda: (self._l1_start_offset(topic) or 0) >= trim_offset,
+            timeout_sec=120,
+            backoff_sec=3,
+            err_msg="L1 start offset did not advance past the trim",
+            retry_on_exc=True,
+        )
+
+        # Dry run: reports unreferenced backing, deletes nothing.
+        resp = self._reclaim_migrated_backing(topic, delete=False)
+        assert not resp.deleted
+        unref = sum(p.segments_unreferenced for p in resp.partitions)
+        assert unref > 0, f"dry-run found no unreferenced segments: {resp}"
+        assert all(p.objects_deleted == 0 for p in resp.partitions)
+        assert self._count_topic_objects(topic) == backing_before, \
+            "dry run must not delete anything"
+
+        # Delete is refused while preserve_migrated_ts is still enabled.
+        try:
+            self._reclaim_migrated_backing(topic, delete=True)
+            assert False, "delete should be refused while preserve is enabled"
+        except ConnectError as e:
+            assert e.code == ConnectErrorCode.FAILED_PRECONDITION, \
+                f"unexpected error code: {e.code}"
+
+        # Disable preservation, then delete the unreferenced backing.
+        self.rpk.alter_topic_config(
+            topic, "redpanda.cloud_topic.preserve_migrated_ts", "false")
+        resp = self._reclaim_migrated_backing(topic, delete=True)
+        assert resp.deleted
+        deleted = sum(p.objects_deleted for p in resp.partitions)
+        assert deleted > 0, f"delete reclaimed nothing: {resp}"
+
+        # The orphaned backing is gone; the topic's object count drops.
+        wait_until(
+            lambda: self._count_topic_objects(topic) < backing_before,
+            timeout_sec=60,
+            backoff_sec=2,
+            err_msg="reclaim did not reduce the backing object count",
+            retry_on_exc=True,
+        )
+
+        # The live cloud topic still serves the retained tail.
+        consumer = KgoVerifierSeqConsumer(
+            self.test_context,
+            self.redpanda,
+            topic,
+            loop=False,
+        )
+        consumer.start()
+        consumer.wait(timeout_sec=120)
+        status = consumer.consumer_status.validator
+        assert status.invalid_reads == 0, \
+            f"invalid_reads={status.invalid_reads} after reclaim"
         consumer.stop()
         consumer.free()
 

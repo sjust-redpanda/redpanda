@@ -9,6 +9,8 @@ from ducktape.cluster.cluster import ClusterNode
 from rptest.clients.admin.proto.redpanda.core.admin.v2 import (
     broker_pb2,
     broker_pb2_connect,
+    cloud_topic_migration_pb2,
+    cloud_topic_migration_pb2_connect,
     cluster_pb2,
     cluster_pb2_connect,
     features_pb2,
@@ -51,6 +53,7 @@ class RedpandaServiceProto(Protocol):
 
 # Re-export some protobufs for convenience
 broker_pb = broker_pb2
+cloud_topic_migration_pb = cloud_topic_migration_pb2
 cluster_pb = cluster_pb2
 datalake_pb = datalake_pb2
 features_pb = features_pb2
@@ -135,6 +138,14 @@ class Admin:
 
     def cluster(self, **kwargs: Any) -> cluster_pb2_connect.ClusterServiceClient:
         return self._make_service(cluster_pb2_connect.ClusterServiceClient, **kwargs)
+
+    def cloud_topic_migration(
+        self, **kwargs: Any
+    ) -> cloud_topic_migration_pb2_connect.CloudTopicMigrationServiceClient:
+        return self._make_service(
+            cloud_topic_migration_pb2_connect.CloudTopicMigrationServiceClient,
+            **kwargs,
+        )
 
     def features(self, **kwargs: Any) -> features_pb2_connect.FeaturesServiceClient:
         return self._make_service(features_pb2_connect.FeaturesServiceClient, **kwargs)

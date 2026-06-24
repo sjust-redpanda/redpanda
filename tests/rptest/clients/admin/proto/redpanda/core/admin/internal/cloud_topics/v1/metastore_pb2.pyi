@@ -433,12 +433,17 @@ class ImportedTsObjectLocation(google.protobuf.message.Message):
     """
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
     TS_PATH_FIELD_NUMBER: builtins.int
+    TOPIC_ID_FIELD_NUMBER: builtins.int
+    PARTITION_ID_FIELD_NUMBER: builtins.int
     ts_path: builtins.str
+    topic_id: builtins.str
+    'The cloud topic this imported segment belongs to (a fixed-width id, not\n    the topic name). Mirrors imported_ts_object_location::tidp.\n    '
+    partition_id: builtins.int
 
-    def __init__(self, *, ts_path: builtins.str=...) -> None:
+    def __init__(self, *, ts_path: builtins.str=..., topic_id: builtins.str=..., partition_id: builtins.int=...) -> None:
         ...
 
-    def ClearField(self, field_name: typing.Literal['ts_path', b'ts_path']) -> None:
+    def ClearField(self, field_name: typing.Literal['partition_id', b'partition_id', 'topic_id', b'topic_id', 'ts_path', b'ts_path']) -> None:
         ...
 Global___ImportedTsObjectLocation: typing_extensions.TypeAlias = ImportedTsObjectLocation
 

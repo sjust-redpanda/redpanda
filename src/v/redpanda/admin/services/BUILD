@@ -34,6 +34,27 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "cloud_topic_migration",
+    srcs = ["cloud_topic_migration.cc"],
+    hdrs = ["cloud_topic_migration.h"],
+    implementation_deps = [
+        "//src/v/base",
+        "//src/v/cloud_storage",
+        "//src/v/cloud_storage_clients",
+        "//src/v/cloud_topics/level_one/metastore",
+        "//src/v/cloud_topics/level_one/metastore:replicated_metastore",
+        "//src/v/cluster:topic_table",
+        "//src/v/model",
+        "//src/v/utils:retry_chain_node",
+    ],
+    deps = [
+        "//proto/redpanda/core/admin/v2:cloud_topic_migration_redpanda_proto",
+        "//src/v/serde/protobuf:rpc",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "cluster",
     srcs = ["cluster.cc"],
     hdrs = ["cluster.h"],

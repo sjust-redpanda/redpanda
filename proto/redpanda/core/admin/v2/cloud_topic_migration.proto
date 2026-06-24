@@ -1,0 +1,109 @@
+// Copyright 2026 Redpanda Data, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package redpanda.core.admin.v2;
+
+import "proto/redpanda/core/pbgen/options.proto";
+import "proto/redpanda/core/pbgen/rpc.proto";
+
+option (pbgen.cpp_namespace) = "proto::admin";
+
+// The CloudTopicMigrationService exposes operator tooling for a
+// tiered-storage -> cloud-topic (TS->CT) migration.
+service CloudTopicMigrationService {
+    // ReclaimMigratedBacking
+    //
+    // Reclaims the tiered-storage objects that backed a topic before its
+    // TS->CT migration but are no longer referenced by the live cloud topic.
+    //
+    // During migration the cloud topic imports the source tiered-storage
+    // segments by reference, so those objects persist after cutover. While the
+    // topic property `redpanda.cloud_topic.preserve_migrated_ts` is set, L1
+    // garbage collection drops its reference to a segment without deleting the
+    // backing object, so a confirmed-good migration accumulates orphaned
+    // objects. This RPC enumerates the topic's frozen tiered-storage
+    // manifest(s) and reclaims the segments the cloud topic has already
+    // retention-expired (every object fully below the partition's live L1
+    // start offset), leaving still-referenced segments for ordinary L1 GC.
+    //
+    // The topic must be fully cut over: every partition must report a
+    // completed migration. A request against a topic with any partition still
+    // migrating (or absent from the metastore) is rejected.
+    //
+    // Defaults to a dry run that reports what would be reclaimed without
+    // touching the bucket. Set `delete_unreferenced` to actually delete; a
+    // delete additionally requires `redpanda.cloud_topic.preserve_migrated_ts`
+    // to be disabled on the topic first, so ongoing GC does not re-orphan
+    // segments after the sweep.
+    rpc ReclaimMigratedBacking(ReclaimMigratedBackingRequest)
+        returns (ReclaimMigratedBackingResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+}
+
+// ReclaimMigratedBackingRequest selects the topic to reclaim.
+message ReclaimMigratedBackingRequest {
+    // The Kafka topic whose leftover tiered-storage backing objects should be
+    // reclaimed. Must be a fully migrated (cut-over) cloud topic.
+    string topic = 1;
+
+    // When false (the default) the request is a dry run: it reports the
+    // objects it would delete without modifying the bucket. When true it
+    // deletes the unreferenced backing objects, which additionally requires
+    // the topic property `redpanda.cloud_topic.preserve_migrated_ts` to be
+    // disabled.
+    bool delete_unreferenced = 2;
+}
+
+// PartitionReclaim is the per-partition breakdown of a reclaim sweep.
+message PartitionReclaim {
+    // Partition id.
+    int32 partition = 1;
+
+    // The partition's live L1 start offset (a Kafka offset). Manifest segments
+    // whose next offset is at or below this are no longer referenced.
+    int64 start_offset = 2;
+
+    // Segments enumerated from the frozen tiered-storage manifest and its
+    // spillover manifests.
+    int64 segments_scanned = 3;
+
+    // Segments still referenced by the live cloud topic; left in place for
+    // ordinary L1 garbage collection.
+    int64 segments_referenced = 4;
+
+    // Unreferenced segments eligible for reclaim.
+    int64 segments_unreferenced = 5;
+
+    // Backing objects deleted (segment plus its `.tx` and `.index` siblings per
+    // unreferenced segment). Zero on a dry run.
+    int64 objects_deleted = 6;
+
+    // A capped sample of the backing object keys that were (or, on a dry run,
+    // would be) deleted, for operator inspection.
+    repeated string sample_object_keys = 7;
+}
+
+// ReclaimMigratedBackingResponse summarizes the sweep across all partitions.
+message ReclaimMigratedBackingResponse {
+    // Whether objects were actually deleted. False on a dry run.
+    bool deleted = 1;
+
+    // Per-partition reclaim breakdown.
+    repeated PartitionReclaim partitions = 2;
+}

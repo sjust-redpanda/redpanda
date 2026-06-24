@@ -12,6 +12,7 @@
 #include "config/node_config.h"
 #include "redpanda/admin/proxy/client.h"
 #include "redpanda/admin/server.h"
+#include "redpanda/admin/services/cloud_topic_migration.h"
 #include "redpanda/admin/services/cluster.h"
 #include "redpanda/admin/services/datalake/datalake.h"
 #include "redpanda/admin/services/features.h"
@@ -114,6 +115,11 @@ void application::configure_admin_server(model::node_id node_id) {
                   &controller->get_shard_table(),
                   cloud_topics_app->get_sharded_l1_domain_supervisor(),
                   cloud_topics_app->get_sharded_l1_metastore_router()));
+              s.add_service(
+                std::make_unique<admin::cloud_topic_migration_service_impl>(
+                  cloud_topics_app->get_sharded_replicated_metastore(),
+                  &controller->get_topics_state(),
+                  &cloud_storage_api));
               s.add_service(
                 std::make_unique<admin::level_zero_service_impl>(
                   node_id,

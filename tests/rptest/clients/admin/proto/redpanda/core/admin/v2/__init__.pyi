@@ -1,4 +1,5 @@
 from . import broker_pb2
+from . import cloud_topic_migration_pb2
 from . import cluster_pb2
 from . import features_pb2
 from . import internal
