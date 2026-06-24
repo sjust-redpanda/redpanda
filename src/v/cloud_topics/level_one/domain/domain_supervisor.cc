@@ -327,14 +327,23 @@ private:
 
         // Whether GC preserves an imported segment's backing tiered-storage
         // objects (so a topic migrated from tiered storage stays recoverable as
-        // TS). The supervisor owns the controller, so this is the seam for a
-        // per-topic decision; for now it is a single cluster-wide switch.
-        // TODO: resolve per topic via _controller's topic config keyed on the
-        // imported object's topic_id_partition.
+        // TS): the owning topic's preserve_migrated_ts_objects property, unset
+        // => preserve. Resolved per imported object's topic via the shard-local
+        // topic_table (the same state metadata_cache wraps). Unknown topic =>
+        // preserve (safe default; never reclaim a topic we can't resolve).
         preserve_imported_backing_fn preserve_imported =
-          [](const model::topic_id_partition&) {
-              return config::shard_local_cfg()
-                .cloud_topics_preserve_imported_ts_backing_objects();
+          [controller = _controller](const model::topic_id_partition& tidp) {
+              const auto& topics = controller->get_topics_state().local();
+              auto ns = topics.get_name_by_id(tidp.topic_id);
+              if (!ns.has_value()) {
+                  return true;
+              }
+              auto cfg = topics.get_topic_cfg(model::topic_namespace_view{*ns});
+              if (!cfg.has_value()) {
+                  return true;
+              }
+              return cfg->properties.preserve_migrated_ts_objects.value_or(
+                true);
           };
 
         ss::shared_ptr<domain_manager> domain_mgr;

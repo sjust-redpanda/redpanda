@@ -46,6 +46,12 @@ inline constexpr std::string_view
 inline constexpr std::string_view topic_property_remote_allow_gaps
   = "redpanda.remote.allowgaps";
 
+// Whether to preserve the backing tiered-storage objects of a topic migrated
+// from tiered storage to a cloud topic (so the migration can be recovered as
+// tiered storage). Unset => preserve.
+inline constexpr std::string_view topic_property_preserve_migrated_ts
+  = "redpanda.cloud_topic.preserve_migrated_ts";
+
 inline constexpr std::string_view topic_property_replication_factor
   = "replication.factor";
 

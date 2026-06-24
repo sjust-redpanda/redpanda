@@ -35,7 +35,7 @@ namespace cluster {
  */
 struct topic_properties
   : serde::
-      envelope<topic_properties, serde::version<14>, serde::compat_version<0>> {
+      envelope<topic_properties, serde::version<15>, serde::compat_version<0>> {
     topic_properties() noexcept = default;
     topic_properties(
       std::optional<model::compression> compression,
@@ -164,6 +164,15 @@ struct topic_properties
     // The override that indicates that when tiered-storage is paused the local
     // retention is allowed to work and potentially create a gap in the data.
     std::optional<bool> remote_topic_allow_gaps;
+
+    // When this topic was migrated from tiered storage to a cloud topic,
+    // whether to preserve the backing tiered-storage objects of imported
+    // extents as L1 garbage-collects them (so the migration can be recovered as
+    // a tiered-storage topic). Unset is treated as true (preserve). Set false
+    // to let GC reclaim the source objects (e.g. after the migration is
+    // confirmed good). No effect on a topic with no imported tiered-storage
+    // data.
+    std::optional<bool> preserve_migrated_ts_objects;
 
     std::optional<uint32_t> batch_max_bytes;
     tristate<size_t> retention_local_target_bytes{std::nullopt};
@@ -329,7 +338,8 @@ struct topic_properties
           message_timestamp_before_max_ms,
           message_timestamp_after_max_ms,
           storage_mode,
-          schema_registry_context);
+          schema_registry_context,
+          preserve_migrated_ts_objects);
     }
 
     friend bool

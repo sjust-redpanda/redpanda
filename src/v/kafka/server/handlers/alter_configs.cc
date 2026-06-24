@@ -101,7 +101,7 @@ create_topic_properties_update(
     std::apply(apply_op(op_t::none), update.custom_properties.serde_fields());
 
     static_assert(
-      std::tuple_size_v<decltype(update.properties.serde_fields())> == 45,
+      std::tuple_size_v<decltype(update.properties.serde_fields())> == 46,
       "If you add a property, decide on its default alter config "
       "policy, and handle the update in the loop below");
     static_assert(
@@ -511,6 +511,14 @@ create_topic_properties_update(
             if (cfg.name == topic_property_remote_allow_gaps) {
                 parse_and_set_optional_bool_alpha(
                   update.properties.remote_allow_gaps,
+                  cfg.value,
+                  kafka::config_resource_operation::set);
+                continue;
+            }
+
+            if (cfg.name == topic_property_preserve_migrated_ts) {
+                parse_and_set_optional_bool_alpha(
+                  update.properties.preserve_migrated_ts_objects,
                   cfg.value,
                   kafka::config_resource_operation::set);
                 continue;

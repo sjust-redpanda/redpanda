@@ -687,6 +687,8 @@ struct incremental_topic_updates
     property_update<std::optional<pandaproxy::schema_registry::context>>
       schema_registry_context;
 
+    property_update<std::optional<bool>> preserve_migrated_ts_objects;
+
     // Not a regular topic property. Used to assign topic UUIDs to pre-25-2
     // topics that were created without one.
     property_update<std::optional<model::topic_id>> topic_id;
@@ -750,7 +752,8 @@ struct incremental_topic_updates
           message_timestamp_after_max_ms,
           remote_label,
           storage_mode,
-          schema_registry_context);
+          schema_registry_context,
+          preserve_migrated_ts_objects);
     }
 
     fmt::iterator format_to(fmt::iterator it) const;

@@ -856,7 +856,6 @@ public:
 
     property<std::chrono::milliseconds>
       cloud_topics_long_term_file_deletion_delay;
-    property<bool> cloud_topics_preserve_imported_ts_backing_objects;
     bounded_property<int32_t> cloud_topics_num_metastore_partitions;
 
     bounded_property<size_t> cloud_topics_produce_write_inflight_limit;

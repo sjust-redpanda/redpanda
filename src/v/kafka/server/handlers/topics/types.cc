@@ -271,6 +271,9 @@ cluster::topic_configuration to_topic_config(
     cfg.properties.remote_topic_allow_gaps = get_bool_value(
       config_entries, topic_property_remote_allow_gaps);
 
+    cfg.properties.preserve_migrated_ts_objects = get_bool_value(
+      config_entries, topic_property_preserve_migrated_ts);
+
     cfg.properties.segment_ms = get_tristate_value<std::chrono::milliseconds>(
       config_entries, topic_property_segment_ms);
 

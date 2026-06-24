@@ -425,6 +425,13 @@ create_topic_properties_update(
                   update.properties.remote_allow_gaps, cfg.value, op);
                 continue;
             }
+            if (cfg.name == topic_property_preserve_migrated_ts) {
+                parse_and_set_optional_bool_alpha(
+                  update.properties.preserve_migrated_ts_objects,
+                  cfg.value,
+                  op);
+                continue;
+            }
             if (cfg.name == topic_property_iceberg_target_lag_ms) {
                 parse_and_set_optional_duration(
                   update.properties.iceberg_target_lag_ms,

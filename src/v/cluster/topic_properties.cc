@@ -54,6 +54,7 @@ fmt::iterator topic_properties::format_to(fmt::iterator it) const {
       "max_compaction_lag_ms: {}, "
       "message_timestamp_before_max_ms: {}, "
       "message_timestamp_after_max_ms: {}, "
+      "preserve_migrated_ts_objects: {}, "
       "redpanda_storage_mode: {}}}",
       compression,
       cleanup_policy_bitflags,
@@ -102,6 +103,7 @@ fmt::iterator topic_properties::format_to(fmt::iterator it) const {
       max_compaction_lag_ms,
       message_timestamp_before_max_ms,
       message_timestamp_after_max_ms,
+      preserve_migrated_ts_objects,
       storage_mode);
 }
 
@@ -165,6 +167,7 @@ bool topic_properties::has_overrides() const {
         || min_compaction_lag_ms.has_value()
         || max_compaction_lag_ms.has_value()
         || remote_topic_allow_gaps.has_value()
+        || preserve_migrated_ts_objects.has_value()
         || message_timestamp_before_max_ms.has_value()
         || message_timestamp_after_max_ms.has_value()
         || storage_mode != storage::ntp_config::default_storage_mode

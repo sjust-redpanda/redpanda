@@ -84,6 +84,7 @@ bool is_supported(std::string_view name) {
        topic_property_min_compaction_lag_ms,
        topic_property_max_compaction_lag_ms,
        topic_property_remote_allow_gaps,
+       topic_property_preserve_migrated_ts,
        topic_property_message_timestamp_before_max_ms,
        topic_property_message_timestamp_after_max_ms,
        topic_property_redpanda_storage_mode});

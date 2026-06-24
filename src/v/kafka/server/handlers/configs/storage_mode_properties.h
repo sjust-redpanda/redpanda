@@ -130,6 +130,8 @@ inline constexpr auto storage_mode_properties
      storage_mode_mask::tiered_and_cloud | storage_mode_mask::tiered_cloud},
     {topic_property_remote_delete,
      storage_mode_mask::tiered_and_cloud | storage_mode_mask::tiered_cloud},
+    {topic_property_preserve_migrated_ts,
+     storage_mode_mask::tiered_and_cloud | storage_mode_mask::tiered_cloud},
     {topic_property_read_replica,
      storage_mode_mask::tiered_and_cloud | storage_mode_mask::tiered_cloud},
   });
