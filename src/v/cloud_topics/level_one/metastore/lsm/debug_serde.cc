@@ -218,8 +218,16 @@ debug_encode_value(const proto::admin::metastore::row_value& val) {
         };
         if (v.has_imported_ts_location()) {
             const auto& loc = v.get_imported_ts_location();
+            auto tidp = parse_tidp(loc.get_topic_id(), loc.get_partition_id());
+            if (!tidp) {
+                return std::unexpected(error(
+                  errc::invalid_uuid,
+                  "imported ts location: {}",
+                  loc.get_topic_id()));
+            }
             entry.imported_ts_location = imported_ts_object_location{
               .ts_path = ts_segment_path{ss::sstring{loc.get_ts_path()}},
+              .tidp = *tidp,
             };
         }
         object_row_value rv{

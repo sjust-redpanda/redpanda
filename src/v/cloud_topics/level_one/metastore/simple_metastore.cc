@@ -181,7 +181,8 @@ new_object make_new_object(const metastore::object_metadata& o) {
             // delta/term on the extent, the ts_path on the object (an imported
             // object is single-extent, so its location is this extent's).
             meta.imported_ts_info = to_segment_info(*c.imported);
-            new_o.imported_ts_location = to_object_location(*c.imported);
+            new_o.imported_ts_location = to_object_location(
+              *c.imported, c.tidp);
         }
         extents[c.tidp.partition] = std::move(meta);
     }

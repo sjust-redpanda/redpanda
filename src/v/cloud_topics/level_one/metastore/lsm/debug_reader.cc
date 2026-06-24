@@ -224,9 +224,11 @@ debug_reader::decode_value(row_type type, iobuf value) {
             ov.set_last_updated(rv.object.last_updated());
             ov.set_is_preregistration(rv.object.is_preregistration);
             if (rv.object.imported_ts_location.has_value()) {
+                const auto& src = *rv.object.imported_ts_location;
                 proto::admin::metastore::imported_ts_object_location loc;
-                loc.set_ts_path(
-                  ss::sstring{rv.object.imported_ts_location->ts_path()});
+                loc.set_ts_path(ss::sstring{src.ts_path()});
+                loc.set_topic_id(uuid_to_string(src.tidp.topic_id()));
+                loc.set_partition_id(src.tidp.partition());
                 ov.set_imported_ts_location(std::move(loc));
             }
             pv.set_object(std::move(ov));

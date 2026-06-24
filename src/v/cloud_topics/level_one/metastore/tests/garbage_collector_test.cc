@@ -18,6 +18,7 @@
 #include "model/fundamental.h"
 #include "raft/tests/raft_fixture.h"
 #include "storage/record_batch_builder.h"
+#include "test_utils/scoped_config.h"
 
 using namespace cloud_topics::l1;
 
@@ -146,7 +147,7 @@ public:
         obj.footer_pos = 0;
         obj.object_size = 500;
         obj.imported_ts_location = imported_ts_object_location{
-          .ts_path = ts_path};
+          .ts_path = ts_path, .tidp = tp};
         obj.extent_metas[tp.topic_id][tp.partition] = new_object::metadata{
           .base_offset = base,
           .last_offset = last,
@@ -255,6 +256,13 @@ TEST_F(GarbageCollectorTest, TestGarbageCollectPartiallyRemovedObjects) {
 }
 
 TEST_F(GarbageCollectorTest, TestGarbageCollectImportedObject) {
+    // Exercise the deletion path: clear the preservation gate (default-on) so
+    // GC removes the backing TS objects rather than retaining them for
+    // recover-as-tiered-storage.
+    scoped_config cfg;
+    cfg.get("cloud_topics_preserve_imported_ts_backing_objects")
+      .set_value(false);
+
     initialize_state_machines(1).get();
     wait_for_leader(5s).get();
     auto stm = get_stm<0>(*nodes().begin()->second);

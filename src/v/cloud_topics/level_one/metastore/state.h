@@ -49,10 +49,16 @@ struct imported_ts_object_location
     friend bool operator==(
       const imported_ts_object_location&,
       const imported_ts_object_location&) = default;
-    auto serde_fields() { return std::tie(ts_path); }
+    auto serde_fields() { return std::tie(ts_path, tidp); }
 
     /// Opaque tiered-storage segment object path (sname_format path).
     ts_segment_path ts_path;
+    /// The cloud topic this imported segment belongs to. Recorded at import
+    /// (the owning ntp_metadata already carries it) so GC can resolve the
+    /// topic's config -- e.g. the migrated-tiered-storage-object preservation
+    /// gate -- without re-parsing ts_path. A fixed-width id (uuid topic_id +
+    /// partition_id), not the topic name.
+    model::topic_id_partition tidp;
 };
 
 /// How to interpret the data within an extent imported from a tiered-storage
@@ -89,8 +95,8 @@ struct imported_ts_segment_info
 // segment descriptor) and the unified imported_ts_info the interface and IO
 // path use.
 inline imported_ts_object_location
-to_object_location(const imported_ts_info& i) {
-    return imported_ts_object_location{.ts_path = i.ts_path};
+to_object_location(const imported_ts_info& i, model::topic_id_partition tidp) {
+    return imported_ts_object_location{.ts_path = i.ts_path, .tidp = tidp};
 }
 inline imported_ts_segment_info to_segment_info(const imported_ts_info& i) {
     return imported_ts_segment_info{

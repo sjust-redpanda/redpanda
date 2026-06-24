@@ -63,7 +63,7 @@ new_object meta_to_rpc_obj(const metastore::object_metadata& obj) {
             // object is single-extent, so its location is this extent's).
             meta.imported_ts_info = to_segment_info(*ntp_meta.imported);
             rpc_obj.imported_ts_location = to_object_location(
-              *ntp_meta.imported);
+              *ntp_meta.imported, ntp_meta.tidp);
         }
         topic_map[ntp_meta.tidp.partition] = std::move(meta);
     }

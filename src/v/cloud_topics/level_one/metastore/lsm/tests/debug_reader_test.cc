@@ -357,6 +357,8 @@ TEST(DebugReaderTest, RoundTripObjectValueImported) {
     ov.set_is_preregistration(false);
     pm::imported_ts_object_location loc;
     loc.set_ts_path("a/b/c-segment.log.1");
+    loc.set_topic_id("12345678-1234-1234-1234-1234567890ab");
+    loc.set_partition_id(7);
     ov.set_imported_ts_location(std::move(loc));
     val.set_object(std::move(ov));
 
@@ -371,6 +373,11 @@ TEST(DebugReaderTest, RoundTripObjectValueImported) {
     EXPECT_EQ(
       decoded->get_object().get_imported_ts_location().get_ts_path(),
       "a/b/c-segment.log.1");
+    EXPECT_EQ(
+      decoded->get_object().get_imported_ts_location().get_topic_id(),
+      "12345678-1234-1234-1234-1234567890ab");
+    EXPECT_EQ(
+      decoded->get_object().get_imported_ts_location().get_partition_id(), 7);
 }
 
 TEST(DebugReaderTest, UnknownRowTypeReturnsError) {

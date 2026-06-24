@@ -245,6 +245,10 @@ message MetadataValue {
 // object property: the imported analog of a native object's id->bucket path.
 message ImportedTsObjectLocation {
     string ts_path = 1;
+    // The cloud topic this imported segment belongs to (a fixed-width id, not
+    // the topic name). Mirrors imported_ts_object_location::tidp.
+    string topic_id = 2;
+    int32 partition_id = 3;
 }
 
 // Whether an imported tiered-storage segment has an aborted-transaction (.tx)
