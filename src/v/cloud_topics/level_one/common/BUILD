@@ -115,6 +115,20 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "ts_chunk_data_source",
+    srcs = ["ts_chunk_data_source.cc"],
+    hdrs = ["ts_chunk_data_source.h"],
+    implementation_deps = [
+        "//src/v/base",
+        "@fmt",
+    ],
+    deps = [
+        ":abstract_io",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "file_io",
     srcs = [
         "file_io.cc",
