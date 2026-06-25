@@ -79,6 +79,23 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
+    name = "ts_chunk_data_source_test",
+    timeout = "short",
+    srcs = [
+        "ts_chunk_data_source_test.cc",
+    ],
+    deps = [
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:iostream",
+        "//src/v/cloud_topics/level_one/common:abstract_io",
+        "//src/v/cloud_topics/level_one/common:ts_chunk_data_source",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "open_object_test",
     timeout = "short",
     srcs = [
