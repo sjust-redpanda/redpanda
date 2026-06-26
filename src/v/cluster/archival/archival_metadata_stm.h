@@ -109,6 +109,9 @@ public:
     command_batch_builder&
     update_highest_producer_id(model::producer_id highest_pid);
 
+    /// Set the tiered->cloud migration flag on the STM.
+    command_batch_builder& set_migration_state(bool migrating);
+
     /// Replicate the configuration batch
     ss::future<std::error_code> replicate();
 
@@ -210,6 +213,16 @@ public:
     ss::future<std::error_code>
     mark_clean(ss::lowres_clock::time_point, model::offset, ss::abort_source&);
 
+    /// Set the tiered->cloud migration flag. While set, the archiver drives
+    /// the migration (mirror fiber; keeps upload + GC running); the flag is
+    /// cleared by reset_metadata at cutover. Idempotent.
+    ss::future<std::error_code> set_migration_state(
+      bool migrating, ss::lowres_clock::time_point deadline, ss::abort_source&);
+
+    /// Whether a tiered->cloud migration is in progress on this partition.
+    /// Drives archiver behavior; the read path keys on the manifest, not this.
+    bool is_migrating() const { return _migration_in_progress; }
+
     /// A set of archived segments. NOTE: manifest can be out-of-date if this
     /// node is not leader; or if the STM hasn't yet performed sync; or if the
     /// node has lost leadership. But it will contain segments successfully
@@ -252,6 +265,10 @@ public:
     model::offset get_last_offset() const;
     model::offset get_archive_start_offset() const;
     model::offset get_archive_clean_offset() const;
+
+    /// True if the partition still has data in tiered storage -- either in the
+    /// live STM manifest or offloaded to the spillover archive.
+    bool holds_archived_data() const;
     kafka::offset get_start_kafka_offset() const;
 
     // Return list of all segments that has to be
@@ -341,6 +358,7 @@ private:
     struct reset_scrubbing_metadata;
     struct update_highest_producer_id_cmd;
     struct read_write_fence_cmd;
+    struct set_migration_state_cmd;
     struct snapshot;
 
     friend segment segment_from_meta(const cloud_storage::segment_meta& meta);
@@ -369,6 +387,7 @@ private:
     void apply_process_anomalies(iobuf);
     void apply_reset_scrubbing_metadata();
     void apply_update_highest_producer_id(model::producer_id pid);
+    void apply_set_migration_state(bool migrating);
     // apply fence command and return true if the 'apply' call should
     // be interrupted
     bool apply_read_write_fence(const read_write_fence_cmd&) noexcept;
@@ -390,6 +409,11 @@ private:
 
     // The offset of the last record that modified this stm
     model::offset _last_dirty_at;
+
+    // Whether a tiered->cloud migration is in progress on this partition. Set
+    // by set_migration_state and cleared by reset_metadata at cutover. false
+    // for a native cloud topic or a tiered partition that never migrated.
+    bool _migration_in_progress{false};
 
     std::optional<ss::promise<errc>> _active_operation_res;
 
