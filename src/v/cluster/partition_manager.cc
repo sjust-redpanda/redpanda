@@ -25,11 +25,13 @@
 #include "cluster/partition_recovery_manager.h"
 #include "cluster/topic_configuration.h"
 #include "cluster/types.h"
+#include "features/feature_table.h"
 #include "model/metadata.h"
 #include "raft/consensus.h"
 #include "raft/consensus_utils.h"
 #include "raft/fundamental.h"
 #include "ssx/async-clear.h"
+#include "ssx/future-util.h"
 
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -73,6 +75,11 @@ partition_manager::partition_manager(
                 if (a) {
                     a.value().get().notify_leadership(leader_id);
                 }
+                // Bootstrap the partition's durable storage mode on becoming
+                // leader (one-time, idempotent; no-op when not leader). The
+                // shared_ptr keeps the partition alive across the async write.
+                ssx::spawn_with_gate(
+                  _gate, [p] { return p->maybe_bootstrap_partition_mode(); });
             }
         });
     _shutdown_watchdog.set_callback(
@@ -100,7 +107,34 @@ partition_manager::get_topic_partition_table(
 
 ss::future<> partition_manager::start() {
     maybe_arm_shutdown_watchdog();
+    // Bootstrap partition_mode once the migration feature activates. The
+    // leadership-notification bootstrap (maybe_bootstrap_partition_mode) is
+    // gated on the feature being active, so a partition that became leader
+    // while the feature was inactive is left with partition_mode == unset.
+    // Re-run the (idempotent) bootstrap on every current leader when the
+    // feature turns active; partitions that gain leadership after activation
+    // are covered by the leadership notification.
+    ssx::spawn_with_gate(_gate, [this] {
+        return bootstrap_partition_mode_on_migration_feature();
+    });
     co_return;
+}
+
+ss::future<>
+partition_manager::bootstrap_partition_mode_on_migration_feature() {
+    try {
+        co_await _feature_table.local().await_feature(
+          features::feature::tiered_to_cloud_migration, _as);
+    } catch (...) {
+        // Aborted on shutdown before the feature activated.
+        co_return;
+    }
+    for (auto& [_, p] : _ntp_table) {
+        if (p->is_leader()) {
+            ssx::spawn_with_gate(
+              _gate, [p] { return p->maybe_bootstrap_partition_mode(); });
+        }
+    }
 }
 
 ss::future<consensus_ptr> partition_manager::manage(
@@ -329,6 +363,16 @@ ss::future<consensus_ptr> partition_manager::manage(
       _upload_hks,
       read_replica_bucket,
       _cloud_topics_state);
+
+    // Populate partition_mode at creation when the feature is active, so it is
+    // classified deterministically here from the topic config rather than via
+    // the racy runtime bootstrap. The bootstrap remains for the feature-switch
+    // case (a partition that predates the feature activation). Left unset when
+    // the feature is inactive.
+    if (_feature_table.local().is_active(
+          features::feature::tiered_to_cloud_migration)) {
+        p->set_creation_partition_mode(log->config().topic_mode());
+    }
 
     _ntp_table.emplace(log->config().ntp(), p);
     _raft_table.emplace(group, p);
