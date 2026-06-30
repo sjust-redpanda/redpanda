@@ -1771,6 +1771,58 @@ void partition::update_partition_mode() {
       _partition_properties_stm->partition_mode());
 }
 
+ss::future<> partition::maybe_bootstrap_partition_mode() {
+    if (!_partition_properties_stm || !is_leader()) {
+        co_return;
+    }
+    if (!_feature_table.local().is_active(
+          features::feature::tiered_to_cloud_migration)) {
+        co_return;
+    }
+    // Already bootstrapped (or already advanced by a migration): nothing to do.
+    if (
+      _partition_properties_stm->partition_mode()
+      != model::redpanda_storage_mode::unset) {
+        co_return;
+    }
+    // Pick the mode to record.
+    //   - holds_archived_data(): the partition holds tiered-storage data, so it
+    //     is (still) tiered regardless of topic_mode -- covers a node that
+    //     became leader *after* the operator switched the topic ts->ct, whose
+    //     archival manifest (loaded on a running partition) reveals it is
+    //     mid-migration while topic_mode() already reads `cloud`.
+    //   - _creation_partition_mode: the classification manage() computed
+    //     deterministically at creation, authoritative when set. Preferred over
+    //     re-reading topic_mode() here because it captures the mode as it was
+    //     at creation, immune to a later async topic-config flip.
+    //   - topic_mode(): the fallback for a partition with no creation-time hint
+    //     (created before this classifier existed). Legacy shadow_indexing
+    //     topics have topic_mode() == unset and are left unset (SI fallback).
+    const bool holds_ts_data = _archival_meta_stm
+                               && _archival_meta_stm->holds_archived_data();
+    model::redpanda_storage_mode target;
+    if (holds_ts_data) {
+        target = model::redpanda_storage_mode::tiered;
+    } else if (
+      _creation_partition_mode != model::redpanda_storage_mode::unset) {
+        target = _creation_partition_mode;
+    } else {
+        target = get_ntp_config().topic_mode();
+    }
+    if (target == model::redpanda_storage_mode::unset) {
+        co_return;
+    }
+    auto res = co_await _partition_properties_stm->set_partition_mode(target);
+    if (res.has_error()) {
+        vlog(
+          clusterlog.debug,
+          "{}: failed to bootstrap partition_mode to {}: {}",
+          _raft->ntp(),
+          target,
+          res.error().message());
+    }
+}
+
 ss::future<result<model::offset>> partition::set_writes_disabled(
   partition_properties_stm::writes_disabled disable,
   model::timeout_clock::time_point deadline,
