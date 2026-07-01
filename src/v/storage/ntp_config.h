@@ -271,6 +271,21 @@ public:
         _partition_mode = m;
     }
 
+    // True while the partition is mid tiered->cloud migration: the topic config
+    // requests a cloud storage mode (topic_mode) but the partition's durable
+    // partition_mode is still tiered. The partition is served as tiered
+    // storage and its data is being mirrored into the cloud-topics metastore
+    // until cutover advances partition_mode to match. This is the single
+    // authoritative migration-phase signal (derived from the two modes) --
+    // behaviors that must key on "still migrating" rather than the eventual
+    // serving mode read this, not the manifest.
+    bool is_migrating() const {
+        const auto tm = topic_mode();
+        return (tm == model::redpanda_storage_mode::cloud
+                || tm == model::redpanda_storage_mode::tiered_cloud)
+               && partition_mode() == model::redpanda_storage_mode::tiered;
+    }
+
     bool is_archival_enabled() const {
         const auto mode = partition_mode();
         // Explicit tiered
