@@ -28,6 +28,8 @@
 #include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/archival/archival_policy.h"
 #include "cluster/archival/logger.h"
+#include "cluster/archival/migration_metastore.h"
+#include "cluster/archival/migration_segment.h"
 #include "cluster/archival/replica_state_validator.h"
 #include "cluster/archival/retention_calculator.h"
 #include "cluster/archival/scrubber.h"
@@ -2065,9 +2067,21 @@ ntp_archiver::schedule_uploads(model::offset max_offset_exclusive) {
       .archiver_term = _start_term,
     });
 
+    // Suspend compacted reupload while the partition is migrating
+    // tiered->cloud. The migration mirror dark-copies the manifest into the
+    // cloud-topics L1 metastore by trimming the front and appending the tail
+    // only; it cannot reflect an in-place segment rewrite. A compacted reupload
+    // replaces an already-mirrored segment (the old object moves to _replaced
+    // and is GC'd) without the mirror re-importing the replacement, leaving the
+    // L1 extent referencing a deleted object. Reupload resumes as native
+    // cloud-topic (L1) compaction after cutover. is_migrating() is the gate:
+    // partition_mode is still tiered during migration, so cloud_topic_enabled()
+    // below stays false and would not suspend us on its own.
     if (
       config::shard_local_cfg().cloud_storage_enable_compacted_topic_reupload()
       && _parent.get_ntp_config().is_locally_compacted()
+      && !_parent.get_ntp_config().cloud_topic_enabled()
+      && !_parent.get_ntp_config().is_migrating()
       && compacted_segments_upload_start < start_upload_offset) {
         params.push_back({
           .upload_kind = segment_upload_kind::compacted,
@@ -2739,15 +2753,28 @@ ss::future<ntp_archiver::housekeeping_result> ntp_archiver::housekeeping() {
             // external housekeeping jobs from upload_housekeeping_service
             // and retention/GC
             auto units = co_await _mutex.get_units(_as);
+            // Migration head-prune runs after retention advances the manifest
+            // start and before GC deletes the dropped objects, so the L1 mirror
+            // has detached its reference to an object before that object is
+            // removed -- the invariant garbage_collect already upholds for the
+            // archival manifest. No-op unless the partition is migrating.
             if (stm_retention_needed()) {
                 co_await apply_retention();
+                co_await migration_head_prune();
                 co_await garbage_collect();
             } else {
                 co_await apply_archive_retention();
+                co_await migration_head_prune();
                 result = co_await garbage_collect_archive();
                 co_await garbage_collect();
             }
             co_await apply_spillover();
+        }
+        // Run the migration mirror outside the housekeeping mutex so its
+        // metastore RPCs don't stall uploads/GC. No-op unless the partition is
+        // migrating and the metastore sink is available.
+        if (may_begin_uploads()) {
+            co_await run_migration_mirror();
         }
     } catch (const ss::abort_requested_exception&) {
     } catch (const ss::gate_closed_exception&) {
@@ -2764,6 +2791,134 @@ ss::future<ntp_archiver::housekeeping_result> ntp_archiver::housekeeping() {
     }
 
     co_return result;
+}
+
+ss::future<> ntp_archiver::migration_head_prune() {
+    auto stm = _parent.archival_meta_stm();
+    // Only a migrating partition prunes here. partition_mode (tiered while the
+    // topic requests cloud) is the migration signal; the archival STM must
+    // exist to hold the manifest being pruned.
+    if (!stm || !_parent.get_ntp_config().is_migrating()) {
+        co_return;
+    }
+    auto* mm = _parent.migration_metastore();
+    if (mm == nullptr) {
+        co_return;
+    }
+    const auto& m = manifest();
+    if (m.size() == 0) {
+        co_return;
+    }
+    auto offs = co_await mm->get_offsets(_ntp);
+    // The true log start, including data offloaded to spillover (archive)
+    // sub-manifests. NB: not m.begin() once spilled -- that is the spillover
+    // boundary, not the log start.
+    const auto log_start = m.full_log_start_kafka_offset();
+    if (
+      !offs.has_value() || !log_start.has_value()
+      || *log_start <= offs->start_offset) {
+        co_return;
+    }
+    // Retention GC dropped data from the front of the log, advancing the true
+    // log start past the L1 mirror's start. Detach the imported extents below
+    // it (detach only -- the archiver still owns the tiered-storage objects),
+    // so the GC that runs next does not delete an object the mirror still
+    // references. Keyed on the true log start, not m.begin(): a spillover
+    // advances m.begin() without deleting data and must not be mistaken for a
+    // retention prune.
+    //
+    // Clamp to next_offset: if retention ran ahead of what the mirror imported
+    // (*log_start > next_offset), the entire mirrored range is below the new
+    // start and is stale -- pruning to next_offset empties the partition, after
+    // which the forward-append re-seeds it at the surviving manifest start (the
+    // empty && migrating path in add_objects). This also keeps prune_below off
+    // the set_start_offset > next_offset rejection.
+    auto prune_to = std::min(*log_start, offs->next_offset);
+    auto pr = co_await mm->prune_below(_ntp, prune_to);
+    if (pr != migration_metastore::errc::ok) {
+        vlog(_rtclog.warn, "migration mirror: prune to {} failed", prune_to);
+    }
+}
+
+ss::future<> ntp_archiver::run_migration_mirror() {
+    auto stm = _parent.archival_meta_stm();
+    if (!stm || !_parent.get_ntp_config().is_migrating()) {
+        co_return;
+    }
+    auto* mm = _parent.migration_metastore();
+    if (mm == nullptr) {
+        // The cloud-topics subsystem has not registered the metastore sink
+        // yet; retry on the next housekeeping tick.
+        co_return;
+    }
+    const auto& m = manifest();
+    if (m.size() == 0) {
+        co_return;
+    }
+
+    // Current L1 coverage -- the mirror's durable progress cursor. The head
+    // prune already ran (migration_head_prune, before retention GC), so these
+    // offsets reflect any detach/empty it did this pass.
+    auto offs = co_await mm->get_offsets(_ntp);
+
+    // The true start of the log, including any data offloaded to spillover
+    // (archive) sub-manifests. NB: this is not m.begin() once the manifest has
+    // spilled -- m.begin() is then the spillover boundary, not the log start.
+    const auto log_start = m.full_log_start_kafka_offset();
+
+    // Forward-append the tail: segments at or above the current L1 next offset
+    // (or the true log start if L1 is still empty). Iterate the whole log via
+    // the manifest view -- the spillover (archive) sub-manifests as well as the
+    // live STM manifest -- so the spilled history is imported, not just the
+    // live manifest tail.
+    const auto append_from = offs.has_value()
+                               ? offs->next_offset
+                               : log_start.value_or(kafka::offset{});
+    auto cursor = co_await _manifest_view->get_cursor(
+      m.full_log_start_offset().value_or(
+        m.get_start_offset().value_or(model::offset{})));
+    if (cursor.has_error()) {
+        vlog(
+          _rtclog.warn,
+          "migration mirror: failed to open manifest cursor: {}",
+          cursor.error());
+        co_return;
+    }
+    chunked_vector<migration_metastore::imported_segment> to_append;
+    co_await cloud_storage::for_each_manifest(
+      std::move(cursor.value()), [&, this](auto submanifest) {
+          const auto& sm = *submanifest;
+          for (const auto& meta : sm) {
+              if (meta.base_kafka_offset() < append_from) {
+                  continue;
+              }
+              // Resolve the per-segment imported descriptor (offset bounds, the
+              // delta-base sentinel guard, and the .tx-presence state) from
+              // segment_meta; nullopt means the segment has no
+              // Kafka-addressable records and is skipped. See
+              // make_imported_segment.
+              auto seg = make_imported_segment(
+                meta,
+                sm.generate_segment_path(meta, remote_path_provider())()
+                  .native());
+              if (seg.has_value()) {
+                  to_append.push_back(std::move(*seg));
+              }
+          }
+          return ss::stop_iteration::no;
+      });
+    if (!to_append.empty()) {
+        const auto append_count = to_append.size();
+        auto ar = co_await mm->append_imported(_ntp, std::move(to_append));
+        if (ar != migration_metastore::errc::ok) {
+            vlog(
+              _rtclog.warn,
+              "migration mirror: append of {} imported segment(s) failed",
+              append_count);
+            // Don't claim convergence on a failed append.
+            co_return;
+        }
+    }
 }
 
 ss::future<> ntp_archiver::apply_archive_retention() {
