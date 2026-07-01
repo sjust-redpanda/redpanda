@@ -13,7 +13,10 @@
 #include "cloud_storage/partition_manifest_downloader.h"
 #include "cloud_storage/read_path_probes.h"
 #include "cloud_storage/remote_partition.h"
+#include "cloud_topics/level_zero/stm/ctp_stm.h"
+#include "cloud_topics/level_zero/stm/ctp_stm_api.h"
 #include "cluster/archival/archival_metadata_stm.h"
+#include "cluster/archival/migration_metastore.h"
 #include "cluster/archival/ntp_archiver_service.h"
 #include "cluster/archival/upload_housekeeping_service.h"
 #include "cluster/id_allocator_stm.h"
@@ -1868,6 +1871,159 @@ ss::future<> partition::maybe_bootstrap_partition_mode() {
           target,
           res.error().message());
     }
+}
+
+ss::future<> partition::cutover_to_cloud_topic(
+  kafka::offset boundary, model::offset log_boundary) {
+    if (!_archival_meta_stm || !_partition_properties_stm) {
+        co_return;
+    }
+    vlog(
+      clusterlog.info,
+      "{}: TS->CT cutover: boundary {} (log {}); seeding ctp_stm, advancing "
+      "partition_mode to cloud, emptying archival STM",
+      _raft->ntp(),
+      boundary,
+      log_boundary);
+
+    auto deadline = ss::lowres_clock::now()
+                    + _archival_conf->manifest_upload_timeout();
+
+    // Step 1: seed the ctp_stm as the authority for [0, B] BEFORE advancing
+    // partition_mode. Advancing partition_mode is the routing flip (the read
+    // path keys on cloud_topic_enabled() -> partition_mode); it must never
+    // expose "neither STM authoritative", so ctp_stm has to be seeded while the
+    // partition is still routed to tiered storage. At convergence the L1 mirror
+    // provably covers the manifest tail, so [0, B] is reconciled.
+    auto ctp = _raft->stm_manager()->get<cloud_topics::ctp_stm>();
+    if (!ctp) {
+        vlog(
+          clusterlog.warn,
+          "{}: TS->CT cutover: ctp_stm not installed; cannot cut over safely, "
+          "will retry",
+          _raft->ntp());
+        co_return;
+    }
+    cloud_topics::ctp_stm_api api{ctp};
+    auto seed = co_await api.advance_reconciled_offset(
+      boundary, log_boundary, deadline, _as);
+    if (!seed.has_value()) {
+        vlog(
+          clusterlog.warn,
+          "{}: TS->CT cutover: failed to seed ctp_stm baseline at {}; will "
+          "retry: {}",
+          _raft->ntp(),
+          boundary,
+          seed.error());
+        co_return;
+    }
+
+    // Hand over the trim floor. A mid-migration DeleteRecords / prefix
+    // truncation sets a start-offset override whose low watermark can fall
+    // mid-segment, above the base offset of the imported L1 extents. Seed the
+    // ctp_stm start there too, otherwise the cut-over partition would serve
+    // from the imported extent's base offset and resurrect deleted records.
+    if (auto trim_floor = kafka_start_offset_override();
+        trim_floor.has_value()) {
+        auto so = co_await api.set_start_offset(
+          model::offset_cast(*trim_floor), deadline, _as);
+        if (!so.has_value()) {
+            vlog(
+              clusterlog.warn,
+              "{}: TS->CT cutover: failed to seed ctp_stm start offset at {}; "
+              "will retry: {}",
+              _raft->ntp(),
+              *trim_floor,
+              so.error());
+            co_return;
+        }
+    }
+
+    // Step 2: advance partition_mode tiered->cloud. THIS is the routing flip:
+    // the structural read/write path keys on cloud_topic_enabled(), which reads
+    // partition_mode. ctp_stm is now authoritative, so the flip is safe. It
+    // must precede reset_metadata -- with partition_mode still tiered a reader
+    // would route to the about-to-be-emptied manifest and miss the migrated
+    // prefix.
+    auto pm = co_await _partition_properties_stm->set_partition_mode(
+      model::redpanda_storage_mode::cloud);
+    if (pm.has_error()) {
+        vlog(
+          clusterlog.warn,
+          "{}: TS->CT cutover: failed to advance partition_mode to cloud; will "
+          "retry: {}",
+          _raft->ntp(),
+          pm.error().message());
+        co_return;
+    }
+
+    // Step 3: post-flip cleanup -- release the archival STM (empty the
+    // manifest) and mark the offline migration phase complete. Routing already
+    // flipped in step 2, so these do not affect serving. If interrupted here, a
+    // later leader finishes them via maybe_finish_cutover().
+    co_await finish_cutover_tail(deadline);
+}
+
+ss::future<>
+partition::finish_cutover_tail(ss::lowres_clock::time_point deadline) {
+    // Empty the archival manifest: releases the local-trim clamp and makes the
+    // (now cloud-mode) archiver dormant -- both key on holds_archived_data().
+    if (_archival_meta_stm && _archival_meta_stm->holds_archived_data()) {
+        auto builder = _archival_meta_stm->batch_start(deadline, _as);
+        builder.reset_metadata();
+        auto ec = co_await builder.replicate();
+        if (ec) {
+            vlog(
+              clusterlog.warn,
+              "{}: TS->CT cutover: reset_metadata failed: {}; will retry",
+              _raft->ntp(),
+              ec.message());
+            co_return;
+        }
+    }
+
+    // Mark the offline migration phase complete so recovery/read-replica
+    // classify the partition as a cloud topic.
+    if (_migration_metastore != nullptr) {
+        auto cr = co_await _migration_metastore->mark_complete(_raft->ntp());
+        if (cr != archival::migration_metastore::errc::ok) {
+            vlog(
+              clusterlog.warn,
+              "{}: TS->CT cutover: failed to mark migration phase complete; "
+              "will retry",
+              _raft->ntp());
+        }
+    }
+}
+
+ss::future<> partition::maybe_finish_cutover() {
+    // Crash-resume for an interrupted cutover. cutover_to_cloud_topic advances
+    // partition_mode to cloud (the routing flip) before emptying the archival
+    // manifest; a crash in between leaves partition_mode==cloud (routing
+    // already correct, on the cloud-topic path) with a non-empty manifest that
+    // no archiver will clean up (should_construct_archiver() is false for a
+    // cloud-mode partition). On becoming leader, finish the tail. ctp_stm was
+    // seeded before partition_mode advanced (the cutover invariant), so it is
+    // already authoritative; only the archival-STM reset + mark_complete
+    // remain.
+    if (!is_leader() || !_partition_properties_stm || !_archival_meta_stm) {
+        co_return;
+    }
+    if (
+      _partition_properties_stm->partition_mode()
+        != model::redpanda_storage_mode::cloud
+      || !_archival_meta_stm->holds_archived_data()) {
+        co_return;
+    }
+    vlog(
+      clusterlog.info,
+      "{}: finishing interrupted TS->CT cutover (partition_mode cloud, "
+      "manifest "
+      "still non-empty)",
+      _raft->ntp());
+    auto deadline = ss::lowres_clock::now()
+                    + _archival_conf->manifest_upload_timeout();
+    co_await finish_cutover_tail(deadline);
 }
 
 ss::future<result<model::offset>> partition::set_writes_disabled(

@@ -24,6 +24,8 @@
 #include "cloud_storage/tx_range_manifest.h"
 #include "cloud_storage/types.h"
 #include "cloud_storage_clients/types.h"
+#include "cloud_topics/level_zero/stm/ctp_stm.h"
+#include "cloud_topics/level_zero/stm/ctp_stm_api.h"
 #include "cluster/archival/adjacent_segment_merger.h"
 #include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/archival/archival_policy.h"
@@ -376,9 +378,8 @@ ntp_archiver::ntp_archiver(
       config::shard_local_cfg()
         .cloud_storage_manifest_max_upload_interval_sec.bind())
   , _manifest_view(std::move(amv))
-  , _initial_backoff(
-      config::shard_local_cfg()
-        .cloud_storage_upload_loop_initial_backoff_ms.bind())
+  , _initial_backoff(config::shard_local_cfg()
+                       .cloud_storage_upload_loop_initial_backoff_ms.bind())
   , _max_backoff(
       config::shard_local_cfg().cloud_storage_upload_loop_max_backoff_ms.bind())
   , _execution_monitor("ntp_archiver", liveness_check_interval) {
@@ -609,10 +610,8 @@ void ntp_archiver::notify_leadership(std::optional<model::node_id> leader_id) {
 }
 
 ss::future<> ntp_archiver::upload_until_abort() {
-    if (
-      unlikely(
-        config::shard_local_cfg()
-          .cloud_storage_disable_upload_loop_for_tests.value())) {
+    if (unlikely(config::shard_local_cfg()
+                   .cloud_storage_disable_upload_loop_for_tests.value())) {
         vlog(_rtclog.warn, "Skipping upload loop start");
         co_return;
     }
@@ -621,7 +620,12 @@ ss::future<> ntp_archiver::upload_until_abort() {
     }
 
     while (!_as.abort_requested()) {
-        if (!_parent.is_leader() || _paused) {
+        // Idle (rather than busy-loop on the may_begin_uploads() check below)
+        // while there is nothing to upload: not leader, paused, or a cut-over
+        // cloud topic whose archiver is dormant. The archiver of a cut-over
+        // partition is normally torn down (its manifest is empty), but until
+        // that happens it must not spin.
+        if (!_parent.is_leader() || _paused || is_cloud_topic_dormant()) {
             bool shutdown = false;
             try {
                 vlog(
@@ -731,10 +735,9 @@ ss::future<> ntp_archiver::upload_until_abort() {
             }
         }
 
-        if (
-          auto ec = co_await maybe_repair_manifest(
-            ss::lowres_clock::now() + sync_timeout);
-          ec) {
+        if (auto ec = co_await maybe_repair_manifest(
+              ss::lowres_clock::now() + sync_timeout);
+            ec) {
             vlog(_rtclog.warn, "Failed to repair manifest: {}, retrying", ec);
             continue;
         }
@@ -805,10 +808,9 @@ ss::future<> ntp_archiver::upload_until_abort() {
 }
 
 ss::future<> ntp_archiver::sync_manifest_until_abort() {
-    if (
-      unlikely(
-        config::shard_local_cfg()
-          .cloud_storage_disable_read_replica_loop_for_tests.value())) {
+    if (unlikely(
+          config::shard_local_cfg()
+            .cloud_storage_disable_read_replica_loop_for_tests.value())) {
         vlog(_rtclog.warn, "Skipping read replica sync loop start");
         co_return;
     }
@@ -1339,8 +1341,32 @@ bool ntp_archiver::can_update_archival_metadata() const {
            && _parent.term() == _start_term;
 }
 
+bool ntp_archiver::is_cloud_topic_dormant() const {
+    // A cloud-mode partition archives to tiered storage ONLY while it still
+    // holds archived data (mid tiered->cloud migration): it is served as tiered
+    // storage and the mirror imports the manifest the archiver builds. Once it
+    // has cut over -- partition_mode advanced to cloud and the archival STM
+    // emptied -- the archiver must go dormant. Otherwise it would re-upload the
+    // (not-yet-trimmed) raft log, re-populating the manifest, which re-triggers
+    // the migration: the partition would oscillate instead of settling as a
+    // native cloud topic, and post-cutover writes would never reach the
+    // cloud-topic (L0) path. cloud_topic_enabled() keys on partition_mode,
+    // which lags at tiered throughout migration, so it becomes true only at
+    // cutover; holds_archived_data() then covers the brief window where
+    // partition_mode has advanced but reset_metadata has not yet committed.
+    //
+    // "No tiered data" must include the spillover archive, not just the live
+    // manifest (spillover/retention can empty the live manifest while the
+    // archive still holds data). Cutover (reset_metadata) clears both, so a
+    // cut-over partition is correctly dormant.
+    auto stm = _parent.archival_meta_stm();
+    return stm != nullptr && _parent.get_ntp_config().cloud_topic_enabled()
+           && !stm->holds_archived_data();
+}
+
 bool ntp_archiver::may_begin_uploads() const {
-    return can_update_archival_metadata() && !_paused;
+    return can_update_archival_metadata() && !_paused
+           && !is_cloud_topic_dormant();
 }
 
 ss::future<> ntp_archiver::stop() {
@@ -2309,9 +2335,8 @@ ntp_archiver::wait_uploads_complete(
               "{} can be added",
               segment_results.size(),
               num_accepted);
-            _probe.value().gap_detected(
-              model::offset(
-                static_cast<int64_t>(segment_results.size() - num_accepted)));
+            _probe.value().gap_detected(model::offset(
+              static_cast<int64_t>(segment_results.size() - num_accepted)));
         }
         vassert(
           num_accepted <= segment_results.size(),
@@ -2919,6 +2944,42 @@ ss::future<> ntp_archiver::run_migration_mirror() {
             co_return;
         }
     }
+
+    // Convergence: cut over as soon as the L1 mirror covers the current
+    // manifest tail. This does not require the log to have quiesced -- a
+    // cutover while the producer is still writing is safe, so migration
+    // completes under concurrent writes.
+    //
+    // Data above the boundary is not stranded. It is still in the raft log
+    // (ctp_stm clamps the local trim floor at the boundary), and after cutover
+    // the reconciler materializes it into L1 from the raft log -- the same path
+    // a native cloud topic uses for its not-yet-reconciled tail.
+    //
+    // The one hazard is a segment upload re-populating the just-emptied
+    // manifest (which would wake the dormant archiver). That cannot happen
+    // here: housekeeping (which runs this and triggers cutover_to_cloud_topic)
+    // is invoked from the upload loop *after* upload_next_candidates has
+    // finished committing its add_segment batches, so there is no in-flight
+    // upload racing the cutover; and once partition_mode advances to cloud and
+    // the manifest is emptied, may_begin_uploads is false
+    // (is_cloud_topic_dormant), so the loop issues no further uploads. This is
+    // the archival STM's normal "the manifest is the committed STM state; a
+    // leader re-derives uploads from it" contract
+    // -- an upload that does not commit its manifest entry is just an orphan
+    // object.
+    auto after = co_await mm->get_offsets(_ntp);
+    auto tail = m.get_last_kafka_offset();
+    if (
+      after.has_value() && tail.has_value()
+      && after->next_offset == kafka::next_offset(*tail)
+      && !config::shard_local_cfg()
+            .cloud_topics_disable_migration_cutover_for_tests()) {
+        // Cutover coordinates three STMs (ctp_stm, partition_properties_stm,
+        // archival_metadata_stm) plus the L1 metastore, so it lives on the
+        // partition, which owns them all. The archiver only detects convergence
+        // (the L1 mirror has covered the manifest tail) and triggers it.
+        co_await _parent.cutover_to_cloud_topic(*tail, m.get_last_offset());
+    }
 }
 
 ss::future<> ntp_archiver::apply_archive_retention() {
@@ -3257,9 +3318,8 @@ ss::future<> ntp_archiver::apply_spillover() {
     // Check the spillover invariant.
     // The start_offset of the manifest must be equal to the begin_offset of
     // the first segment in the manifest.
-    if (
-      auto so = manifest().get_start_offset();
-      so.has_value() && !manifest().empty()) {
+    if (auto so = manifest().get_start_offset();
+        so.has_value() && !manifest().empty()) {
         auto fo = manifest().begin()->base_offset;
         if (fo != so.value()) {
             vlog(
@@ -3761,7 +3821,7 @@ ntp_archiver::find_reupload_candidate(
           },
           [this, &run, &rw_fence, units = std::move(units)](
             segment_collector_stream& collector_stream) mutable
-            -> find_reupload_candidate_result {
+          -> find_reupload_candidate_result {
               if (
                 collector_stream.start_offset != run->meta.base_offset
                 || collector_stream.end_offset != run->meta.committed_offset) {
