@@ -500,9 +500,14 @@ public:
     }
 
     bool migrated_to_cloud() const {
-        return _overrides
-               && _overrides->migrated_from
-                    != model::redpanda_storage_mode::unset;
+        return migrated_from() != model::redpanda_storage_mode::unset;
+    }
+
+    // The mode the topic was migrated to cloud/tsv2 from; unset for a topic
+    // that never migrated.
+    model::redpanda_storage_mode migrated_from() const {
+        return _overrides ? _overrides->migrated_from
+                          : model::redpanda_storage_mode::unset;
     }
 
     std::optional<double> min_cleanable_dirty_ratio() const {

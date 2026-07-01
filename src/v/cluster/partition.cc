@@ -19,6 +19,7 @@
 #include "cluster/id_allocator_stm.h"
 #include "cluster/log_eviction_stm.h"
 #include "cluster/logger.h"
+#include "cluster/partition_kafka_offsets.h"
 #include "cluster/partition_properties_stm.h"
 #include "cluster/rm_stm.h"
 #include "cluster/tm_stm.h"
@@ -823,21 +824,36 @@ bool partition::should_construct_archiver() {
     // in the case of read replicas -- we still need the archiver to drive
     // manifest updates, etc.
     const auto& ntp_config = _raft->log()->config();
-    return config::shard_local_cfg().cloud_storage_enabled()
-           && config::shard_local_cfg().cloud_storage_disable_archiver_manager()
-           && _cloud_storage_api.local_is_initialized()
-           // The archiver can only be created for partitions that belong to
-           // user topics. This includes everything inside the kafka namespace
-           // except for the kafka consumer offsets topic. The consumer offsets
-           // topic is backed up separately by the cluster/cluster_metadata
-           // subsystem. The archival_metadata_stm can't be created for the
-           // consumer offsets topic partitions. The schema registry topic is
-           // not exempt from this. It should be possible to create an archiver
-           // for it.
-           && _raft->ntp().ns == model::kafka_namespace
-           && _raft->ntp().tp.topic != model::kafka_consumer_offsets_topic
-           && !ntp_config.cloud_topic_enabled()
-           && (ntp_config.is_archival_enabled() || ntp_config.is_read_replica_mode_enabled());
+    const bool base
+      = config::shard_local_cfg().cloud_storage_enabled()
+        && config::shard_local_cfg().cloud_storage_disable_archiver_manager()
+        && _cloud_storage_api.local_is_initialized()
+        // The archiver can only be created for partitions that
+        // belong to user topics. This includes everything inside
+        // the kafka namespace except for the kafka consumer
+        // offsets topic. The consumer offsets topic is backed up
+        // separately by the cluster/cluster_metadata subsystem.
+        // The archival_metadata_stm can't be created for the
+        // consumer offsets topic partitions. The schema registry
+        // topic is not exempt from this. It should be possible to
+        // create an archiver for it.
+        && _raft->ntp().ns == model::kafka_namespace
+        && _raft->ntp().tp.topic != model::kafka_consumer_offsets_topic;
+    if (!base) {
+        return false;
+    }
+    // A partition mid tiered->cloud migration keeps its archiver: it is
+    // tiered-mode (partition_storage_mode is still tiered until cutover), so it
+    // is handled by the is_archival_enabled() branch and keeps uploading,
+    // GC'ing, and mirroring its tiered data. A cloud-mode partition
+    // (partition_storage_mode cloud) needs no archiver; cutover advances
+    // partition_storage_mode to cloud once the data has been mirrored into L1,
+    // after which this returns false.
+    if (ntp_config.cloud_topic_enabled()) {
+        return false;
+    }
+    return ntp_config.is_archival_enabled()
+           || ntp_config.is_read_replica_mode_enabled();
 }
 
 void partition::maybe_construct_archiver() {
@@ -1867,16 +1883,53 @@ ss::future<> partition::sync_partition_storage_mode() {
     if (!partition_storage_mode_sync_enabled() || !is_leader()) {
         co_return;
     }
-    // All allowed storage mode transitions are simply passed through: mirror
-    // topic_storage_mode() into partition_storage_mode whenever they differ. (A
-    // legacy shadow_indexing topic has topic_storage_mode() == unset;
-    // partition_storage_mode starts unset too, so this is a no-op and it stays
-    // unset.)
+    // Mirror topic_storage_mode() into partition_storage_mode, except where a
+    // migration has to be interposed. (A legacy shadow_indexing topic has
+    // topic_storage_mode() == unset; partition_storage_mode starts unset too,
+    // so this is a no-op and it stays unset.)
     //
     // Recomputed on every attempt: the topic config may change while retrying,
     // including while a previous attempt was replicating.
-    const auto target = get_ntp_config().topic_storage_mode();
-    if (_partition_properties_stm->partition_storage_mode() == target) {
+    const auto current = _partition_properties_stm->partition_storage_mode();
+    auto target = get_ntp_config().topic_storage_mode();
+
+    const auto migrated_from = get_ntp_config().migrated_from();
+    // Kafka-space comparison: raft configuration batches keep the raft log
+    // non-empty on every live partition, but do not advance kafka offsets.
+    const bool has_tiered_data
+      = kafka_high_watermark(*this)
+          > log()->from_log_offset(_raft->start_offset())
+        || (_archival_meta_stm && _archival_meta_stm->has_archived_data());
+    if (
+      current == model::redpanda_storage_mode::unset
+      && migrated_from != model::redpanda_storage_mode::unset
+      && has_tiered_data) {
+        // A partition with no recorded partition_storage_mode cannot have
+        // migrated: cutover records the mode before a migration completes. If
+        // the topic's mode switched to cloud/tsv2 before this partition
+        // recorded one, a naive sync would jump straight to cloud and skip
+        // the migration. The partition is really still on the topic's
+        // pre-migration mode -- record that first, so the switch is handled
+        // as a migration on the next pass.
+        //
+        // Interpose only when the partition holds local or archived data: with
+        // neither, a migration has nothing to preserve and the topic mode is
+        // recorded directly. In particular, a completed-migration partition
+        // recovered onto a fresh cluster comes back with migrated_from set but
+        // an empty log positioned at the migration boundary -- its data is
+        // already L1-authoritative, and routing it as tiered would serve
+        // offset_out_of_range for offsets L1 has.
+        target = migrated_from;
+    } else if (
+      current == model::redpanda_storage_mode::tiered
+      && (target == model::redpanda_storage_mode::cloud || target == model::redpanda_storage_mode::tiered_cloud)) {
+        // A tiered partition must be migrated to cloud/tsv2. Leave the mode as
+        // tiered to allow us to continue serving IO as normal; a background
+        // migration process will eventually flip the mode when ready.
+        co_return;
+    }
+
+    if (current == target) {
         co_return;
     }
     // The archiver is rebuilt after the ntp_config flip by
