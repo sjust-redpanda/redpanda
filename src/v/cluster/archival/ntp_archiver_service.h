@@ -289,6 +289,24 @@ public:
     /// STM manifest.
     ss::future<> apply_spillover();
 
+    // One pass of the tiered->cloud migration mirror: while the archival STM's
+    // migration flag is set and the injected migration metastore sink is
+    // available, reconcile the archival manifest's segments into the L1
+    // metastore as imported extents -- prune the head that retention GC dropped
+    // and forward-append the tail that was uploaded since the last pass. Runs
+    // leader-only in housekeeping; idempotent against the L1 state.
+    ss::future<> run_migration_mirror();
+
+    // Head-prune step of the migration mirror, run before retention GC so the
+    // L1 mirror has dropped its reference to a tiered-storage object before
+    // that object is deleted (the mirror must never reference a removed object,
+    // the same invariant the archival manifest upholds in garbage_collect).
+    // Detaches the imported extents below the true log start; if retention has
+    // run ahead of what the mirror imported, empties the mirrored range so the
+    // forward append re-seeds it at the surviving manifest start. No-op unless
+    // migrating.
+    ss::future<> migration_head_prune();
+
     // Request a flush operation of all current local data to cloud storage.
     // This function can be used in combination with wait() to block until the
     // flush operation is complete.
