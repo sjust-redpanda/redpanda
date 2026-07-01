@@ -325,6 +325,15 @@ ss::future<> reconciler<Clock>::reconcile() {
     chunked_vector<ss::shared_ptr<source>> sources;
     // Make a copy of the sources to not worry about concurrent modification.
     for (auto& [_, src] : _sources) {
+        // Reconcile only cloud topics. A partition served as tiered storage --
+        // plain tiered, or still migrating tiered->cloud (partition_mode lags
+        // at tiered until cutover) -- has the archiver's mirror as its sole L1
+        // writer, so the reconciler must skip it to avoid two writers.
+        // Re-evaluated every round, so a partition is picked up automatically
+        // the round after cutover advances partition_mode.
+        if (!src->is_cloud_topic()) {
+            continue;
+        }
         sources.push_back(src);
     }
     vlog(

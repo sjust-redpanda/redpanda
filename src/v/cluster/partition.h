@@ -194,6 +194,20 @@ public:
         _creation_partition_mode = m;
     }
 
+    /// Cut a converged migrating partition over to a native cloud topic.
+    /// Coordinates the three STMs in order: seed the ctp_stm reconciliation
+    /// baseline at boundary B, advance partition_mode tiered->cloud (the
+    /// routing flip), then empty the archival STM + mark the offline phase
+    /// complete. Triggered by the archiver's mirror at convergence.
+    ss::future<>
+    cutover_to_cloud_topic(kafka::offset boundary, model::offset log_boundary);
+
+    /// On becoming leader, finish a cutover interrupted after partition_mode
+    /// advanced to cloud but before the archival manifest was emptied (a crash
+    /// window that would otherwise orphan the manifest). No-op unless
+    /// partition_mode==cloud and the archival STM still holds data.
+    ss::future<> maybe_finish_cutover();
+
     bool has_followers() const;
     void block_new_leadership() const;
     void unblock_new_leadership() const;
@@ -469,6 +483,12 @@ private:
     // the log's ntp_config, so ntp_config::partition_mode() reflects it. Called
     // at start and whenever the STM signals a change.
     void update_partition_mode();
+
+    /// The post-routing-flip tail of a TS->CT cutover, shared by
+    /// cutover_to_cloud_topic and maybe_finish_cutover: empty the archival STM
+    /// manifest (releasing the local-trim clamp and making the archiver
+    /// dormant) and mark the offline migration phase complete. Idempotent.
+    ss::future<> finish_cutover_tail(ss::lowres_clock::time_point deadline);
 
     // Creation-time partition_mode classification; see
     // set_creation_partition_mode. `unset` until manage() sets it.
