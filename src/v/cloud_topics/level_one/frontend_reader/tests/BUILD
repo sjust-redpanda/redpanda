@@ -45,6 +45,24 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
+    name = "reader_imported_test",
+    timeout = "short",
+    srcs = [
+        "reader_imported_test.cc",
+    ],
+    deps = [
+        ":l1_reader_fixture",
+        "//src/v/bytes:iobuf",
+        "//src/v/container:chunked_circular_buffer",
+        "//src/v/model",
+        "//src/v/model/tests:random",
+        "//src/v/storage:record_batch_utils",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "reader_test",
     timeout = "short",
     srcs = [

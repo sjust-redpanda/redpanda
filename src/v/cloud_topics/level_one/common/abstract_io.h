@@ -25,6 +25,11 @@
 
 namespace cloud_topics::l1 {
 
+// Forward declaration — full definition in object_handle.h.
+// Do not #include object_handle.h here: object_handle.h already includes
+// abstract_io.h for io::errc, so including it here creates a cycle.
+class object_handle;
+
 // An abstraction for a local file that is used for staging uploads to object
 // storage.
 class staging_file {
@@ -93,9 +98,21 @@ public:
     virtual ss::future<std::expected<iobuf, errc>> read_object_as_iobuf(
       object_extent, ss::abort_source*, cloud_io::group_id g);
 
-    // Delete the specified objects from object storage.
+    // Open an object for indexed read access, returning a handle that exposes
+    // both an index (for seeking) and readers (for streaming batches).
+    //
+    // For native L1 objects (extent.imported == nullopt), the handle reads the
+    // L1 footer and implements the native seek path. For imported TS extents
+    // (extent.imported.has_value()), the handle loads the TS segment index and
+    // translates log offsets to Kafka offsets while reading.
+    virtual ss::future<std::expected<std::unique_ptr<object_handle>, errc>>
+    open_object(object_extent, ss::abort_source*, cloud_io::group_id g) = 0;
+
+    // Delete the specified objects from object storage. An entry with a ts_path
+    // is addressed by that tiered-storage segment path; otherwise the native L1
+    // object path is used. Both live in the one configured object bucket.
     virtual ss::future<std::expected<void, errc>>
-    delete_objects(chunked_vector<object_id>, ss::abort_source*) = 0;
+    delete_objects(chunked_vector<object_location>, ss::abort_source*) = 0;
 
     // Create a multipart upload for streaming data directly to object storage.
     virtual ss::future<

@@ -11,6 +11,7 @@
 #pragma once
 
 #include "cloud_topics/level_one/common/file_io.h"
+#include "cloud_topics/level_one/common/file_io_probe.h"
 #include "cloud_topics/level_one/domain/domain_supervisor.h"
 #include "cloud_topics/level_one/frontend_reader/l1_reader_cache.h"
 #include "cloud_topics/level_one/frontend_reader/level_one_reader_probe.h"

@@ -11,18 +11,27 @@
 #include "cloud_topics/level_one/common/file_io.h"
 
 #include "base/vassert.h"
+#include "bytes/iostream.h"
 #include "cloud_io/io_result.h"
 #include "cloud_io/remote.h"
+#include "cloud_storage/remote_segment.h"
+#include "cloud_storage/remote_segment_index.h"
+#include "cloud_storage/tx_range_manifest.h"
 #include "cloud_storage_clients/client.h"
 #include "cloud_topics/level_one/common/abstract_io.h"
+#include "cloud_topics/level_one/common/file_io_probe.h"
+#include "cloud_topics/level_one/common/object.h"
+#include "cloud_topics/level_one/common/object_handle.h"
 #include "cloud_topics/level_one/common/object_id.h"
 #include "cloud_topics/level_one/common/object_utils.h"
+#include "cloud_topics/level_one/common/ts_object.h"
 #include "cloud_topics/logger.h"
 #include "config/configuration.h"
 
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 
@@ -88,6 +97,213 @@ struct one_time_stream_provider : public stream_provider {
     }
     std::optional<ss::input_stream<char>> _st;
 };
+
+ss::future<uint64_t> save_to_cache(
+  cloud_io::cache* cache,
+  ss::input_stream<char> stream,
+  cloud_io::space_reservation_guard* reservation,
+  std::filesystem::path cache_key,
+  uint64_t content_length) {
+    co_await cache->put(std::move(cache_key), stream, *reservation);
+    co_return content_length;
+}
+
+// Reserve cache space, run the S3 GET for [offset, offset+size) of `key`, and
+// stream the bytes into the cloud cache under `cache_key`. Succeeds, or fails
+// with the mapped errc on reservation / download failure. Runs under
+// single_flight so concurrent missers for the same key share one download.
+ss::future<single_flight::outcome> do_download_to_cache(
+  cloud_io::remote* remote,
+  cloud_io::cache* cache,
+  const cloud_storage_clients::bucket_name& bucket,
+  const cloud_storage_clients::object_key& key,
+  const std::filesystem::path& cache_key,
+  size_t offset,
+  size_t size,
+  cloud_io::group_id group,
+  std::string_view download_label,
+  retry_chain_node& root,
+  ss::abort_source& as) {
+    // TODO(cloud_topics): reserving space should also take an abort_source
+    auto reservation_fut
+      = co_await ss::coroutine::as_future<cloud_io::space_reservation_guard>(
+        cache->reserve_space(size, 1));
+    if (reservation_fut.failed()) {
+        auto ex = reservation_fut.get_exception();
+        vlog(
+          cd_log.warn, "Error reserving cache space for {}: {}", cache_key, ex);
+        co_return std::unexpected(io::errc::file_io_error);
+    }
+    cloud_io::try_consume_stream consumer =
+      [cache, rg = reservation_fut.get(), &cache_key](
+        uint64_t content_length, ss::input_stream<char> s) mutable {
+          return save_to_cache(
+            cache, std::move(s), &rg, cache_key, content_length);
+      };
+    auto result_fut
+      = co_await ss::coroutine::as_future<cloud_io::download_result>(
+        remote->download_stream(
+          cloud_io::transfer_details{
+            .bucket = bucket,
+            .key = key,
+            .parent_rtc = root,
+          },
+          consumer,
+          download_label,
+          /*acquire_hydration_units=*/true,
+          cloud_storage_clients::http_byte_range{offset, offset + size - 1},
+          {},
+          group));
+    if (result_fut.failed()) {
+        auto ex = result_fut.get_exception();
+        vlog(cd_log.warn, "Error downloading {}: {}", cache_key, ex);
+        // Map abort to cloud_op_timeout so a leader-abort and a merger-abort
+        // produce the same errc for the same event.
+        co_return std::unexpected(
+          as.abort_requested() ? io::errc::cloud_op_timeout
+                               : io::errc::cloud_op_error);
+    }
+    switch (result_fut.get()) {
+    case cloud_io::download_result::success:
+        co_return single_flight::outcome{};
+    case cloud_io::download_result::notfound:
+        co_return std::unexpected(io::errc::cloud_missing_object);
+    case cloud_io::download_result::timedout:
+        co_return std::unexpected(io::errc::cloud_op_timeout);
+    case cloud_io::download_result::failed:
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    std::unreachable();
+}
+
+// Returns a stream over [offset, offset+size) of the object at `key` in
+// `bucket`, caching the downloaded range locally under `cache_key`. Shared by
+// the native L1 read path and the imported TS-segment fetch. `sf` dedups
+// concurrent downloads that miss the cache for the same `cache_key`; cache-miss
+// and merge events are reported to `probe` when it is non-null.
+ss::future<std::expected<ss::input_stream<char>, io::errc>>
+download_cached_range(
+  cloud_io::remote* remote,
+  cloud_io::cache* cache,
+  const cloud_storage_clients::bucket_name& bucket,
+  cloud_storage_clients::object_key key,
+  std::filesystem::path cache_key,
+  size_t offset,
+  size_t size,
+  cloud_io::group_id group,
+  std::string_view download_label,
+  single_flight& sf,
+  file_io_probe* probe,
+  ss::abort_source* as) {
+    static constexpr auto timeout = 10s;
+    static constexpr auto backoff = 100ms;
+    retry_chain_node root(*as, ss::lowres_clock::now() + timeout, backoff);
+    while (true) {
+        auto stream_fut = co_await ss::coroutine::as_future<
+          std::optional<cloud_io::cache_item_stream>>(cache->get_stream(
+          cache_key,
+          config::shard_local_cfg().storage_read_buffer_size(),
+          config::shard_local_cfg().storage_read_readahead_count()));
+        if (stream_fut.failed()) {
+            auto ex = stream_fut.get_exception();
+            vlog(
+              cd_log.warn,
+              "Error reading from cache for {}: {}",
+              cache_key,
+              ex);
+            co_return std::unexpected(io::errc::file_io_error);
+        }
+        auto stream = stream_fut.get();
+        if (stream) {
+            co_return std::move(stream->body);
+        }
+
+        if (probe) {
+            probe->register_cache_miss();
+        }
+
+        // single_flight dedups concurrent downloads for this cache_key.
+        auto r = co_await sf.run(
+          cache_key,
+          *as,
+          [remote,
+           cache,
+           &bucket,
+           &key,
+           &cache_key,
+           offset,
+           size,
+           group,
+           download_label,
+           &root,
+           as] {
+              return do_download_to_cache(
+                remote,
+                cache,
+                bucket,
+                key,
+                cache_key,
+                offset,
+                size,
+                group,
+                download_label,
+                root,
+                *as);
+          },
+          &cd_log);
+        if (!r.has_value()) {
+            co_return std::unexpected(r.error());
+        }
+        if (r.value()) {
+            vlog(cd_log.debug, "Merged L1 read for {}", cache_key);
+            if (probe) {
+                probe->register_concurrent_read_merge();
+            }
+        }
+        // The leader populated the cache (mergers waited for it); loop back to
+        // serve the now-cached bytes.
+    }
+}
+
+// Download a whole object by key into an iobuf. Used for small sidecar objects
+// (the imported segment's index and tx-range manifest) that are fetched in one
+// shot rather than streamed through the cache.
+ss::future<std::expected<iobuf, io::errc>> download_raw_iobuf(
+  cloud_io::remote* remote,
+  const cloud_storage_clients::bucket_name& bucket,
+  const ss::sstring& key,
+  ss::abort_source* as) {
+    static constexpr auto timeout = 10s;
+    static constexpr auto backoff = 100ms;
+    retry_chain_node root(*as, ss::lowres_clock::now() + timeout, backoff);
+    iobuf result;
+    auto res_fut = co_await ss::coroutine::as_future<cloud_io::download_result>(
+      remote->download_object({
+        .transfer_details = {
+          .bucket = bucket,
+          .key = cloud_storage_clients::object_key{key},
+          .parent_rtc = root,
+        },
+        .display_str = "ts_raw_download",
+        .payload = result,
+      }));
+    if (res_fut.failed()) {
+        auto ex = res_fut.get_exception();
+        vlog(cd_log.warn, "Error downloading raw object {}: {}", key, ex);
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    switch (res_fut.get()) {
+    case cloud_io::download_result::success:
+        co_return std::move(result);
+    case cloud_io::download_result::notfound:
+        co_return std::unexpected(io::errc::cloud_missing_object);
+    case cloud_io::download_result::timedout:
+        co_return std::unexpected(io::errc::cloud_op_timeout);
+    case cloud_io::download_result::failed:
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    std::unreachable();
+}
 
 } // namespace
 
@@ -169,77 +385,6 @@ file_io::put_object(object_id oid, staging_file* file, ss::abort_source* as) {
     std::unreachable();
 }
 
-ss::future<uint64_t> file_io::save_to_cache(
-  ss::input_stream<char> stream,
-  cloud_io::space_reservation_guard* reservation,
-  std::filesystem::path cache_key,
-  uint64_t content_length) {
-    co_await _cache->put(std::move(cache_key), stream, *reservation);
-    co_return content_length;
-}
-
-ss::future<std::expected<void, io::errc>> file_io::do_download_to_cache(
-  const object_extent& extent,
-  const std::filesystem::path& cache_key,
-  retry_chain_node& root,
-  ss::abort_source& as,
-  cloud_io::group_id gid) {
-    // TODO(cloud_topics): reserving space should also take an abort_source
-    auto reservation_fut
-      = co_await ss::coroutine::as_future<cloud_io::space_reservation_guard>(
-        _cache->reserve_space(extent.size, 1));
-    if (reservation_fut.failed()) {
-        auto ex = reservation_fut.get_exception();
-        vlog(
-          cd_log.warn,
-          "Error reserving cache space for download of {}: {}",
-          extent,
-          ex);
-        co_return std::unexpected(io::errc::file_io_error);
-    }
-    cloud_io::try_consume_stream consumer =
-      [this, r = reservation_fut.get(), &cache_key](
-        uint64_t content_length, ss::input_stream<char> stream) mutable {
-          return save_to_cache(
-            std::move(stream), &r, cache_key, content_length);
-      };
-    auto result_fut
-      = co_await ss::coroutine::as_future<cloud_io::download_result>(
-        _remote->download_stream(
-          cloud_io::transfer_details{
-            .bucket = _bucket,
-            .key = object_path_factory::level_one_path(extent.id),
-            .parent_rtc = root,
-          },
-          consumer,
-          "l1_file_download",
-          /*acquire_hydration_units=*/true,
-          cloud_storage_clients::http_byte_range{
-            extent.position, extent.position + extent.size - 1},
-          {},
-          gid));
-    if (result_fut.failed()) {
-        auto ex = result_fut.get_exception();
-        vlog(cd_log.warn, "Error downloading object {}: {}", extent, ex);
-        // Map abort to cloud_op_timeout so a leader-abort and a
-        // merger-abort produce the same errc for the same event.
-        co_return std::unexpected(
-          as.abort_requested() ? io::errc::cloud_op_timeout
-                               : io::errc::cloud_op_error);
-    }
-    switch (result_fut.get()) {
-    case cloud_io::download_result::success:
-        co_return std::expected<void, io::errc>{};
-    case cloud_io::download_result::notfound:
-        co_return std::unexpected(io::errc::cloud_missing_object);
-    case cloud_io::download_result::timedout:
-        co_return std::unexpected(io::errc::cloud_op_timeout);
-    case cloud_io::download_result::failed:
-        co_return std::unexpected(io::errc::cloud_op_error);
-    }
-    std::unreachable();
-}
-
 ss::future<std::expected<ss::input_stream<char>, io::errc>>
 file_io::read_object(
   object_extent extent, ss::abort_source* as, cloud_io::group_id gid) {
@@ -250,73 +395,186 @@ file_io::read_object(
     if (_probe) {
         _probe->register_read();
     }
-    static constexpr auto timeout = 10s;
-    static constexpr auto backoff = 100ms;
-    retry_chain_node root(*as, ss::lowres_clock::now() + timeout, backoff);
     // TODO(cloud_topics): Optimize the cache such that it understands partial
     // objects? Or we assert somehow there are no overlaps (or just live with
     // them).
     // TODO(cloud_topics): If reading just a footer, we should skip the cache.
     // Maybe we need another method for that which is iobuf based?
     auto cache_key = file_io::cache_key(extent);
-    while (true) {
-        auto stream_fut = co_await ss::coroutine::as_future<
-          std::optional<cloud_io::cache_item_stream>>(_cache->get_stream(
-          cache_key,
-          config::shard_local_cfg().storage_read_buffer_size(),
-          config::shard_local_cfg().storage_read_readahead_count()));
-        if (stream_fut.failed()) {
-            auto ex = stream_fut.get_exception();
-            vlog(
-              cd_log.warn, "Error reading from cache for {}: {}", extent, ex);
-            co_return std::unexpected(io::errc::file_io_error);
-        }
-        auto stream = stream_fut.get();
-        if (stream) {
-            co_return std::move(stream->body);
-        }
-
-        if (_probe) {
-            _probe->register_cache_miss();
-        }
-
-        // single_flight dedups concurrent downloads for this extent.
-        auto r = co_await _single_flight.run(
-          cache_key,
-          *as,
-          [this, &extent, &cache_key, &root, as, gid]() {
-              return do_download_to_cache(extent, cache_key, root, *as, gid);
-          },
-          &cd_log);
-
-        if (!r.has_value()) {
-            // TODO(cloud_topics): on a transient errc, a merger whose own
-            // abort_source hasn't fired could re-loop as its own leader
-            // instead of inheriting the leader's failure.
-            co_return std::unexpected(r.error());
-        }
-        if (r.value()) {
-            vlog(cd_log.debug, "Merged L1 read for {}", extent);
-            if (_probe) {
-                _probe->register_concurrent_read_merge();
-            }
-        }
-    }
+    co_return co_await download_cached_range(
+      _remote,
+      _cache,
+      _bucket,
+      object_path_factory::level_one_path(extent.id),
+      cache_key,
+      extent.position,
+      extent.size,
+      gid,
+      "l1_file_download",
+      _single_flight,
+      _probe,
+      as);
 }
 
-ss::future<std::expected<void, io::errc>>
-file_io::delete_objects(chunked_vector<object_id> ids, ss::abort_source* as) {
-    static constexpr auto timeout = 10s;
-    static constexpr auto backoff = 100ms;
-    retry_chain_node root(*as, ss::lowres_clock::now() + timeout, backoff);
-    chunked_vector<cloud_storage_clients::object_key> keys;
-    for (const auto& id : ids) {
-        keys.push_back(object_path_factory::level_one_path(id));
+ss::future<std::expected<std::unique_ptr<object_handle>, io::errc>>
+file_io::open_object(
+  object_extent extent, ss::abort_source* as, cloud_io::group_id g) {
+    if (extent.imported.has_value()) {
+        auto index_path = cloud_storage::generate_index_path(
+          cloud_storage::remote_segment_path{
+            std::filesystem::path{extent.imported->ts_path()}});
+        cloud_storage::offset_index ts_index(
+          model::offset{0},
+          kafka::offset{0},
+          0,
+          cloud_storage::remote_segment_sampling_step_bytes,
+          model::timestamp::missing());
+        auto index_iobuf = co_await download_raw_iobuf(
+          _remote, _bucket, index_path.native(), as);
+        if (index_iobuf.has_value()) {
+            if (_probe != nullptr) {
+                _probe->register_ts_index_read(index_iobuf->size_bytes());
+            }
+            ts_index.from_iobuf(std::move(*index_iobuf));
+        } else if (index_iobuf.error() != io::errc::cloud_missing_object) {
+            // A genuinely absent index (notfound) is fine: fall back to a
+            // full-segment scan with an empty index. Any other error (timeout
+            // or transient failure) must propagate -- previously it was
+            // silently masked as an empty-index full scan.
+            vlog(
+              cd_log.warn,
+              "Failed to download index for imported segment {}: {}",
+              extent.imported->ts_path,
+              index_iobuf.error());
+            co_return std::unexpected(index_iobuf.error());
+        }
+        auto idx = std::make_unique<ts_segment_index>(
+          std::move(ts_index), extent.imported->delta_base, extent.size);
+
+        // Aborted-transaction ranges for this segment, so the reader can strip
+        // aborted data and make the imported region committed-only (like native
+        // CT L1). Ranges are in raw log-offset space, as the reader needs.
+        //
+        // Whether to fetch the .tx manifest is decided by the import-time
+        // tx_state, which mirrors what native tiered storage already knows
+        // without a probe (remote_segment.cc): only v1/v2 non-compacted
+        // segments require a probe.
+        aborted_transactions aborted;
+        cloud_storage::remote_segment_path seg_path{
+          std::filesystem::path{extent.imported->ts_path()}};
+        if (extent.imported->tx_state != tx_manifest_state::absent) {
+            // present or unknown: download the .tx manifest.
+            auto tx_path = cloud_storage::generate_remote_tx_path(seg_path);
+            auto tx_iobuf = co_await download_raw_iobuf(
+              _remote, _bucket, tx_path().native(), as);
+            if (tx_iobuf.has_value()) {
+                if (_probe != nullptr) {
+                    _probe->register_ts_tx_read(tx_iobuf->size_bytes());
+                }
+                cloud_storage::tx_range_manifest manifest(seg_path);
+                co_await manifest.update(
+                  make_iobuf_input_stream(std::move(*tx_iobuf)));
+                for (auto& r : std::move(manifest).get_tx_range()) {
+                    aborted.insert(r);
+                }
+            } else if (tx_iobuf.error() == io::errc::cloud_missing_object) {
+                // A missing .tx means no aborted transactions. Tolerate it and
+                // read the segment as committed-only, matching native tiered
+                // storage, which treats a notfound .tx as empty
+                // (remote_segment.cc). When tx_state == present the source
+                // metadata recorded a .tx, so its absence is unexpected (a lost
+                // or partial upload) and we warn -- but as a compatibility
+                // layer we degrade gracefully rather than turning behavior that
+                // was silently tolerated by tiered storage into a hard read
+                // failure.
+                if (extent.imported->tx_state == tx_manifest_state::present) {
+                    vlog(
+                      cd_log.warn,
+                      "Imported segment {} was expected to have a .tx manifest "
+                      "(its metadata recorded one) but it is missing; reading "
+                      "the segment as committed-only",
+                      extent.imported->ts_path);
+                }
+            } else {
+                // A transient/other error (not a definitive notfound):
+                // propagate so the read is retried, rather than silently
+                // dropping aborted-transaction filtering.
+                vlog(
+                  cd_log.warn,
+                  "Failed to download tx manifest for imported segment {}: {}",
+                  extent.imported->ts_path,
+                  tx_iobuf.error());
+                co_return std::unexpected(tx_iobuf.error());
+            }
+        }
+        // tx_state == absent: known to have no aborted transactions (compacted,
+        // or v3 with an empty .tx manifest), so skip the download entirely --
+        // `aborted` stays empty.
+
+        // Serve the segment as lazily-fetched fixed-size chunks so a read only
+        // downloads the chunks it touches (a read bounded by max_offset/
+        // max_bytes stops pulling and the tail is never fetched). chunk_size==0
+        // (cloud_storage_disable_chunk_reads) falls back to a single
+        // whole-suffix download. The fetch is invoked per chunk with a
+        // chunk-aligned (pos,len); the (pos,len)-keyed cache entry then dedups
+        // across reads that touch the same chunk.
+        const auto chunk_size
+          = config::shard_local_cfg().cloud_storage_disable_chunk_reads()
+              ? size_t{0}
+              : config::shard_local_cfg().cloud_storage_cache_chunk_size();
+        co_return std::make_unique<ts_object_handle>(
+          std::move(idx),
+          extent.imported->segment_term,
+          std::move(aborted),
+          [remote = _remote,
+           bucket = _bucket,
+           cache = _cache,
+           ts_path = extent.imported->ts_path(),
+           sf = &_single_flight,
+           probe = _probe](size_t pos, size_t len, ss::abort_source* as)
+            -> ss::future<std::expected<ss::input_stream<char>, io::errc>> {
+              return download_cached_range(
+                remote,
+                cache,
+                bucket,
+                cloud_storage_clients::object_key{ts_path},
+                fmt::format(
+                  "ts_{}_position_{}_size_{}.partial", ts_path, pos, len),
+                pos,
+                len,
+                cloud_io::group_id::default_group,
+                "ts_segment_download",
+                *sf,
+                probe,
+                as);
+          },
+          chunk_size);
     }
+
+    if (_probe != nullptr) {
+        _probe->register_footer_read(extent.size);
+    }
+    auto read_result = co_await read_object_as_iobuf(extent, as, g);
+    if (!read_result.has_value()) {
+        co_return std::unexpected(read_result.error());
+    }
+    auto footer_result = co_await footer::read(std::move(read_result).value());
+    if (!std::holds_alternative<footer>(footer_result)) {
+        vlog(cd_log.warn, "Failed to parse L1 footer for object {}", extent.id);
+        co_return std::unexpected(io::errc::cloud_op_error);
+    }
+    co_return std::make_unique<l1_native_object_handle>(
+      extent.id, std::get<footer>(std::move(footer_result)), this, g);
+}
+
+ss::future<std::expected<void, io::errc>> file_io::delete_keys(
+  const cloud_storage_clients::bucket_name& bucket,
+  chunked_vector<cloud_storage_clients::object_key> keys,
+  retry_chain_node& root) {
     auto result_fut
       = co_await ss::coroutine::as_future<cloud_io::upload_result>(
         _remote->delete_objects(
-          _bucket, std::move(keys), root, [](size_t retry_count) {
+          bucket, std::move(keys), root, [](size_t retry_count) {
               std::ignore = retry_count;
           }));
     if (result_fut.failed()) {
@@ -334,6 +592,64 @@ file_io::delete_objects(chunked_vector<object_id> ids, ss::abort_source* as) {
         co_return std::unexpected(io::errc::cloud_op_error);
     }
     std::unreachable();
+}
+
+ss::future<std::expected<void, io::errc>> file_io::delete_objects(
+  chunked_vector<object_location> objects, ss::abort_source* as) {
+    static constexpr auto timeout = 10s;
+    static constexpr auto backoff = 100ms;
+    retry_chain_node root(*as, ss::lowres_clock::now() + timeout, backoff);
+
+    chunked_vector<cloud_storage_clients::object_key> native_keys;
+    chunked_vector<cloud_storage_clients::object_key> ts_keys;
+    size_t ts_count = 0;
+    for (const auto& obj : objects) {
+        if (obj.ts_path.has_value()) {
+            ++ts_count;
+            // An imported segment owns three cloud objects (the segment, its
+            // .tx range manifest, and its .index), the same set the archiver
+            // would have deleted. Remove all three so nothing is orphaned.
+            cloud_storage::remote_segment_path seg_path{
+              std::filesystem::path{(*obj.ts_path)()}};
+            ts_keys.push_back(
+              cloud_storage_clients::object_key{(*obj.ts_path)()});
+            ts_keys.push_back(
+              cloud_storage_clients::object_key{
+                cloud_storage::generate_remote_tx_path(seg_path)().native()});
+            ts_keys.push_back(
+              cloud_storage_clients::object_key{
+                cloud_storage::generate_index_path(seg_path).native()});
+        } else {
+            native_keys.push_back(object_path_factory::level_one_path(obj.id));
+        }
+    }
+
+    if (!native_keys.empty()) {
+        auto l1_object_count = native_keys.size();
+        auto res = co_await delete_keys(_bucket, std::move(native_keys), root);
+        if (!res.has_value()) {
+            vlog(
+              cd_log.warn,
+              "Failed to delete {} L1 objects: {}",
+              l1_object_count,
+              res.error());
+            co_return res;
+        }
+    }
+    if (!ts_keys.empty()) {
+        auto ts_key_count = ts_keys.size();
+        auto res = co_await delete_keys(_bucket, std::move(ts_keys), root);
+        if (!res.has_value()) {
+            vlog(
+              cd_log.warn,
+              "Failed to delete {} keys for {} imported TS segments: {}",
+              ts_key_count,
+              ts_count,
+              res.error());
+            co_return res;
+        }
+    }
+    co_return std::expected<void, io::errc>{};
 }
 
 ss::future<std::expected<cloud_storage_clients::multipart_upload_ref, io::errc>>

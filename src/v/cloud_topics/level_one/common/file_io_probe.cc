@@ -43,6 +43,24 @@ void file_io_probe::setup_metrics() {
             "Cache misses that joined an in-flight download for the "
             "same extent.")),
       });
+    _metrics.add_group(
+      prometheus_sanitize::metrics_name("cloud_topics_level_one_reader"),
+      {
+        sm::make_counter(
+          "footer_read_bytes",
+          [this] { return _footer_bytes_read; },
+          sm::description("Number of footer bytes read by L1 readers.")),
+        sm::make_counter(
+          "ts_index_read_bytes",
+          [this] { return _ts_index_bytes_read; },
+          sm::description("Number of imported tiered-storage segment index "
+                          "bytes read by L1 readers.")),
+        sm::make_counter(
+          "ts_tx_read_bytes",
+          [this] { return _ts_tx_bytes_read; },
+          sm::description("Number of imported tiered-storage segment "
+                          "tx-manifest bytes read by L1 readers.")),
+      });
 }
 
 } // namespace cloud_topics::l1
