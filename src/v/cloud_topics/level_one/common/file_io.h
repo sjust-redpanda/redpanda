@@ -60,31 +60,29 @@ public:
       cloud_io::group_id g,
       bool skip_cache) override;
 
+    ss::future<std::expected<std::unique_ptr<object_handle>, errc>> open_object(
+      object_extent,
+      ss::abort_source*,
+      cloud_io::group_id g,
+      bool skip_cache) override;
+
     ss::future<std::expected<void, errc>>
-    delete_objects(chunked_vector<object_id>, ss::abort_source*) override;
+    delete_objects(chunked_vector<object_location>, ss::abort_source*) override;
 
     ss::future<std::expected<cloud_storage_clients::multipart_upload_ref, errc>>
     create_multipart_upload(
       object_id, size_t part_size, ss::abort_source*) override;
 
 private:
-    ss::future<uint64_t> save_to_cache(
-      ss::input_stream<char>,
-      cloud_io::space_reservation_guard*,
-      std::filesystem::path,
-      uint64_t content_length);
-
-    /// Reserve cache space, run the S3 GET, and stream the bytes into
-    /// the cloud cache under `cache_key`. Succeeds, or fails with the
-    /// mapped errc on reservation / download failure.
-    ss::future<std::expected<void, errc>> do_download_to_cache(
-      const object_extent& extent,
-      const std::filesystem::path& cache_key,
-      retry_chain_node& root,
-      ss::abort_source& as,
-      cloud_io::group_id gid);
+    // Delete a batch of keys from the given bucket.
+    ss::future<std::expected<void, errc>> delete_keys(
+      const cloud_storage_clients::bucket_name& bucket,
+      chunked_vector<cloud_storage_clients::object_key> keys,
+      retry_chain_node& parent);
 
     cloud_io::remote* _remote;
+    // Holds both native L1 objects and imported tiered-storage segments: a
+    // single cluster always stores both in the one configured object bucket.
     cloud_storage_clients::bucket_name _bucket;
     std::filesystem::path _staging_dir;
     cloud_io::cache* _cache;

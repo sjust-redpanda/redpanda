@@ -20,9 +20,13 @@ redpanda_cc_library(
     ],
     deps = [
         "//src/v/base",
+        "//src/v/model",
+        "//src/v/serde",
+        "//src/v/serde:enum",
         "//src/v/utils:named_type",
         "//src/v/utils:uuid",
         "@fmt",
+        "@seastar",
     ],
 )
 
@@ -98,6 +102,70 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "object_handle",
+    srcs = ["object_handle.cc"],
+    hdrs = ["object_handle.h"],
+    deps = [
+        ":abstract_io",
+        ":object",
+        ":object_id",
+        "//src/v/model",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "ts_reader",
+    srcs = ["ts_reader.cc"],
+    hdrs = ["ts_reader.h"],
+    visibility = ["//visibility:private"],
+    implementation_deps = [
+        "//src/v/bytes:iostream",
+        "//src/v/storage:record_batch_utils",
+        "@fmt",
+    ],
+    deps = [
+        ":object",
+        "//src/v/model",
+        "@abseil-cpp//absl/container:btree",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "ts_chunk_data_source",
+    srcs = ["ts_chunk_data_source.cc"],
+    hdrs = ["ts_chunk_data_source.h"],
+    implementation_deps = [
+        "//src/v/base",
+        "@fmt",
+    ],
+    deps = [
+        ":abstract_io",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "ts_object",
+    srcs = ["ts_object.cc"],
+    hdrs = ["ts_object.h"],
+    visibility = ["//visibility:private"],
+    implementation_deps = [
+        ":ts_reader",
+    ],
+    deps = [
+        ":abstract_io",
+        ":object_handle",
+        ":ts_chunk_data_source",
+        "//src/v/cloud_storage:offset_index",
+        "//src/v/model",
+        "@abseil-cpp//absl/container:btree",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "file_io",
     srcs = [
         "file_io.cc",
@@ -107,16 +175,22 @@ redpanda_cc_library(
         "file_io.h",
         "file_io_probe.h",
     ],
-    implementation_deps = [
-        "//src/v/base",
-    ],
     visibility = [
         "//src/v/cloud_topics:__pkg__",
         "//src/v/cloud_topics/level_one:__subpackages__",
         "//src/v/cloud_topics/read_replica:__pkg__",
     ],
+    implementation_deps = [
+        ":ts_object",
+        "//src/v/base",
+        "//src/v/bytes:iostream",
+        "//src/v/cloud_storage",
+        "@abseil-cpp//absl/container:btree",
+    ],
     deps = [
         ":abstract_io",
+        ":object",
+        ":object_handle",
         ":object_id",
         ":object_utils",
         ":single_flight",
@@ -137,13 +211,20 @@ redpanda_cc_library(
     name = "fake_io",
     srcs = ["fake_io.cc"],
     hdrs = ["fake_io.h"],
+    implementation_deps = [
+        ":object",
+        ":ts_object",
+        "//src/v/cloud_storage",
+    ],
     deps = [
         ":abstract_io",
+        ":object_handle",
         ":object_id",
         ":object_utils",
         "//src/v/bytes:iobuf",
         "//src/v/bytes:iostream",
         "//src/v/cloud_storage_clients",
+        "//src/v/model",
         "@abseil-cpp//absl/container:btree",
         "@seastar",
     ],
