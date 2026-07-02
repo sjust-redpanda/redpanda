@@ -59,6 +59,7 @@ enum class feature : std::uint64_t {
     batch_mirror_topic_status = 1ULL << 15U,
     shadow_link_sr_api_sync = 1ULL << 16U,
     iceberg_extended_mode_config = 1ULL << 17U,
+    tiered_to_cloud_migration = 1ULL << 18U,
     node_isolation = 1ULL << 19U,
     group_offset_retention = 1ULL << 20U,
     membership_change_controller_cmds = 1ULL << 22U,
@@ -428,6 +429,12 @@ inline constexpr std::array feature_schema{
     "partition_properties_stm",
     feature::partition_properties_stm,
     feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v26_2_1,
+    "tiered_to_cloud_migration",
+    feature::tiered_to_cloud_migration,
+    feature_spec::available_policy::explicit_only,
     feature_spec::prepare_policy::always},
   feature_spec{
     release_version::v24_3_1,

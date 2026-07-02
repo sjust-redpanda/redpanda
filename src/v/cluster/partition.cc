@@ -473,6 +473,17 @@ ss::future<> partition::start(
     _partition_properties_stm
       = _raft->stm_manager()->get<cluster::partition_properties_stm>();
 
+    // Feed the partition's durable storage mode into the log's ntp_config and
+    // keep it up to date as the STM applies changes. Reading replicated STM
+    // state is always safe; writes (which require the partition_mode feature)
+    // are gated separately. Until partition_mode is set, partition_mode() is
+    // `unset` and ntp_config falls back to the topic-config-derived mode.
+    if (_partition_properties_stm) {
+        _partition_properties_stm->set_partition_mode_change_callback(
+          [this] { update_partition_mode(); });
+        update_partition_mode();
+    }
+
     // Start the probe after the partition is fully initialised
     _probe.setup_metrics(ntp);
 
@@ -1751,6 +1762,66 @@ partition::force_abort_replica_set_update(model::revision_id rev) {
     return _raft->abort_configuration_change(rev);
 }
 consensus_ptr partition::raft() const { return _raft; }
+
+void partition::update_partition_mode() {
+    if (!_partition_properties_stm) {
+        return;
+    }
+    _raft->log()->set_partition_mode(
+      _partition_properties_stm->partition_mode());
+}
+
+ss::future<> partition::maybe_bootstrap_partition_mode() {
+    if (!_partition_properties_stm || !is_leader()) {
+        co_return;
+    }
+    if (!_feature_table.local().is_active(
+          features::feature::tiered_to_cloud_migration)) {
+        co_return;
+    }
+    // Already bootstrapped (or already advanced by a migration): nothing to do.
+    if (
+      _partition_properties_stm->partition_mode()
+      != model::redpanda_storage_mode::unset) {
+        co_return;
+    }
+    // Pick the mode to record.
+    //   - holds_archived_data(): the partition holds tiered-storage data, so it
+    //     is (still) tiered regardless of topic_mode -- covers a node that
+    //     became leader *after* the operator switched the topic ts->ct, whose
+    //     archival manifest (loaded on a running partition) reveals it is
+    //     mid-migration while topic_mode() already reads `cloud`.
+    //   - _creation_partition_mode: the classification manage() computed
+    //     deterministically at creation, authoritative when set. Preferred over
+    //     re-reading topic_mode() here because it captures the mode as it was
+    //     at creation, immune to a later async topic-config flip.
+    //   - topic_mode(): the fallback for a partition with no creation-time hint
+    //     (created before this classifier existed). Legacy shadow_indexing
+    //     topics have topic_mode() == unset and are left unset (SI fallback).
+    const bool holds_ts_data = _archival_meta_stm
+                               && _archival_meta_stm->holds_archived_data();
+    model::redpanda_storage_mode target;
+    if (holds_ts_data) {
+        target = model::redpanda_storage_mode::tiered;
+    } else if (
+      _creation_partition_mode != model::redpanda_storage_mode::unset) {
+        target = _creation_partition_mode;
+    } else {
+        target = get_ntp_config().topic_mode();
+    }
+    if (target == model::redpanda_storage_mode::unset) {
+        co_return;
+    }
+    auto res = co_await _partition_properties_stm->set_partition_mode(target);
+    if (res.has_error()) {
+        vlog(
+          clusterlog.debug,
+          "{}: failed to bootstrap partition_mode to {}: {}",
+          _raft->ntp(),
+          target,
+          res.error().message());
+    }
+}
 
 ss::future<result<model::offset>> partition::set_writes_disabled(
   partition_properties_stm::writes_disabled disable,

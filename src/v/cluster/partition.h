@@ -164,6 +164,25 @@ public:
 
     bool is_elected_leader() const;
     bool is_leader() const;
+
+    // On becoming leader, capture the partition's current
+    // (topic-config-derived) storage mode into partition_properties, so it is
+    // remembered across later topic-config changes (the TS->CT migration).
+    // Gated behind the partition_mode feature; one-time per partition and
+    // idempotent. Legacy shadow_indexing topics (no explicit storage_mode) are
+    // left unset. Invoked by partition_manager's leadership notification.
+    ss::future<> maybe_bootstrap_partition_mode();
+
+    // The partition_mode to record at bootstrap, classified deterministically
+    // at creation (partition_manager::manage), so it does not depend on the
+    // async config propagation a runtime re-derivation would race. `unset`
+    // means "no creation-time classification" (e.g. created while the feature
+    // was inactive), in which case the bootstrap falls back to the runtime
+    // signals.
+    void set_creation_partition_mode(model::redpanda_storage_mode m) {
+        _creation_partition_mode = m;
+    }
+
     bool has_followers() const;
     void block_new_leadership() const;
     void unblock_new_leadership() const;
@@ -423,6 +442,16 @@ private:
     // If should_notify_topic_config is set, it marks the topic_manifest as
     // dirty so that it gets reuploaded
     ss::future<> restart_archiver(bool should_notify_topic_config);
+
+    // Push the partition's durable storage mode (partition_properties_stm) into
+    // the log's ntp_config, so ntp_config::partition_mode() reflects it. Called
+    // at start and whenever the STM signals a change.
+    void update_partition_mode();
+
+    // Creation-time partition_mode classification; see
+    // set_creation_partition_mode. `unset` until manage() sets it.
+    model::redpanda_storage_mode _creation_partition_mode{
+      model::redpanda_storage_mode::unset};
 
     consensus_ptr _raft; // never null
     ss::shared_ptr<cluster::log_eviction_stm> _log_eviction_stm;
