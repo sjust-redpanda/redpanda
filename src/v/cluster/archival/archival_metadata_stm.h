@@ -216,6 +216,11 @@ public:
     /// added with `add_segments`.
     const cloud_storage::partition_manifest& manifest() const;
 
+    /// True if the partition holds tiered-storage data: the manifest has
+    /// segments, or a non-empty spillover archive. Used to detect that a
+    /// partition is (still) tiered storage independent of the topic config.
+    bool holds_archived_data() const;
+
     ss::future<> stop() override;
 
     static ss::future<> make_snapshot(
@@ -253,9 +258,6 @@ public:
     model::offset get_archive_start_offset() const;
     model::offset get_archive_clean_offset() const;
 
-    /// True if the partition still has data in tiered storage -- either in the
-    /// live STM manifest or offloaded to the spillover archive.
-    bool holds_archived_data() const;
     kafka::offset get_start_kafka_offset() const;
 
     // Return list of all segments that has to be

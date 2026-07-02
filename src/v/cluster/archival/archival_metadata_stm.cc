@@ -1686,6 +1686,11 @@ archival_metadata_stm::manifest() const {
     return *_manifest;
 }
 
+bool archival_metadata_stm::holds_archived_data() const {
+    return _manifest->size() > 0
+           || _manifest->get_archive_start_offset() != model::offset{};
+}
+
 model::offset archival_metadata_stm::get_start_offset() const {
     auto p = _manifest->get_start_offset();
     if (p.has_value()) {
@@ -1700,11 +1705,6 @@ model::offset archival_metadata_stm::get_last_offset() const {
 
 model::offset archival_metadata_stm::get_archive_start_offset() const {
     return _manifest->get_archive_start_offset();
-}
-
-bool archival_metadata_stm::holds_archived_data() const {
-    return _manifest->size() > 0
-           || _manifest->get_archive_start_offset() != model::offset{};
 }
 
 model::offset archival_metadata_stm::get_archive_clean_offset() const {
