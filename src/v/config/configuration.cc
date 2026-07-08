@@ -5055,6 +5055,16 @@ configuration::configuration()
       "When true, completely disables leveling of cloud topics.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       false)
+  , enable_ts_tsv2_migration(
+      *this,
+      "enable_ts_tsv2_migration",
+      "Enable triggering a tiered-storage -> cloud-topics (TSv2) migration by "
+      "transitioning a topic's storage mode from tiered to cloud/tiered_cloud. "
+      "The migration also requires the tiered_to_cloud_migration cluster "
+      "feature to be active; this config must additionally be true. Off by "
+      "default.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      false)
   , cloud_topics_compaction_key_map_memory(
       *this,
       "cloud_topics_compaction_key_map_memory",
