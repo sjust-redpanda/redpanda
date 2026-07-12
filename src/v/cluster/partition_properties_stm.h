@@ -69,6 +69,21 @@ public:
     // retry budget around set_partition_mode should use a multiple of it.
     std::chrono::milliseconds sync_timeout() const { return _sync_timeout(); }
 
+    // Seed the kvstore-backed local snapshot with a single state entry
+    // recording `mode`, before the partition (STM) starts, so a partition
+    // restored with a non-empty log comes up with partition_mode already set --
+    // before any leadership/config-propagation race could misclassify it. The
+    // seed survives persisted_stm start, whose initial cleanup only runs for an
+    // empty log (dirty_offset == {}), whereas a restored/bootstrapped partition
+    // has a non-empty log. `snapshot_offset` is the last-applied offset the
+    // seed represents (prev(log start)).
+    static ss::future<> seed_partition_mode(
+      storage::kvstore& kvstore,
+      ss::logger& logger,
+      const model::ntp& ntp,
+      model::offset snapshot_offset,
+      model::redpanda_storage_mode mode);
+
     // Registers a callback invoked on this shard whenever partition_mode may
     // have changed (on apply and on raft-snapshot restore), so the owner can
     // re-read partition_mode() and propagate it (e.g. into ntp_config).
