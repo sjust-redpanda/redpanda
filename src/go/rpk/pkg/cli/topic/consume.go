@@ -58,9 +58,15 @@ type consumer struct {
 
 	resetOffset kgo.Offset // defaults to NoResetOffset, can be start or end
 
-	useSchemaRegistry []string // schema registry options
-	decodeKey         bool
-	decodeVal         bool
+	useSchemaRegistry     []string // schema registry options
+	decodeKey             bool
+	decodeVal             bool
+	schemaContext         string // --schema-context; "" or "." means the default context
+	useTopicSchemaContext bool   // --use-topic-schema-context; derive the context from topic config
+
+	// resolveCtx maps a topic to the Schema Registry context its records' schema ids should
+	// be resolved in. Set only when --use-schema-registry is in effect.
+	resolveCtx func(topic string) string
 
 	// If an end offset is specified, we immediately look up where we will
 	// end and quit rpk when we hit the end.
@@ -126,6 +132,34 @@ func newConsumeCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 				out.MaybeDie(err, "unable to parse --use-schema-registry flag: %v", err)
 				c.srCl, err = schemaregistry.NewClient(fs, p)
 				out.MaybeDie(err, "unable to initialize schema registry client: %v", err)
+
+				// Resolve the SR context to decode each topic's records in:
+				//   - the topic's redpanda.schema.registry.context config, when
+				//     --use-topic-schema-context is set (reads topic config via DescribeConfigs);
+				//     else
+				//   - the --schema-context flag value (empty or "." = default context).
+				// The two flags are mutually exclusive. A single consume can span topics in
+				// different contexts, so this resolves per topic (cached). Shares helpers with
+				// `rpk topic produce`.
+				ctxCache := make(map[string]string)
+				c.resolveCtx = func(topic string) string {
+					if ctx, ok := ctxCache[topic]; ok {
+						return ctx
+					}
+					var ctx string
+					if c.useTopicSchemaContext && topic != "" {
+						topicCtx, err := schemaContextForTopic(cmd.Context(), adm, topic)
+						// Topic existence is validated up front, so any failure here means we
+						// genuinely can't determine the context; bail rather than silently
+						// decoding against the default context (possibly the wrong schema).
+						out.MaybeDie(err, "unable to determine schema context for topic %q: %v", topic, err)
+						ctx = normalizeSchemaContext(topicCtx)
+					} else {
+						ctx = normalizeSchemaContext(c.schemaContext)
+					}
+					ctxCache[topic] = ctx
+					return ctx
+				}
 			}
 
 			doneConsume := make(chan struct{})
@@ -174,6 +208,9 @@ func newConsumeCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 	cmd.Flags().StringVar(&c.rack, "rack", "", "Rack to use for consuming, which opts into follower fetching")
 
 	cmd.Flags().StringSliceVar(&c.useSchemaRegistry, "use-schema-registry", []string{}, "If present, rpk will decode the key and the value with the schema registry. Also accepts use-schema-registry=key or use-schema-registry=value")
+	cmd.Flags().StringVar(&c.schemaContext, "schema-context", "", "Schema Registry context to resolve schemas in when decoding; defaults to the default context (a lone dot '.' or an empty value also selects it). Mutually exclusive with --use-topic-schema-context")
+	cmd.Flags().BoolVar(&c.useTopicSchemaContext, "use-topic-schema-context", false, "Decode schemas in the context bound to each topic via its redpanda.schema.registry.context config; reads topic config with DescribeConfigs (requires the DESCRIBE_CONFIGS ACL). Mutually exclusive with --schema-context")
+	cmd.MarkFlagsMutuallyExclusive("schema-context", "use-topic-schema-context")
 	// Deprecated.
 	cmd.Flags().BoolVar(new(bool), "commit", false, "")
 	cmd.Flags().MarkDeprecated("commit", "Group consuming always commits")
@@ -190,7 +227,7 @@ func (c *consumer) consume(ctx context.Context) {
 		marks []*kgo.Record
 		done  bool
 	)
-	serdeCache := make(map[int]*serde.Serde)
+	serdeCache := make(map[serdeCacheKey]*serde.Serde)
 	for !done {
 		fs := c.cl.PollFetches(ctx)
 		if fs.IsClientClosed() {
@@ -213,10 +250,16 @@ func (c *consumer) consume(ctx context.Context) {
 				return // reached end, still draining client
 			}
 
+			// The context to resolve schema ids in is per topic; it is constant within a
+			// partition, so resolve it once here.
+			var schemaCtx string
+			if c.decodeKey || c.decodeVal {
+				schemaCtx = c.resolveCtx(p.Topic)
+			}
 			for _, r := range p.Records {
 				var toStdErr bool
 				if r.Key != nil && c.decodeKey {
-					decKey, err := handleDecode(ctx, c.srCl, r.Key, serdeCache)
+					decKey, err := handleDecode(ctx, c.srCl, schemaCtx, r.Key, serdeCache)
 					if err != nil {
 						zap.L().Sugar().Warnf("unable to decode record key %v with schema registry: %v\n", r.Key, err)
 						toStdErr = true
@@ -225,7 +268,7 @@ func (c *consumer) consume(ctx context.Context) {
 					}
 				}
 				if r.Value != nil && c.decodeVal {
-					decVal, err := handleDecode(ctx, c.srCl, r.Value, serdeCache)
+					decVal, err := handleDecode(ctx, c.srCl, schemaCtx, r.Value, serdeCache)
 					if err != nil {
 						zap.L().Sugar().Warnf("unable to decode record value %v with schema registry: %v\n", r.Value, err)
 						toStdErr = true
@@ -832,25 +875,34 @@ func (c *consumer) formatSchemaRegistryFlag() error {
 	return nil
 }
 
-func handleDecode(ctx context.Context, cl *rpsr.Client, record []byte, serdeCache map[int]*serde.Serde) ([]byte, error) {
+// serdeCacheKey keys the decode serde cache. Schema ids are context-local, so the same numeric
+// id in two contexts must not share a serde; the (context, id) pair disambiguates them.
+type serdeCacheKey struct {
+	context string
+	id      int
+}
+
+func handleDecode(ctx context.Context, cl *rpsr.Client, schemaCtx string, record []byte, serdeCache map[serdeCacheKey]*serde.Serde) ([]byte, error) {
 	var serdeHeader sr.ConfluentHeader
 	id, toDecode, err := serdeHeader.DecodeID(record)
 	if err != nil {
 		return nil, errors.New("unable to decode the ID")
 	}
+	key := serdeCacheKey{context: schemaCtx, id: id}
 	var rpkSerde *serde.Serde
-	if cachedSerde, ok := serdeCache[id]; ok {
+	if cachedSerde, ok := serdeCache[key]; ok {
 		rpkSerde = cachedSerde
 	} else {
-		schema, err := cl.SchemaByID(ctx, id)
+		upCtx := sr.InContext(ctx, schemaCtx)
+		schema, err := cl.SchemaByID(upCtx, id)
 		if err != nil {
 			return nil, fmt.Errorf("unable to get schema with index %v from the schema registry: %v", id, err)
 		}
-		rpkSerde, err = serde.NewSerde(ctx, cl.Client, &schema, id, "")
+		rpkSerde, err = serde.NewSerde(upCtx, cl.Client, &schema, id, "")
 		if err != nil {
 			return nil, err
 		}
-		serdeCache[id] = rpkSerde
+		serdeCache[key] = rpkSerde
 	}
 
 	return rpkSerde.DecodeRecord(toDecode)
