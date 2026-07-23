@@ -145,12 +145,14 @@ class TsToCtMigrationTest(RedpandaTest):
         transition is gated on both the tiered_to_cloud_migration cluster
         feature and the enable_ts_tsv2_migration config; set both."""
         self.redpanda.set_feature_active(
-            "tiered_to_cloud_migration", True, timeout_sec=30)
+            "tiered_to_cloud_migration", True, timeout_sec=30
+        )
         self.redpanda.set_cluster_config({"enable_ts_tsv2_migration": True})
 
     def _wait_for_ts_segment(self, topic: str):
         """Wait until at least one TS segment has reached object storage, so the
         partition has tiered data to migrate."""
+
         def has_ts_segment() -> bool:
             manifest = self.admin.get_partition_manifest(topic, 0)
             return len(manifest.get("segments", {})) >= 1
@@ -171,10 +173,12 @@ class TsToCtMigrationTest(RedpandaTest):
         storage.mode value."""
         if storage_mode == TopicSpec.STORAGE_MODE_IMPL_TIERED_V2:
             self.redpanda.set_cluster_config(
-                {"default_redpanda_storage_mode_tiered_impl": "tiered_v2"})
+                {"default_redpanda_storage_mode_tiered_impl": "tiered_v2"}
+            )
             storage_mode = TopicSpec.STORAGE_MODE_TIERED
         self.rpk.alter_topic_config(
-            topic, TopicSpec.PROPERTY_STORAGE_MODE, storage_mode)
+            topic, TopicSpec.PROPERTY_STORAGE_MODE, storage_mode
+        )
 
     def _wait_for_cutover(self, topic: str):
         """Cutover advances partition_mode to cloud -- which flips routing to
@@ -182,6 +186,7 @@ class TsToCtMigrationTest(RedpandaTest):
         partition_properties field) -- and empties the archival STM manifest
         (reset_metadata). Observe it as the archival partition manifest
         becoming empty."""
+
         def cut_over() -> bool:
             manifest = self.admin.get_partition_manifest(topic, 0)
             return len(manifest.get("segments", {})) == 0
@@ -203,7 +208,8 @@ class TsToCtMigrationTest(RedpandaTest):
         log + tiered storage instead do not."""
         metastore = AdminV2(self.redpanda).metastore()
         req = metastore_pb.GetOffsetsRequest(
-            partition=ntp_pb.TopicPartition(topic=topic, partition=partition))
+            partition=ntp_pb.TopicPartition(topic=topic, partition=partition)
+        )
         try:
             resp = metastore.get_offsets(req=req)
             return resp.offsets.next_offset
@@ -216,6 +222,7 @@ class TsToCtMigrationTest(RedpandaTest):
         """Wait until every partition of the topic has cut over (its archival
         manifest is empty). Each partition migrates and cuts over
         independently."""
+
         def all_cut_over() -> bool:
             for p in range(num_partitions):
                 m = self.admin.get_partition_manifest(topic, p)
@@ -243,7 +250,8 @@ class TsToCtMigrationTest(RedpandaTest):
         )
 
     def _wait_for_compaction_quiesce(
-        self, stable_sec: int = 20, timeout_sec: int = 240):
+        self, stable_sec: int = 20, timeout_sec: int = 240
+    ):
         """Wait until CT (L1) compaction has converged -- the records-removed
         metric is unchanged for `stable_sec`. latest-value validation is only
         meaningful once the log is fully compacted to one value per key."""
@@ -274,10 +282,12 @@ class TsToCtMigrationTest(RedpandaTest):
     # ---- tests ------------------------------------------------------------
 
     @cluster(num_nodes=2)
-    @matrix(storage_mode=[
-        TopicSpec.STORAGE_MODE_CLOUD,
-        TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
-    ])
+    @matrix(
+        storage_mode=[
+            TopicSpec.STORAGE_MODE_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
+        ]
+    )
     def test_ts_to_ct_migration(self, storage_mode: str):
         """Produce in tiered mode, trigger the migration mid-stream, and verify
         that a consumer reading from offset 0 sees every record in order both
@@ -286,7 +296,8 @@ class TsToCtMigrationTest(RedpandaTest):
         self._enable_migration()
         if storage_mode == TopicSpec.STORAGE_MODE_IMPL_TIERED_V2:
             self.redpanda.set_feature_active(
-                "tiered_cloud_topics", True, timeout_sec=30)
+                "tiered_cloud_topics", True, timeout_sec=30
+            )
 
         self.rpk.create_topic(
             self.TOPIC,
@@ -335,18 +346,20 @@ class TsToCtMigrationTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=120)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.valid_reads >= total, \
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.valid_reads >= total, (
             f"valid_reads={status.valid_reads} < produced {total}"
+        )
         consumer.stop()
         consumer.free()
 
     @cluster(num_nodes=2)
-    @matrix(storage_mode=[
-        TopicSpec.STORAGE_MODE_CLOUD,
-        TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
-    ])
+    @matrix(
+        storage_mode=[
+            TopicSpec.STORAGE_MODE_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
+        ]
+    )
     def test_ts_to_ct_migration_transactions(self, storage_mode: str):
         """read_committed correctness across the migration boundary.
 
@@ -367,7 +380,8 @@ class TsToCtMigrationTest(RedpandaTest):
         self._enable_migration()
         if storage_mode == TopicSpec.STORAGE_MODE_IMPL_TIERED_V2:
             self.redpanda.set_feature_active(
-                "tiered_cloud_topics", True, timeout_sec=30)
+                "tiered_cloud_topics", True, timeout_sec=30
+            )
 
         self.rpk.create_topic(
             self.TOPIC_TX,
@@ -400,8 +414,7 @@ class TsToCtMigrationTest(RedpandaTest):
             # tx_range_manifest objects in S3 are the only source for aborted
             # ranges in the uploaded portion of the log.
             def is_log_truncated() -> bool:
-                status = self.admin.get_partition_cloud_storage_status(
-                    self.TOPIC_TX, 0)
+                status = self.admin.get_partition_cloud_storage_status(self.TOPIC_TX, 0)
                 return status.get("local_log_start_offset", 0) > 0
 
             wait_until(
@@ -455,9 +468,10 @@ class TsToCtMigrationTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=180)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"read_committed consumer saw aborted records: " \
+        assert status.invalid_reads == 0, (
+            f"read_committed consumer saw aborted records: "
             f"invalid_reads={status.invalid_reads}"
+        )
         consumer.stop()
         consumer.free()
 
@@ -473,10 +487,12 @@ class TsToCtMigrationTest(RedpandaTest):
         produced."""
         # Force segment-based spillover: disable the (default 64KiB) size
         # threshold so a small number of segments triggers spillover.
-        self.redpanda.set_cluster_config({
-            "cloud_storage_spillover_manifest_max_segments": 5,
-            "cloud_storage_spillover_manifest_size": None,
-        })
+        self.redpanda.set_cluster_config(
+            {
+                "cloud_storage_spillover_manifest_max_segments": 5,
+                "cloud_storage_spillover_manifest_size": None,
+            }
+        )
         self._enable_migration()
         self.rpk.create_topic(
             self.TOPIC_SPILL,
@@ -503,8 +519,7 @@ class TsToCtMigrationTest(RedpandaTest):
 
         def spillover_uploads() -> float:
             return self.redpanda.metric_sum(
-                metric_name=(
-                    "redpanda_cloud_storage_spillover_manifest_uploads_total"),
+                metric_name=("redpanda_cloud_storage_spillover_manifest_uploads_total"),
                 metrics_endpoint=MetricsEndpoint.PUBLIC_METRICS,
             )
 
@@ -533,10 +548,12 @@ class TsToCtMigrationTest(RedpandaTest):
         # present in L1 after cutover: the partition starts at 0 and the high
         # watermark covers everything produced.
         part = list(self.rpk.describe_topic(self.TOPIC_SPILL))[0]
-        assert part.start_offset == 0, \
+        assert part.start_offset == 0, (
             f"start_offset={part.start_offset} (spilled prefix not imported)"
-        assert part.high_watermark >= acked, \
+        )
+        assert part.high_watermark >= acked, (
             f"high_watermark={part.high_watermark} < acked {acked}"
+        )
 
         # Spot-check rather than full-scan: the imported region is served by
         # reading the underlying TS segment objects on demand (imported extents
@@ -557,18 +574,21 @@ class TsToCtMigrationTest(RedpandaTest):
         spot.start()
         spot.wait(timeout_sec=300)
         status = spot.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"spot-check across the spilled range saw bad reads: " \
+        assert status.invalid_reads == 0, (
+            f"spot-check across the spilled range saw bad reads: "
             f"invalid_reads={status.invalid_reads}"
+        )
         assert status.valid_reads > 0, "spot-check read no records"
         spot.stop()
         spot.free()
 
     @cluster(num_nodes=2)
-    @matrix(storage_mode=[
-        TopicSpec.STORAGE_MODE_CLOUD,
-        TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
-    ])
+    @matrix(
+        storage_mode=[
+            TopicSpec.STORAGE_MODE_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
+        ]
+    )
     def test_ts_to_ct_migration_compaction(self, storage_mode: str):
         """Compaction correctness across the migration boundary.
 
@@ -587,7 +607,8 @@ class TsToCtMigrationTest(RedpandaTest):
         self._enable_migration()
         if storage_mode == TopicSpec.STORAGE_MODE_IMPL_TIERED_V2:
             self.redpanda.set_feature_active(
-                "tiered_cloud_topics", True, timeout_sec=30)
+                "tiered_cloud_topics", True, timeout_sec=30
+            )
 
         self.rpk.create_topic(
             self.TOPIC_COMPACT,
@@ -653,9 +674,10 @@ class TsToCtMigrationTest(RedpandaTest):
         try:
             consumer.wait(timeout_sec=180)
             status = consumer.consumer_status.validator
-            assert status.invalid_reads == 0, \
-                f"compaction across migration resurrected/corrupted a key: " \
+            assert status.invalid_reads == 0, (
+                f"compaction across migration resurrected/corrupted a key: "
                 f"invalid_reads={status.invalid_reads}"
+            )
         finally:
             consumer.stop()
             consumer.free()
@@ -686,10 +708,12 @@ class TsToCtMigrationTest(RedpandaTest):
         self._enable_migration()
         # Enable compacted reupload and hold the partition migrating so a
         # recompaction can race the mirror before cutover.
-        self.redpanda.set_cluster_config({
-            "cloud_storage_enable_compacted_topic_reupload": True,
-            "cloud_topics_disable_migration_cutover_for_tests": True,
-        })
+        self.redpanda.set_cluster_config(
+            {
+                "cloud_storage_enable_compacted_topic_reupload": True,
+                "cloud_topics_disable_migration_cutover_for_tests": True,
+            }
+        )
         self.rpk.create_topic(
             self.TOPIC_COMPACT_REUP,
             partitions=1,
@@ -724,8 +748,7 @@ class TsToCtMigrationTest(RedpandaTest):
             timeout_sec=120,
         )
         self._wait_for_ts_segment(self.TOPIC_COMPACT_REUP)
-        self._trigger_migration(
-            self.TOPIC_COMPACT_REUP, TopicSpec.STORAGE_MODE_CLOUD)
+        self._trigger_migration(self.TOPIC_COMPACT_REUP, TopicSpec.STORAGE_MODE_CLOUD)
         # Wait for the mirror to import the phase-1 segments into L1 (the
         # partition stays migrating: cutover is held).
         wait_until(
@@ -760,7 +783,8 @@ class TsToCtMigrationTest(RedpandaTest):
 
         # The partition also serves correctly through cutover.
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": False})
+            {"cloud_topics_disable_migration_cutover_for_tests": False}
+        )
         self._wait_for_cutover(self.TOPIC_COMPACT_REUP)
         self.redpanda.validate_metastore(check_object_storage=True)
 
@@ -773,16 +797,17 @@ class TsToCtMigrationTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=120)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
         consumer.stop()
         consumer.free()
 
     @cluster(num_nodes=2)
-    @matrix(storage_mode=[
-        TopicSpec.STORAGE_MODE_CLOUD,
-        TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
-    ])
+    @matrix(
+        storage_mode=[
+            TopicSpec.STORAGE_MODE_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
+        ]
+    )
     def test_ts_to_ct_migration_cutover_transition(self, storage_mode: str):
         """Migration liveness + correctness under concurrent writes.
 
@@ -805,7 +830,8 @@ class TsToCtMigrationTest(RedpandaTest):
         self._enable_migration()
         if storage_mode == TopicSpec.STORAGE_MODE_IMPL_TIERED_V2:
             self.redpanda.set_feature_active(
-                "tiered_cloud_topics", True, timeout_sec=30)
+                "tiered_cloud_topics", True, timeout_sec=30
+            )
 
         self.rpk.create_topic(
             self.TOPIC_CUTOVER,
@@ -840,7 +866,8 @@ class TsToCtMigrationTest(RedpandaTest):
             acked_after = producer.produce_status.acked
             assert acked_after > acked_before, (
                 "producer made no progress across cutover -- the cutover did "
-                "not happen under concurrent writes")
+                "not happen under concurrent writes"
+            )
             # Let a bit more land on the post-cutover (cloud-topic) path before
             # stopping, so the consume covers writes from both sides of cutover.
             time.sleep(5)
@@ -860,13 +887,13 @@ class TsToCtMigrationTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=180)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.offset_gaps == 0, \
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, (
             f"data stranded across cutover: offset_gaps={status.offset_gaps}"
-        assert status.valid_reads >= acked, \
-            f"records lost across cutover: read {status.valid_reads} < " \
-            f"acked {acked}"
+        )
+        assert status.valid_reads >= acked, (
+            f"records lost across cutover: read {status.valid_reads} < acked {acked}"
+        )
         consumer.stop()
         consumer.free()
 
@@ -901,9 +928,10 @@ class TsToCtMigrationTest(RedpandaTest):
         )
         # And the archiver must not have re-uploaded them to tiered storage.
         manifest = self.admin.get_partition_manifest(self.TOPIC_CUTOVER, 0)
-        assert len(manifest.get("segments", {})) == 0, \
-            "archiver re-populated the TS manifest after cutover -- post-cutover " \
+        assert len(manifest.get("segments", {})) == 0, (
+            "archiver re-populated the TS manifest after cutover -- post-cutover "
             "writes went to tiered storage instead of the cloud-topic path"
+        )
 
     @cluster(num_nodes=2)
     def test_ts_to_ct_migration_trigger_feature_gated(self):
@@ -934,11 +962,11 @@ class TsToCtMigrationTest(RedpandaTest):
 
         # Rejected while the feature is inactive.
         try:
-            self._trigger_migration(
-                self.TOPIC_GATE, TopicSpec.STORAGE_MODE_CLOUD)
+            self._trigger_migration(self.TOPIC_GATE, TopicSpec.STORAGE_MODE_CLOUD)
             raise AssertionError(
                 "the migration trigger was accepted while the "
-                "tiered_to_cloud_migration feature was inactive")
+                "tiered_to_cloud_migration feature was inactive"
+            )
         except RpkException:
             pass
 
@@ -980,10 +1008,8 @@ class TsToCtMigrationTest(RedpandaTest):
 
         # Trigger, then re-issue the identical trigger before cutover -- the
         # second must neither error nor start a second migration.
-        self._trigger_migration(
-            self.TOPIC_RETRIGGER, TopicSpec.STORAGE_MODE_CLOUD)
-        self._trigger_migration(
-            self.TOPIC_RETRIGGER, TopicSpec.STORAGE_MODE_CLOUD)
+        self._trigger_migration(self.TOPIC_RETRIGGER, TopicSpec.STORAGE_MODE_CLOUD)
+        self._trigger_migration(self.TOPIC_RETRIGGER, TopicSpec.STORAGE_MODE_CLOUD)
         self._wait_for_cutover(self.TOPIC_RETRIGGER)
 
         # Cut over exactly once, nothing lost: consume from 0 contiguous.
@@ -996,12 +1022,11 @@ class TsToCtMigrationTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=120)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.offset_gaps == 0, \
-            f"offset_gaps={status.offset_gaps}"
-        assert status.valid_reads >= total, \
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, f"offset_gaps={status.offset_gaps}"
+        assert status.valid_reads >= total, (
             f"valid_reads={status.valid_reads} < produced {total}"
+        )
         consumer.stop()
         consumer.free()
 
@@ -1010,10 +1035,11 @@ class TsToCtMigrationTest(RedpandaTest):
             self.rpk.alter_topic_config(
                 self.TOPIC_RETRIGGER,
                 TopicSpec.PROPERTY_STORAGE_MODE,
-                TopicSpec.STORAGE_MODE_TIERED)
+                TopicSpec.STORAGE_MODE_TIERED,
+            )
             raise AssertionError(
-                "reverting a cut-over cloud topic to tiered storage was "
-                "accepted")
+                "reverting a cut-over cloud topic to tiered storage was accepted"
+            )
         except RpkException:
             pass
 
@@ -1021,8 +1047,7 @@ class TsToCtMigrationTest(RedpandaTest):
         # advances) and the archiver stays dormant (manifest stays empty): the
         # re-trigger did not resurrect the migration.
         pre = self._l1_next_offset(self.TOPIC_RETRIGGER)
-        assert pre is not None, \
-            "partition absent from L1 metastore after cutover"
+        assert pre is not None, "partition absent from L1 metastore after cutover"
         post_count = 2000
         KgoVerifierProducer.oneshot(
             self.test_context,
@@ -1045,8 +1070,9 @@ class TsToCtMigrationTest(RedpandaTest):
             retry_on_exc=True,
         )
         manifest = self.admin.get_partition_manifest(self.TOPIC_RETRIGGER, 0)
-        assert len(manifest.get("segments", {})) == 0, \
+        assert len(manifest.get("segments", {})) == 0, (
             "archival manifest resurrected after re-trigger"
+        )
 
     @cluster(num_nodes=2)
     def test_ts_to_ct_migration_cutover_durable_across_restart(self):
@@ -1080,18 +1106,22 @@ class TsToCtMigrationTest(RedpandaTest):
         self._wait_for_ts_segment(self.TOPIC_CUTOVER_RESTART)
 
         self._trigger_migration(
-            self.TOPIC_CUTOVER_RESTART, TopicSpec.STORAGE_MODE_CLOUD)
+            self.TOPIC_CUTOVER_RESTART, TopicSpec.STORAGE_MODE_CLOUD
+        )
         self._wait_for_cutover(self.TOPIC_CUTOVER_RESTART)
 
         # Restart immediately after cutover.
         self.redpanda.restart_nodes(self.redpanda.nodes)
         self.redpanda._admin.await_stable_leader(
-            self.TOPIC_CUTOVER_RESTART, partition=0, namespace="kafka",
-            timeout_s=60, backoff_s=2)
+            self.TOPIC_CUTOVER_RESTART,
+            partition=0,
+            namespace="kafka",
+            timeout_s=60,
+            backoff_s=2,
+        )
 
         def manifest_empty() -> bool:
-            m = self.admin.get_partition_manifest(
-                self.TOPIC_CUTOVER_RESTART, 0)
+            m = self.admin.get_partition_manifest(self.TOPIC_CUTOVER_RESTART, 0)
             return len(m.get("segments", {})) == 0
 
         # Cutover persisted: the partition comes back cloud-topic-served, not
@@ -1115,20 +1145,18 @@ class TsToCtMigrationTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=180)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.offset_gaps == 0, \
-            f"offset_gaps={status.offset_gaps}"
-        assert status.valid_reads >= total, \
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, f"offset_gaps={status.offset_gaps}"
+        assert status.valid_reads >= total, (
             f"valid_reads={status.valid_reads} < produced {total}"
+        )
         consumer.stop()
         consumer.free()
 
         # The cutover baseline survived: post-cutover writes reconcile into L1
         # and the archiver stays dormant.
         pre = self._l1_next_offset(self.TOPIC_CUTOVER_RESTART)
-        assert pre is not None, \
-            "partition absent from L1 metastore after restart"
+        assert pre is not None, "partition absent from L1 metastore after restart"
         post_count = 2000
         KgoVerifierProducer.oneshot(
             self.test_context,
@@ -1150,14 +1178,17 @@ class TsToCtMigrationTest(RedpandaTest):
             err_msg="post-restart writes were not reconciled into L1",
             retry_on_exc=True,
         )
-        assert manifest_empty(), \
+        assert manifest_empty(), (
             "archival manifest resurrected after post-restart writes"
+        )
 
     @cluster(num_nodes=2)
-    @matrix(storage_mode=[
-        TopicSpec.STORAGE_MODE_CLOUD,
-        TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
-    ])
+    @matrix(
+        storage_mode=[
+            TopicSpec.STORAGE_MODE_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
+        ]
+    )
     def test_ts_to_ct_migration_head_prune(self, storage_mode: str):
         """Retention trims the archival manifest head WHILE migrating; the mirror
         head-prunes the imported L1 extents below the new start (detach only --
@@ -1175,11 +1206,13 @@ class TsToCtMigrationTest(RedpandaTest):
         self._enable_migration()
         if storage_mode == TopicSpec.STORAGE_MODE_IMPL_TIERED_V2:
             self.redpanda.set_feature_active(
-                "tiered_cloud_topics", True, timeout_sec=30)
+                "tiered_cloud_topics", True, timeout_sec=30
+            )
         # Hold the partition in the migrating phase so retention trims the head
         # while it is still migrating (cutover would otherwise complete first).
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": True})
+            {"cloud_topics_disable_migration_cutover_for_tests": True}
+        )
 
         self.rpk.create_topic(
             self.TOPIC_HEADPRUNE,
@@ -1229,8 +1262,7 @@ class TsToCtMigrationTest(RedpandaTest):
 
             def head_trimmed_while_migrating() -> bool:
                 try:
-                    m = self.admin.get_partition_manifest(
-                        self.TOPIC_HEADPRUNE, 0)
+                    m = self.admin.get_partition_manifest(self.TOPIC_HEADPRUNE, 0)
                     kstart = self._partition_start_offset(self.TOPIC_HEADPRUNE)
                 except Exception as e:
                     # Transient admin error mid-migration; keep polling.
@@ -1240,7 +1272,8 @@ class TsToCtMigrationTest(RedpandaTest):
                 mstart: int = m.get("start_offset") or 0
                 self.logger.info(
                     f"head_prune: segs={segs} manifest.start={mstart} "
-                    f"kafka_start={kstart} lag={mstart - kstart}")
+                    f"kafka_start={kstart} lag={mstart - kstart}"
+                )
                 if segs == 0:
                     # Not migrating (cut over or not yet started); keep polling.
                     return False
@@ -1251,7 +1284,8 @@ class TsToCtMigrationTest(RedpandaTest):
                 assert mstart - kstart <= MAX_TRIM_LAG, (
                     "local trim not tracking the manifest during migration "
                     f"(stalled retention): manifest.start={mstart} "
-                    f"kafka_start={kstart} lag={mstart - kstart}")
+                    f"kafka_start={kstart} lag={mstart - kstart}"
+                )
                 return True
 
             wait_until(
@@ -1268,7 +1302,8 @@ class TsToCtMigrationTest(RedpandaTest):
 
         # Allow cutover now that the head has trimmed mid-migration.
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": False})
+            {"cloud_topics_disable_migration_cutover_for_tests": False}
+        )
         self._wait_for_cutover(self.TOPIC_HEADPRUNE)
 
         # The trimmed start carried through cutover: the partition begins above
@@ -1297,12 +1332,11 @@ class TsToCtMigrationTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=180)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.offset_gaps == 0, \
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, (
             f"head-pruned prefix has gaps: offset_gaps={status.offset_gaps}"
-        assert status.valid_reads > 0, \
-            "head-pruned partition served no records"
+        )
+        assert status.valid_reads > 0, "head-pruned partition served no records"
         consumer.stop()
         consumer.free()
 
@@ -1321,7 +1355,8 @@ class TsToCtMigrationTest(RedpandaTest):
         is held off (test knob) until the trim has taken effect mid-migration."""
         self._enable_migration()
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": True})
+            {"cloud_topics_disable_migration_cutover_for_tests": True}
+        )
 
         self.rpk.create_topic(
             self.TOPIC_DELETE_RECORDS,
@@ -1345,16 +1380,19 @@ class TsToCtMigrationTest(RedpandaTest):
         # Several uploaded segments so a mid-stream trim prunes whole segments
         # from the manifest head.
         wait_until(
-            lambda: len(self.admin.get_partition_manifest(
-                self.TOPIC_DELETE_RECORDS, 0).get("segments", {})) >= 3,
+            lambda: len(
+                self.admin.get_partition_manifest(self.TOPIC_DELETE_RECORDS, 0).get(
+                    "segments", {}
+                )
+            )
+            >= 3,
             timeout_sec=120,
             backoff_sec=2,
             err_msg="not enough TS segments uploaded to trim",
             retry_on_exc=True,
         )
 
-        self._trigger_migration(
-            self.TOPIC_DELETE_RECORDS, TopicSpec.STORAGE_MODE_CLOUD)
+        self._trigger_migration(self.TOPIC_DELETE_RECORDS, TopicSpec.STORAGE_MODE_CLOUD)
         wait_until(
             lambda: (self._l1_next_offset(self.TOPIC_DELETE_RECORDS) or 0) > 0,
             timeout_sec=120,
@@ -1364,34 +1402,36 @@ class TsToCtMigrationTest(RedpandaTest):
         )
 
         trim_offset = produced // 2
-        self.rpk.trim_prefix(
-            self.TOPIC_DELETE_RECORDS, trim_offset, partitions=[0])
+        self.rpk.trim_prefix(self.TOPIC_DELETE_RECORDS, trim_offset, partitions=[0])
 
         # The trim advances the start offset while the partition is still
         # migrating (manifest non-empty), driving the mirror's head-prune.
         def trimmed_while_migrating() -> bool:
             m = self.admin.get_partition_manifest(self.TOPIC_DELETE_RECORDS, 0)
             migrating = len(m.get("segments", {})) > 0
-            return migrating and self._partition_start_offset(
-                self.TOPIC_DELETE_RECORDS) >= trim_offset
+            return (
+                migrating
+                and self._partition_start_offset(self.TOPIC_DELETE_RECORDS)
+                >= trim_offset
+            )
 
         wait_until(
             trimmed_while_migrating,
             timeout_sec=120,
             backoff_sec=3,
-            err_msg="DeleteRecords did not advance the start offset while "
-            "migrating",
+            err_msg="DeleteRecords did not advance the start offset while migrating",
             retry_on_exc=True,
         )
 
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": False})
+            {"cloud_topics_disable_migration_cutover_for_tests": False}
+        )
         self._wait_for_cutover(self.TOPIC_DELETE_RECORDS)
 
         trimmed_start = self._partition_start_offset(self.TOPIC_DELETE_RECORDS)
-        assert trimmed_start >= trim_offset, \
-            f"trimmed start lost across cutover: start={trimmed_start} < " \
-            f"{trim_offset}"
+        assert trimmed_start >= trim_offset, (
+            f"trimmed start lost across cutover: start={trimmed_start} < {trim_offset}"
+        )
 
         consumer = KgoVerifierSeqConsumer(
             self.test_context,
@@ -1402,12 +1442,11 @@ class TsToCtMigrationTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=180)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.offset_gaps == 0, \
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, (
             f"trimmed prefix has gaps: offset_gaps={status.offset_gaps}"
-        assert status.valid_reads > 0, \
-            "trimmed partition served no records"
+        )
+        assert status.valid_reads > 0, "trimmed partition served no records"
         consumer.stop()
         consumer.free()
 
@@ -1424,7 +1463,8 @@ class TsToCtMigrationTest(RedpandaTest):
         read_committed scan; then cuts over and re-reads from L1."""
         self._enable_migration()
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": True})
+            {"cloud_topics_disable_migration_cutover_for_tests": True}
+        )
 
         self.rpk.create_topic(
             self.TOPIC_API,
@@ -1448,8 +1488,10 @@ class TsToCtMigrationTest(RedpandaTest):
             timeout_sec=120,
         )
         wait_until(
-            lambda: len(self.admin.get_partition_manifest(
-                self.TOPIC_API, 0).get("segments", {})) >= 3,
+            lambda: len(
+                self.admin.get_partition_manifest(self.TOPIC_API, 0).get("segments", {})
+            )
+            >= 3,
             timeout_sec=180,
             backoff_sec=2,
             err_msg="not enough TS segments uploaded",
@@ -1464,9 +1506,12 @@ class TsToCtMigrationTest(RedpandaTest):
             err_msg="migration did not start (nothing imported into L1)",
             retry_on_exc=True,
         )
-        assert len(self.admin.get_partition_manifest(
-            self.TOPIC_API, 0).get("segments", {})) > 0, \
-            "partition is not in the migrating (TS-served) state"
+        assert (
+            len(
+                self.admin.get_partition_manifest(self.TOPIC_API, 0).get("segments", {})
+            )
+            > 0
+        ), "partition is not in the migrating (TS-served) state"
 
         def offsets(out: str) -> list[int]:
             return [int(ln) for ln in out.splitlines() if ln.strip().isdigit()]
@@ -1474,61 +1519,78 @@ class TsToCtMigrationTest(RedpandaTest):
         # list-offsets: earliest == 0, latest == produced.
         p = list(self.rpk.describe_topic(self.TOPIC_API))[0]
         assert p.start_offset == 0, f"start_offset={p.start_offset}"
-        assert p.high_watermark == produced, \
+        assert p.high_watermark == produced, (
             f"high_watermark={p.high_watermark} != {produced}"
+        )
 
         # fetch from earliest: a full scan from 0 is contiguous and complete.
         consumer = KgoVerifierSeqConsumer(
-            self.test_context, self.redpanda, self.TOPIC_API, loop=False)
+            self.test_context, self.redpanda, self.TOPIC_API, loop=False
+        )
         consumer.start()
         consumer.wait(timeout_sec=180)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
         assert status.offset_gaps == 0, f"offset_gaps={status.offset_gaps}"
-        assert status.valid_reads >= produced, \
+        assert status.valid_reads >= produced, (
             f"valid_reads={status.valid_reads} < {produced}"
+        )
         consumer.stop()
         consumer.free()
 
         # fetch from a mid offset: the first record returned is exactly that
         # offset (make_reader honors the requested start while migrating).
         mid = produced // 2
-        got = offsets(self.rpk.consume(
-            self.TOPIC_API, n=1, offset=mid, partition=0, format="%o\n"))
-        assert got and got[0] == mid, \
-            f"fetch from offset {mid} returned {got[:1]}"
+        got = offsets(
+            self.rpk.consume(
+                self.TOPIC_API, n=1, offset=mid, partition=0, format="%o\n"
+            )
+        )
+        assert got and got[0] == mid, f"fetch from offset {mid} returned {got[:1]}"
 
         # timequery: a timestamp before any produce resolves to the earliest
         # offset (0).
-        got = offsets(self.rpk.consume(
-            self.TOPIC_API, n=1, offset=f"@{t_before}", partition=0,
-            format="%o\n"))
-        assert got and got[0] == 0, \
+        got = offsets(
+            self.rpk.consume(
+                self.TOPIC_API, n=1, offset=f"@{t_before}", partition=0, format="%o\n"
+            )
+        )
+        assert got and got[0] == 0, (
             f"timequery(@{t_before}) returned {got[:1]}, expected 0"
+        )
 
         # read_committed: with no open transactions the last-stable-offset equals
         # the high watermark, so a full read_committed scan returns everything.
-        rc = offsets(self.rpk.consume(
-            self.TOPIC_API, n=produced, offset="start", partition=0,
-            read_committed=True, format="%o\n"))
-        assert len(rc) == produced, \
+        rc = offsets(
+            self.rpk.consume(
+                self.TOPIC_API,
+                n=produced,
+                offset="start",
+                partition=0,
+                read_committed=True,
+                format="%o\n",
+            )
+        )
+        assert len(rc) == produced, (
             f"read_committed returned {len(rc)} records, expected {produced}"
+        )
 
         # Cut over and confirm everything still reads back from L1.
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": False})
+            {"cloud_topics_disable_migration_cutover_for_tests": False}
+        )
         self._wait_for_cutover(self.TOPIC_API)
         consumer = KgoVerifierSeqConsumer(
-            self.test_context, self.redpanda, self.TOPIC_API, loop=False)
+            self.test_context, self.redpanda, self.TOPIC_API, loop=False
+        )
         consumer.start()
         consumer.wait(timeout_sec=180)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
         assert status.offset_gaps == 0, f"offset_gaps={status.offset_gaps}"
-        assert status.valid_reads >= produced, \
+        assert status.valid_reads >= produced, (
             f"valid_reads={status.valid_reads} < {produced}"
+        )
         consumer.stop()
         consumer.free()
 
@@ -1560,18 +1622,31 @@ class TsToCtMigrationTest(RedpandaTest):
 
         # Produce + consume the tiered phase; the group commits ~phase1.
         KgoVerifierProducer.oneshot(
-            self.test_context, self.redpanda, self.TOPIC_CG,
-            msg_size=self.MSG_SIZE, msg_count=phase1, timeout_sec=120)
+            self.test_context,
+            self.redpanda,
+            self.TOPIC_CG,
+            msg_size=self.MSG_SIZE,
+            msg_count=phase1,
+            timeout_sec=120,
+        )
         self._wait_for_ts_segment(self.TOPIC_CG)
         c1 = KgoVerifierConsumerGroupConsumer(
-            self.test_context, self.redpanda, self.TOPIC_CG, self.MSG_SIZE,
-            readers=1, loop=False, max_msgs=phase1, group_name=group)
+            self.test_context,
+            self.redpanda,
+            self.TOPIC_CG,
+            self.MSG_SIZE,
+            readers=1,
+            loop=False,
+            max_msgs=phase1,
+            group_name=group,
+        )
         c1.start()
         c1.wait(timeout_sec=120)
         s1 = c1.consumer_status.validator
         assert s1.invalid_reads == 0, f"invalid_reads={s1.invalid_reads}"
-        assert s1.valid_reads >= phase1, \
+        assert s1.valid_reads >= phase1, (
             f"group did not drain the tiered phase: {s1.valid_reads} < {phase1}"
+        )
         c1.stop()
         c1.free()
 
@@ -1579,31 +1654,47 @@ class TsToCtMigrationTest(RedpandaTest):
         self._trigger_migration(self.TOPIC_CG, TopicSpec.STORAGE_MODE_CLOUD)
         self._wait_for_cutover(self.TOPIC_CG)
         KgoVerifierProducer.oneshot(
-            self.test_context, self.redpanda, self.TOPIC_CG,
-            msg_size=self.MSG_SIZE, msg_count=phase2, timeout_sec=120)
+            self.test_context,
+            self.redpanda,
+            self.TOPIC_CG,
+            msg_size=self.MSG_SIZE,
+            msg_count=phase2,
+            timeout_sec=120,
+        )
 
         # The same group resumes from its committed offset (~phase1): it reads
         # roughly phase2 new records, not re-reading the whole log from 0.
         c2 = KgoVerifierConsumerGroupConsumer(
-            self.test_context, self.redpanda, self.TOPIC_CG, self.MSG_SIZE,
-            readers=1, loop=False, max_msgs=phase1 + phase2, group_name=group)
+            self.test_context,
+            self.redpanda,
+            self.TOPIC_CG,
+            self.MSG_SIZE,
+            readers=1,
+            loop=False,
+            max_msgs=phase1 + phase2,
+            group_name=group,
+        )
         c2.start()
         c2.wait(timeout_sec=120)
         s2 = c2.consumer_status.validator
         assert s2.invalid_reads == 0, f"invalid_reads={s2.invalid_reads}"
-        assert s2.valid_reads >= phase2 * 0.9, \
+        assert s2.valid_reads >= phase2 * 0.9, (
             f"group did not see the post-cutover records: {s2.valid_reads}"
-        assert s2.valid_reads <= phase1 + phase2 * 0.5, \
-            f"group re-read from 0 -- committed offset lost across cutover: " \
+        )
+        assert s2.valid_reads <= phase1 + phase2 * 0.5, (
+            f"group re-read from 0 -- committed offset lost across cutover: "
             f"valid_reads={s2.valid_reads}"
+        )
         c2.stop()
         c2.free()
 
     @cluster(num_nodes=2)
-    @matrix(storage_mode=[
-        TopicSpec.STORAGE_MODE_CLOUD,
-        TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
-    ])
+    @matrix(
+        storage_mode=[
+            TopicSpec.STORAGE_MODE_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
+        ]
+    )
     def test_ts_to_ct_migration_multi_partition(self, storage_mode: str):
         """A multi-partition topic migrates: each partition runs its own mirror
         and cuts over independently (one trigger, fanned out). Exercises the
@@ -1613,7 +1704,8 @@ class TsToCtMigrationTest(RedpandaTest):
         self._enable_migration()
         if storage_mode == TopicSpec.STORAGE_MODE_IMPL_TIERED_V2:
             self.redpanda.set_feature_active(
-                "tiered_cloud_topics", True, timeout_sec=30)
+                "tiered_cloud_topics", True, timeout_sec=30
+            )
 
         self.rpk.create_topic(
             self.TOPIC_MULTI,
@@ -1641,8 +1733,11 @@ class TsToCtMigrationTest(RedpandaTest):
             for p in range(self.MULTI_PARTITION_COUNT):
                 wait_until(
                     lambda p=p: len(
-                        self.admin.get_partition_manifest(
-                            self.TOPIC_MULTI, p).get("segments", {})) >= 1,
+                        self.admin.get_partition_manifest(self.TOPIC_MULTI, p).get(
+                            "segments", {}
+                        )
+                    )
+                    >= 1,
                     timeout_sec=120,
                     backoff_sec=2,
                     err_msg=f"partition {p} got no TS segment within 120s",
@@ -1655,8 +1750,7 @@ class TsToCtMigrationTest(RedpandaTest):
             producer.free()
 
         total = producer.produce_status.acked
-        self._wait_for_cutover_all(
-            self.TOPIC_MULTI, self.MULTI_PARTITION_COUNT)
+        self._wait_for_cutover_all(self.TOPIC_MULTI, self.MULTI_PARTITION_COUNT)
 
         consumer = KgoVerifierSeqConsumer(
             self.test_context,
@@ -1667,20 +1761,21 @@ class TsToCtMigrationTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=180)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.offset_gaps == 0, \
-            f"offset_gaps={status.offset_gaps}"
-        assert status.valid_reads >= total, \
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, f"offset_gaps={status.offset_gaps}"
+        assert status.valid_reads >= total, (
             f"records lost: read {status.valid_reads} < acked {total}"
+        )
         consumer.stop()
         consumer.free()
 
     @cluster(num_nodes=2)
-    @matrix(storage_mode=[
-        TopicSpec.STORAGE_MODE_CLOUD,
-        TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
-    ])
+    @matrix(
+        storage_mode=[
+            TopicSpec.STORAGE_MODE_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
+        ]
+    )
     def test_ts_to_ct_migration_node_restart(self, storage_mode: str):
         """A broker restart mid-migration (the common operational case, distinct
         from total-loss cluster recovery). The migration state -- the archival
@@ -1692,11 +1787,13 @@ class TsToCtMigrationTest(RedpandaTest):
         self._enable_migration()
         if storage_mode == TopicSpec.STORAGE_MODE_IMPL_TIERED_V2:
             self.redpanda.set_feature_active(
-                "tiered_cloud_topics", True, timeout_sec=30)
+                "tiered_cloud_topics", True, timeout_sec=30
+            )
         # Hold the partition migrating so the restart happens mid-migration
         # rather than racing a cutover under concurrent writes.
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": True})
+            {"cloud_topics_disable_migration_cutover_for_tests": True}
+        )
 
         self.rpk.create_topic(
             self.TOPIC_RESTART,
@@ -1736,14 +1833,22 @@ class TsToCtMigrationTest(RedpandaTest):
             # Graceful restart of the broker (no wipe) -- mid-migration.
             self.redpanda.restart_nodes(self.redpanda.nodes)
             self.redpanda._admin.await_stable_leader(
-                self.TOPIC_RESTART, partition=0, namespace="kafka",
-                timeout_s=60, backoff_s=2)
+                self.TOPIC_RESTART,
+                partition=0,
+                namespace="kafka",
+                timeout_s=60,
+                backoff_s=2,
+            )
 
             # The migration state survived: still TS-served (manifest non-empty),
             # not reset to a fresh cloud topic.
             wait_until(
-                lambda: len(self.admin.get_partition_manifest(
-                    self.TOPIC_RESTART, 0).get("segments", {})) > 0,
+                lambda: len(
+                    self.admin.get_partition_manifest(self.TOPIC_RESTART, 0).get(
+                        "segments", {}
+                    )
+                )
+                > 0,
                 timeout_sec=60,
                 backoff_sec=2,
                 err_msg="migration state lost across restart (manifest empty)",
@@ -1757,7 +1862,8 @@ class TsToCtMigrationTest(RedpandaTest):
         # Allow cutover now that we've confirmed the migration survived the
         # restart; the mirror has resumed and converges.
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": False})
+            {"cloud_topics_disable_migration_cutover_for_tests": False}
+        )
         self._wait_for_cutover(self.TOPIC_RESTART)
 
         consumer = KgoVerifierSeqConsumer(
@@ -1769,13 +1875,11 @@ class TsToCtMigrationTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=180)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.offset_gaps == 0, \
-            f"offset_gaps={status.offset_gaps}"
-        assert status.valid_reads >= acked, \
-            f"records lost across restart: read {status.valid_reads} < " \
-            f"acked {acked}"
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, f"offset_gaps={status.offset_gaps}"
+        assert status.valid_reads >= acked, (
+            f"records lost across restart: read {status.valid_reads} < acked {acked}"
+        )
         consumer.stop()
         consumer.free()
 
@@ -1798,6 +1902,7 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
     consumer reading from offset 0 sees a correct, gap-free prefix of the data
     that reached tiered storage.
     """
+
     TOPIC = "ts-ct-recovery-test"
     MSG_SIZE = 128
 
@@ -1846,13 +1951,15 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
     @cluster(num_nodes=2)
     def test_ts_to_ct_migration_recovery(self):
         self.redpanda.set_feature_active(
-            "tiered_to_cloud_migration", True, timeout_sec=30)
+            "tiered_to_cloud_migration", True, timeout_sec=30
+        )
         # Hold the partition in the migrating phase (the knob is a cluster config,
         # so it is captured in the controller snapshot and restored on recovery)
         # so the partition is recovered via the migrating branch -- as tiered
         # storage -- rather than racing a cutover.
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": True})
+            {"cloud_topics_disable_migration_cutover_for_tests": True}
+        )
 
         self.rpk.create_topic(
             self.TOPIC,
@@ -1908,8 +2015,7 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
             self.redpanda.wait_for_controller_snapshot(self.redpanda.nodes[0])
             time.sleep(8)
             acked_before = producer.produce_status.acked
-            self.logger.info(
-                f"acked before recovery: {acked_before}")
+            self.logger.info(f"acked before recovery: {acked_before}")
             assert acked_before > 0, "producer made no progress"
         finally:
             # Abruptly stop the broker while the producer is still running so the
@@ -1927,13 +2033,12 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
             omit_seeds_on_idx_one=False,
         )
         self.redpanda._admin.await_stable_leader(
-            "controller", partition=0, namespace="redpanda",
-            timeout_s=60, backoff_s=2)
+            "controller", partition=0, namespace="redpanda", timeout_s=60, backoff_s=2
+        )
         self.redpanda._admin.initialize_cluster_recovery()
 
         def recovery_done() -> bool:
-            state = self.redpanda._admin.get_cluster_recovery_status().json()[
-                "state"]
+            state = self.redpanda._admin.get_cluster_recovery_status().json()["state"]
             if "failed" in state:
                 raise RuntimeError(f"cluster recovery failed: {state}")
             return "inactive" in state
@@ -1949,8 +2054,7 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
         # The migrating partition was recovered as tiered storage (the metastore
         # phase is migrating and cutover is held off): partition_mode is tiered,
         # so it is served as TS from the rebuilt archival STM.
-        assert self.TOPIC in set(self.rpk.list_topics()), \
-            "topic was not recovered"
+        assert self.TOPIC in set(self.rpk.list_topics()), "topic was not recovered"
 
         # The migrating partition must come back AS TIERED STORAGE -- a non-empty
         # archival manifest -- not as an empty/native cloud topic. A recovery
@@ -2034,12 +2138,13 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
         # -- records acked but not yet uploaded are legitimately lost on cluster
         # wipe -- so assert a substantial contiguous prefix rather than an exact
         # total.
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.offset_gaps == 0, \
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, (
             f"recovered prefix has gaps: offset_gaps={status.offset_gaps}"
-        assert status.valid_reads > 1000, \
+        )
+        assert status.valid_reads > 1000, (
             f"recovered partition served too few records: {status.valid_reads}"
+        )
         consumer.stop()
         consumer.free()
 
@@ -2057,9 +2162,11 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
         retained range stays small (the recovered partition reads from tiered
         storage on demand)."""
         self.redpanda.set_feature_active(
-            "tiered_to_cloud_migration", True, timeout_sec=30)
+            "tiered_to_cloud_migration", True, timeout_sec=30
+        )
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": True})
+            {"cloud_topics_disable_migration_cutover_for_tests": True}
+        )
 
         self.rpk.create_topic(
             self.TOPIC_TRIMMED,
@@ -2075,8 +2182,13 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
         produced = 8000
         trim_to = 7000
         KgoVerifierProducer.oneshot(
-            self.test_context, self.redpanda, self.TOPIC_TRIMMED,
-            msg_size=self.MSG_SIZE, msg_count=produced, timeout_sec=120)
+            self.test_context,
+            self.redpanda,
+            self.TOPIC_TRIMMED,
+            msg_size=self.MSG_SIZE,
+            msg_count=produced,
+            timeout_sec=120,
+        )
 
         def describe_start() -> int:
             parts = list(self.rpk.describe_topic(self.TOPIC_TRIMMED))
@@ -2109,8 +2221,7 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
 
             # DeleteRecords trims the head deterministically while migrating; the
             # start advances to the trim point with the manifest still non-empty.
-            self.rpk.trim_prefix(
-                self.TOPIC_TRIMMED, trim_to, partitions=[0])
+            self.rpk.trim_prefix(self.TOPIC_TRIMMED, trim_to, partitions=[0])
 
             def trimmed_migrating() -> bool:
                 m = self.admin.get_partition_manifest(self.TOPIC_TRIMMED, 0)
@@ -2138,13 +2249,12 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
             omit_seeds_on_idx_one=False,
         )
         self.redpanda._admin.await_stable_leader(
-            "controller", partition=0, namespace="redpanda",
-            timeout_s=60, backoff_s=2)
+            "controller", partition=0, namespace="redpanda", timeout_s=60, backoff_s=2
+        )
         self.redpanda._admin.initialize_cluster_recovery()
 
         def recovery_done() -> bool:
-            state = self.redpanda._admin.get_cluster_recovery_status().json()[
-                "state"]
+            state = self.redpanda._admin.get_cluster_recovery_status().json()["state"]
             if "failed" in state:
                 raise RuntimeError(f"cluster recovery failed: {state}")
             return "inactive" in state
@@ -2156,15 +2266,16 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
             err_msg="cluster recovery did not complete within 120s",
             retry_on_exc=True,
         )
-        assert self.TOPIC_TRIMMED in set(self.rpk.list_topics()), \
+        assert self.TOPIC_TRIMMED in set(self.rpk.list_topics()), (
             "topic was not recovered"
+        )
 
         # The trimmed head carried through recovery: the partition begins at the
         # trimmed offset (no reset to 0, no stale prefix below the trimmed start).
         recovered_start = describe_start()
-        assert recovered_start >= trim_to, \
-            f"trimmed start lost on recovery: start={recovered_start} < " \
-            f"{trim_to}"
+        assert recovered_start >= trim_to, (
+            f"trimmed start lost on recovery: start={recovered_start} < {trim_to}"
+        )
 
         # Confirm the recovered prefix is readable from exactly the trimmed start.
         # A bounded read of the first records suffices -- the recovered partition
@@ -2172,19 +2283,27 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
         # of the retained range is slow, and the start offset (above) is the
         # property under test.
         out = self.rpk.consume(
-            self.TOPIC_TRIMMED, n=20, offset="start", partition=0,
-            format="%o\n", timeout=120)
+            self.TOPIC_TRIMMED,
+            n=20,
+            offset="start",
+            partition=0,
+            format="%o\n",
+            timeout=120,
+        )
         served = [int(ln) for ln in out.splitlines() if ln.strip().isdigit()]
-        assert len(served) >= 20, \
+        assert len(served) >= 20, (
             f"recovered partition served too few records: {len(served)}"
-        assert served[0] == recovered_start, \
-            f"recovered prefix starts at {served[0]}, expected the trimmed " \
+        )
+        assert served[0] == recovered_start, (
+            f"recovered prefix starts at {served[0]}, expected the trimmed "
             f"start {recovered_start}"
+        )
 
     def _l1_next_offset(self, topic: str, partition: int = 0) -> int | None:
         metastore = AdminV2(self.redpanda).metastore()
         req = metastore_pb.GetOffsetsRequest(
-            partition=ntp_pb.TopicPartition(topic=topic, partition=partition))
+            partition=ntp_pb.TopicPartition(topic=topic, partition=partition)
+        )
         try:
             resp = metastore.get_offsets(req=req)
             return resp.offsets.next_offset
@@ -2216,7 +2335,8 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
         the high watermark with every record.
         """
         self.redpanda.set_feature_active(
-            "tiered_to_cloud_migration", True, timeout_sec=30)
+            "tiered_to_cloud_migration", True, timeout_sec=30
+        )
 
         # Deterministic recovery condition (scoped to this test, not the class,
         # so the mid-migration recovery test keeps the default cadences): fast L1
@@ -2225,10 +2345,12 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
         # archiver does not re-upload the emptied archival manifest -- the remote
         # archival manifest stays stale (non-empty), which is exactly the
         # recovery scenario under test.
-        self.redpanda.set_cluster_config({
-            "cloud_topics_long_term_flush_interval": 500,
-            "cloud_storage_manifest_max_upload_interval_sec": 3600,
-        })
+        self.redpanda.set_cluster_config(
+            {
+                "cloud_topics_long_term_flush_interval": 500,
+                "cloud_storage_manifest_max_upload_interval_sec": 3600,
+            }
+        )
 
         self.rpk.create_topic(
             self.TOPIC_COMPLETE,
@@ -2269,8 +2391,12 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
 
         # Cutover empties the (live) archival manifest.
         wait_until(
-            lambda: len(self.admin.get_partition_manifest(
-                self.TOPIC_COMPLETE, 0).get("segments", {})) == 0,
+            lambda: len(
+                self.admin.get_partition_manifest(self.TOPIC_COMPLETE, 0).get(
+                    "segments", {}
+                )
+            )
+            == 0,
             timeout_sec=240,
             backoff_sec=5,
             err_msg="topic did not cut over within 240s",
@@ -2312,13 +2438,12 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
             omit_seeds_on_idx_one=False,
         )
         self.redpanda._admin.await_stable_leader(
-            "controller", partition=0, namespace="redpanda",
-            timeout_s=60, backoff_s=2)
+            "controller", partition=0, namespace="redpanda", timeout_s=60, backoff_s=2
+        )
         self.redpanda._admin.initialize_cluster_recovery()
 
         def recovery_done() -> bool:
-            state = self.redpanda._admin.get_cluster_recovery_status().json()[
-                "state"]
+            state = self.redpanda._admin.get_cluster_recovery_status().json()["state"]
             if "failed" in state:
                 raise RuntimeError(f"cluster recovery failed: {state}")
             return "inactive" in state
@@ -2331,8 +2456,9 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
             retry_on_exc=True,
         )
 
-        assert self.TOPIC_COMPLETE in set(self.rpk.list_topics()), \
+        assert self.TOPIC_COMPLETE in set(self.rpk.list_topics()), (
             "topic was not recovered"
+        )
 
         # The restored metastore must be internally consistent and complete: the
         # snapshot is atomic, so next_offset, the extents, and their backing
@@ -2354,13 +2480,14 @@ class TsToCtMigrationRecoveryTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=180)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.offset_gaps == 0, \
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, (
             f"recovered topic has gaps: offset_gaps={status.offset_gaps}"
-        assert status.valid_reads >= self.NUM_COMPLETE, \
-            (f"recovered topic served {status.valid_reads} of "
-             f"{self.NUM_COMPLETE} records")
+        )
+        assert status.valid_reads >= self.NUM_COMPLETE, (
+            f"recovered topic served {status.valid_reads} of "
+            f"{self.NUM_COMPLETE} records"
+        )
         consumer.stop()
         consumer.free()
 
@@ -2377,6 +2504,7 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
     still-migrating source returns a correct, gap-free prefix of the source's
     data (lagging the source tail until cutover).
     """
+
     TOPIC = "ts-ct-rr-test"
     MSG_SIZE = 128
 
@@ -2409,8 +2537,7 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
             cloud_storage_enable_remote_write=False,
             fast_uploads=True,
         )
-        self.rr_settings.reset_cloud_storage_bucket(
-            si_settings.cloud_storage_bucket)
+        self.rr_settings.reset_cloud_storage_bucket(si_settings.cloud_storage_bucket)
         self.source_bucket = si_settings.cloud_storage_bucket
         self.second_cluster = None
 
@@ -2421,11 +2548,13 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
     @cluster(num_nodes=4)
     def test_ts_to_ct_migration_read_replica(self):
         self.redpanda.set_feature_active(
-            "tiered_to_cloud_migration", True, timeout_sec=30)
+            "tiered_to_cloud_migration", True, timeout_sec=30
+        )
         # Hold the source in the migrating phase so the replica reads a
         # mid-migration source (rather than the source cutting over first).
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": True})
+            {"cloud_topics_disable_migration_cutover_for_tests": True}
+        )
 
         self.rpk.create_topic(
             self.TOPIC,
@@ -2493,10 +2622,8 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
             )
 
             def rr_has_leader() -> bool:
-                parts = list(
-                    rr_rpk.describe_topic(self.TOPIC, tolerant=True))
-                return len(parts) > 0 and all(
-                    p.leader != -1 for p in parts)
+                parts = list(rr_rpk.describe_topic(self.TOPIC, tolerant=True))
+                return len(parts) > 0 and all(p.leader != -1 for p in parts)
 
             wait_until(
                 rr_has_leader,
@@ -2517,13 +2644,16 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
             consumer.start()
             consumer.wait(timeout_sec=120)
             status = consumer.consumer_status.validator
-            assert status.invalid_reads == 0, \
-                f"replica served incorrect records: " \
+            assert status.invalid_reads == 0, (
+                f"replica served incorrect records: "
                 f"invalid_reads={status.invalid_reads}"
-            assert status.offset_gaps == 0, \
+            )
+            assert status.offset_gaps == 0, (
                 f"replica prefix has gaps: offset_gaps={status.offset_gaps}"
-            assert status.valid_reads > 1000, \
+            )
+            assert status.valid_reads > 1000, (
                 f"replica served too few records: {status.valid_reads}"
+            )
             consumer.stop()
             consumer.free()
         finally:
@@ -2586,7 +2716,8 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
             # Activate the migration feature on the replica cluster so that
             # tiered->cloud would be permitted if not for the read-replica guard.
             self.second_cluster.set_feature_active(
-                "tiered_to_cloud_migration", True, timeout_sec=30)
+                "tiered_to_cloud_migration", True, timeout_sec=30
+            )
             rr_rpk = RpkTool(self.second_cluster)
             rr_rpk.create_topic(
                 self.TOPIC,
@@ -2614,10 +2745,12 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
             ):
                 try:
                     rr_rpk.alter_topic_config(
-                        self.TOPIC, TopicSpec.PROPERTY_STORAGE_MODE, mode)
+                        self.TOPIC, TopicSpec.PROPERTY_STORAGE_MODE, mode
+                    )
                     raise AssertionError(
                         f"altering redpanda.storage.mode to {mode} on a "
-                        "read-replica topic was accepted")
+                        "read-replica topic was accepted"
+                    )
                 except RpkException:
                     pass
         finally:
@@ -2635,12 +2768,14 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
         """
         topic = "ts-ct-rr-cutover-test"
         self.redpanda.set_feature_active(
-            "tiered_to_cloud_migration", True, timeout_sec=30)
+            "tiered_to_cloud_migration", True, timeout_sec=30
+        )
         # Hold the source migrating so the replica is brought up live during the
         # migration; the knob is released below to drive the migrating->complete
         # flip deterministically while the replica is reading.
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": True})
+            {"cloud_topics_disable_migration_cutover_for_tests": True}
+        )
 
         self.rpk.create_topic(
             topic,
@@ -2714,7 +2849,8 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
             # replica is live.
             producer.wait(timeout_sec=180)
             self.redpanda.set_cluster_config(
-                {"cloud_topics_disable_migration_cutover_for_tests": False})
+                {"cloud_topics_disable_migration_cutover_for_tests": False}
+            )
             wait_until(
                 lambda: not self._has_ts_segments(topic),
                 timeout_sec=240,
@@ -2727,8 +2863,7 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
             # high watermark catches up to the full record count.
             def rr_caught_up() -> bool:
                 parts = list(rr_rpk.describe_topic(topic, tolerant=True))
-                return len(parts) > 0 and (
-                    parts[0].high_watermark or 0) >= total
+                return len(parts) > 0 and (parts[0].high_watermark or 0) >= total
 
             wait_until(
                 rr_caught_up,
@@ -2747,13 +2882,12 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
             consumer.start()
             consumer.wait(timeout_sec=120)
             status = consumer.consumer_status.validator
-            assert status.invalid_reads == 0, \
-                f"invalid_reads={status.invalid_reads}"
-            assert status.offset_gaps == 0, \
-                f"offset_gaps={status.offset_gaps}"
-            assert status.valid_reads >= total, \
-                f"replica lost records across the source cutover: " \
+            assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+            assert status.offset_gaps == 0, f"offset_gaps={status.offset_gaps}"
+            assert status.valid_reads >= total, (
+                f"replica lost records across the source cutover: "
                 f"read {status.valid_reads} < {total}"
+            )
             consumer.stop()
             consumer.free()
         finally:
@@ -2773,9 +2907,11 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
         the replica is brought up, then cut over."""
         topic = "ts-ct-rr-tx-test"
         self.redpanda.set_feature_active(
-            "tiered_to_cloud_migration", True, timeout_sec=30)
+            "tiered_to_cloud_migration", True, timeout_sec=30
+        )
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": True})
+            {"cloud_topics_disable_migration_cutover_for_tests": True}
+        )
 
         self.rpk.create_topic(
             topic,
@@ -2849,7 +2985,8 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
             self.rpk.produce(topic, "sentinel", "sentinel")
 
             self.redpanda.set_cluster_config(
-                {"cloud_topics_disable_migration_cutover_for_tests": False})
+                {"cloud_topics_disable_migration_cutover_for_tests": False}
+            )
             wait_until(
                 lambda: not self._has_ts_segments(topic),
                 timeout_sec=240,
@@ -2860,8 +2997,11 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
 
             src_hwm = list(self.rpk.describe_topic(topic))[0].high_watermark or 0
             wait_until(
-                lambda: (list(rr_rpk.describe_topic(topic, tolerant=True))[0]
-                         .high_watermark or 0) >= src_hwm,
+                lambda: (
+                    list(rr_rpk.describe_topic(topic, tolerant=True))[0].high_watermark
+                    or 0
+                )
+                >= src_hwm,
                 timeout_sec=120,
                 backoff_sec=3,
                 err_msg="replica did not catch up to the source high watermark",
@@ -2880,11 +3020,11 @@ class TsToCtMigrationReadReplicaTest(RedpandaTest):
             consumer.start()
             consumer.wait(timeout_sec=180)
             status = consumer.consumer_status.validator
-            assert status.invalid_reads == 0, \
-                f"replica read_committed saw aborted records: " \
+            assert status.invalid_reads == 0, (
+                f"replica read_committed saw aborted records: "
                 f"invalid_reads={status.invalid_reads}"
-            assert status.valid_reads > 0, \
-                "replica served no committed records"
+            )
+            assert status.valid_reads > 0, "replica served no committed records"
             consumer.stop()
             consumer.free()
         finally:
@@ -2903,6 +3043,7 @@ class TsToCtMigrationReplicatedTest(RedpandaTest):
     These cases check that migration converges and cuts over under a real quorum,
     and that it survives a leadership change while migrating -- the new leader
     resumes the mirror and still reaches cutover, with nothing lost."""
+
     TOPIC = "ts-ct-migration-replicated-test"
     TOPIC_XFER = "ts-ct-migration-xfer-test"
     TOPIC_MULTITERM = "ts-ct-migration-multiterm-test"
@@ -2933,12 +3074,13 @@ class TsToCtMigrationReplicatedTest(RedpandaTest):
 
     def _enable_migration(self):
         self.redpanda.set_feature_active(
-            "tiered_to_cloud_migration", True, timeout_sec=30)
+            "tiered_to_cloud_migration", True, timeout_sec=30
+        )
 
     def _wait_for_ts_segment(self, topic: str):
         wait_until(
-            lambda: len(self.admin.get_partition_manifest(
-                topic, 0).get("segments", {})) >= 1,
+            lambda: len(self.admin.get_partition_manifest(topic, 0).get("segments", {}))
+            >= 1,
             timeout_sec=120,
             backoff_sec=2,
             err_msg=f"No TS segment uploaded for {topic} within 120s",
@@ -2952,15 +3094,17 @@ class TsToCtMigrationReplicatedTest(RedpandaTest):
         # tiered_cloud is not a settable storage.mode value.
         if storage_mode == TopicSpec.STORAGE_MODE_IMPL_TIERED_V2:
             self.redpanda.set_cluster_config(
-                {"default_redpanda_storage_mode_tiered_impl": "tiered_v2"})
+                {"default_redpanda_storage_mode_tiered_impl": "tiered_v2"}
+            )
             storage_mode = TopicSpec.STORAGE_MODE_TIERED
         self.rpk.alter_topic_config(
-            topic, TopicSpec.PROPERTY_STORAGE_MODE, storage_mode)
+            topic, TopicSpec.PROPERTY_STORAGE_MODE, storage_mode
+        )
 
     def _wait_for_cutover(self, topic: str):
         wait_until(
-            lambda: len(self.admin.get_partition_manifest(
-                topic, 0).get("segments", {})) == 0,
+            lambda: len(self.admin.get_partition_manifest(topic, 0).get("segments", {}))
+            == 0,
             timeout_sec=240,
             backoff_sec=5,
             err_msg=f"{topic} did not cut over to cloud topics within 240s",
@@ -2970,7 +3114,8 @@ class TsToCtMigrationReplicatedTest(RedpandaTest):
     def _l1_next_offset(self, topic: str, partition: int = 0) -> int | None:
         metastore = AdminV2(self.redpanda).metastore()
         req = metastore_pb.GetOffsetsRequest(
-            partition=ntp_pb.TopicPartition(topic=topic, partition=partition))
+            partition=ntp_pb.TopicPartition(topic=topic, partition=partition)
+        )
         try:
             resp = metastore.get_offsets(req=req)
             return resp.offsets.next_offset
@@ -3019,12 +3164,11 @@ class TsToCtMigrationReplicatedTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=180)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.offset_gaps == 0, \
-            f"offset_gaps={status.offset_gaps}"
-        assert status.valid_reads >= total, \
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, f"offset_gaps={status.offset_gaps}"
+        assert status.valid_reads >= total, (
             f"valid_reads={status.valid_reads} < produced {total}"
+        )
         consumer.stop()
         consumer.free()
 
@@ -3038,7 +3182,8 @@ class TsToCtMigrationReplicatedTest(RedpandaTest):
         writes."""
         self._enable_migration()
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": True})
+            {"cloud_topics_disable_migration_cutover_for_tests": True}
+        )
         self.rpk.create_topic(
             self.TOPIC_XFER,
             partitions=1,
@@ -3061,8 +3206,7 @@ class TsToCtMigrationReplicatedTest(RedpandaTest):
         producer.start()
         try:
             self._wait_for_ts_segment(self.TOPIC_XFER)
-            self._trigger_migration(
-                self.TOPIC_XFER, TopicSpec.STORAGE_MODE_CLOUD)
+            self._trigger_migration(self.TOPIC_XFER, TopicSpec.STORAGE_MODE_CLOUD)
             # Migration genuinely underway: the mirror has imported into L1.
             wait_until(
                 lambda: (self._l1_next_offset(self.TOPIC_XFER) or 0) > 0,
@@ -3073,25 +3217,41 @@ class TsToCtMigrationReplicatedTest(RedpandaTest):
             )
 
             old_leader = self.admin.await_stable_leader(
-                self.TOPIC_XFER, partition=0, namespace="kafka",
-                timeout_s=60, backoff_s=2)
+                self.TOPIC_XFER,
+                partition=0,
+                namespace="kafka",
+                timeout_s=60,
+                backoff_s=2,
+            )
             # Move leadership to the next replica, mid-mirror.
             transferred = self.admin.transfer_leadership_to(
-                namespace="kafka", topic=self.TOPIC_XFER, partition=0,
-                leader_id=old_leader)
+                namespace="kafka",
+                topic=self.TOPIC_XFER,
+                partition=0,
+                leader_id=old_leader,
+            )
             assert transferred, "leadership transfer was not performed"
             new_leader = self.admin.await_stable_leader(
-                self.TOPIC_XFER, partition=0, namespace="kafka",
-                timeout_s=60, backoff_s=2,
-                check=lambda node_id: node_id != old_leader)
-            assert new_leader != old_leader, \
+                self.TOPIC_XFER,
+                partition=0,
+                namespace="kafka",
+                timeout_s=60,
+                backoff_s=2,
+                check=lambda node_id: node_id != old_leader,
+            )
+            assert new_leader != old_leader, (
                 f"leader did not change: still {old_leader}"
+            )
 
             # Migration survived the transfer: still TS-served (manifest
             # non-empty), not reset to a fresh cloud topic.
             wait_until(
-                lambda: len(self.admin.get_partition_manifest(
-                    self.TOPIC_XFER, 0).get("segments", {})) > 0,
+                lambda: len(
+                    self.admin.get_partition_manifest(self.TOPIC_XFER, 0).get(
+                        "segments", {}
+                    )
+                )
+                > 0,
                 timeout_sec=60,
                 backoff_sec=2,
                 err_msg="migration state lost across leadership transfer "
@@ -3105,7 +3265,8 @@ class TsToCtMigrationReplicatedTest(RedpandaTest):
 
         # Release the hold: the new leader's mirror resumes and converges.
         self.redpanda.set_cluster_config(
-            {"cloud_topics_disable_migration_cutover_for_tests": False})
+            {"cloud_topics_disable_migration_cutover_for_tests": False}
+        )
         self._wait_for_cutover(self.TOPIC_XFER)
 
         consumer = KgoVerifierSeqConsumer(
@@ -3117,13 +3278,12 @@ class TsToCtMigrationReplicatedTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=180)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.offset_gaps == 0, \
-            f"offset_gaps={status.offset_gaps}"
-        assert status.valid_reads >= acked, \
-            f"records lost across leadership transfer: read " \
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, f"offset_gaps={status.offset_gaps}"
+        assert status.valid_reads >= acked, (
+            f"records lost across leadership transfer: read "
             f"{status.valid_reads} < acked {acked}"
+        )
         consumer.stop()
         consumer.free()
 
@@ -3159,22 +3319,32 @@ class TsToCtMigrationReplicatedTest(RedpandaTest):
         producer.start()
         try:
             self._wait_for_ts_segment(self.TOPIC_MULTITERM)
-            epoch0 = list(self.rpk.describe_topic(
-                self.TOPIC_MULTITERM))[0].leader_epoch
+            epoch0 = list(self.rpk.describe_topic(self.TOPIC_MULTITERM))[0].leader_epoch
             # Transfer leadership a few times while producing, so segments are
             # uploaded under several raft terms (distinct leader epochs).
             for _ in range(3):
                 acked = producer.produce_status.acked
                 old = self.admin.await_stable_leader(
-                    self.TOPIC_MULTITERM, partition=0, namespace="kafka",
-                    timeout_s=60, backoff_s=2)
+                    self.TOPIC_MULTITERM,
+                    partition=0,
+                    namespace="kafka",
+                    timeout_s=60,
+                    backoff_s=2,
+                )
                 self.admin.transfer_leadership_to(
-                    namespace="kafka", topic=self.TOPIC_MULTITERM, partition=0,
-                    leader_id=old)
+                    namespace="kafka",
+                    topic=self.TOPIC_MULTITERM,
+                    partition=0,
+                    leader_id=old,
+                )
                 self.admin.await_stable_leader(
-                    self.TOPIC_MULTITERM, partition=0, namespace="kafka",
-                    timeout_s=60, backoff_s=2,
-                    check=lambda node_id, _old=old: node_id != _old)
+                    self.TOPIC_MULTITERM,
+                    partition=0,
+                    namespace="kafka",
+                    timeout_s=60,
+                    backoff_s=2,
+                    check=lambda node_id, _old=old: node_id != _old,
+                )
                 # Let a batch of records land under the new term.
                 wait_until(
                     lambda _a=acked: producer.produce_status.acked > _a + 2000,
@@ -3183,12 +3353,11 @@ class TsToCtMigrationReplicatedTest(RedpandaTest):
                     err_msg="producer made no progress under the new term",
                     retry_on_exc=True,
                 )
-            epoch1 = list(self.rpk.describe_topic(
-                self.TOPIC_MULTITERM))[0].leader_epoch
-            assert epoch1 > epoch0, \
+            epoch1 = list(self.rpk.describe_topic(self.TOPIC_MULTITERM))[0].leader_epoch
+            assert epoch1 > epoch0, (
                 f"no new terms created: leader_epoch {epoch0} -> {epoch1}"
-            self._trigger_migration(
-                self.TOPIC_MULTITERM, TopicSpec.STORAGE_MODE_CLOUD)
+            )
+            self._trigger_migration(self.TOPIC_MULTITERM, TopicSpec.STORAGE_MODE_CLOUD)
         finally:
             producer.stop()
             acked = producer.produce_status.acked
@@ -3205,12 +3374,14 @@ class TsToCtMigrationReplicatedTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=240)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads} (leader-epoch monotonicity " \
+        assert status.invalid_reads == 0, (
+            f"invalid_reads={status.invalid_reads} (leader-epoch monotonicity "
             f"or order broken across the imported multi-term extents)"
+        )
         assert status.offset_gaps == 0, f"offset_gaps={status.offset_gaps}"
-        assert status.valid_reads >= acked, \
+        assert status.valid_reads >= acked, (
             f"records lost: read {status.valid_reads} < acked {acked}"
+        )
         consumer.stop()
         consumer.free()
 
@@ -3266,12 +3437,14 @@ class TsToCtMigrationEmptyManifestTest(RedpandaTest):
     def _enable_migration(self):
         """Permit the tiered->cloud migration trigger (feature + config)."""
         self.redpanda.set_feature_active(
-            "tiered_to_cloud_migration", True, timeout_sec=30)
+            "tiered_to_cloud_migration", True, timeout_sec=30
+        )
         self.redpanda.set_cluster_config({"enable_ts_tsv2_migration": True})
 
     def _trigger_migration(self, topic: str):
         self.rpk.alter_topic_config(
-            topic, TopicSpec.PROPERTY_STORAGE_MODE, TopicSpec.STORAGE_MODE_CLOUD)
+            topic, TopicSpec.PROPERTY_STORAGE_MODE, TopicSpec.STORAGE_MODE_CLOUD
+        )
 
     def _l1_next_offset(self, topic: str, partition: int = 0) -> int | None:
         """The L1 metastore's next_offset for the partition (None if the
@@ -3280,7 +3453,8 @@ class TsToCtMigrationEmptyManifestTest(RedpandaTest):
         reconciler materialized the raft log into L1."""
         metastore = AdminV2(self.redpanda).metastore()
         req = metastore_pb.GetOffsetsRequest(
-            partition=ntp_pb.TopicPartition(topic=topic, partition=partition))
+            partition=ntp_pb.TopicPartition(topic=topic, partition=partition)
+        )
         try:
             resp = metastore.get_offsets(req=req)
             return resp.offsets.next_offset
@@ -3295,13 +3469,13 @@ class TsToCtMigrationEmptyManifestTest(RedpandaTest):
         and this would fail, meaning we are not exercising the empty path."""
         m = self.admin.get_partition_manifest(topic, 0)
         n = len(m.get("segments", {}))
-        assert n == 0, \
-            f"archival manifest not empty {when}: {n} segments"
+        assert n == 0, f"archival manifest not empty {when}: {n} segments"
 
     def _wait_for_migration_complete(self, topic: str, min_next_offset: int):
         """Empty-manifest cutover has no 'manifest goes empty' signal (it starts
         empty), so observe completion via the L1 metastore: the partition
         appears (ctp_stm seeded at cutover) and next_offset covers the data."""
+
         def done() -> bool:
             nxt = self._l1_next_offset(topic)
             return nxt is not None and nxt >= min_next_offset
@@ -3372,12 +3546,11 @@ class TsToCtMigrationEmptyManifestTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=120)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.offset_gaps == 0, \
-            f"offset_gaps={status.offset_gaps}"
-        assert status.valid_reads >= count, \
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, f"offset_gaps={status.offset_gaps}"
+        assert status.valid_reads >= count, (
             f"valid_reads={status.valid_reads} < produced {count}"
+        )
         consumer.stop()
         consumer.free()
 
@@ -3425,11 +3598,10 @@ class TsToCtMigrationEmptyManifestTest(RedpandaTest):
         consumer.start()
         consumer.wait(timeout_sec=120)
         status = consumer.consumer_status.validator
-        assert status.invalid_reads == 0, \
-            f"invalid_reads={status.invalid_reads}"
-        assert status.offset_gaps == 0, \
-            f"offset_gaps={status.offset_gaps}"
-        assert status.valid_reads >= total, \
+        assert status.invalid_reads == 0, f"invalid_reads={status.invalid_reads}"
+        assert status.offset_gaps == 0, f"offset_gaps={status.offset_gaps}"
+        assert status.valid_reads >= total, (
             f"valid_reads={status.valid_reads} < produced {total}"
+        )
         consumer.stop()
         consumer.free()
