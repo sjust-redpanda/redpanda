@@ -92,6 +92,12 @@ partition_manager::partition_manager(
                 // gate; _as just bounds the retries at node shutdown.
                 ssx::background = ssx::ignore_shutdown_exceptions(
                   p->maybe_sync_partition_mode(_as));
+                // Finish a TS->CT cutover interrupted after partition_mode
+                // advanced to cloud but before the archival manifest was
+                // emptied (idempotent; no-op unless that crash window is
+                // observed).
+                ssx::spawn_with_gate(
+                  _gate, [p] { return p->maybe_finish_cutover(); });
             }
         });
     _shutdown_watchdog.set_callback(
