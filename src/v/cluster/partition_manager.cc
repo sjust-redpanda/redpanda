@@ -82,6 +82,12 @@ partition_manager::partition_manager(
                 // gate, and only one loop runs per partition however many
                 // callers poke it.
                 p->partition_storage_mode_sync().notify();
+                // Finish a TS->CT cutover interrupted after
+                // partition_storage_mode advanced to cloud but before the
+                // archival manifest was emptied (idempotent; no-op unless that
+                // crash window is observed).
+                ssx::spawn_with_gate(
+                  _gate, [p] { return p->maybe_finish_cutover(); });
             }
         });
     _shutdown_watchdog.set_callback(
