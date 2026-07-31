@@ -28,6 +28,7 @@
 #include "storage/types.h"
 #include "utils/notification_list.h"
 
+#include <seastar/core/gate.hh>
 #include <seastar/core/shared_ptr.hh>
 
 namespace cloud_topics {
@@ -164,6 +165,32 @@ public:
 
     bool is_elected_leader() const;
     bool is_leader() const;
+
+    // Keep the durable partition_mode in step with the topic-configured
+    // storage mode: whenever they differ -- a storage.mode change, or the
+    // first time a leader records it -- write topic_mode() through to
+    // partition_properties. Gated behind the partition_mode feature and
+    // leader-only. Legacy shadow_indexing topics (topic_mode() == unset) are
+    // left unset. Invoked on leadership, on migration-feature activation, and
+    // on topic-config changes (update_configuration).
+    //
+    // Transient failures are retried with backoff, aborting on `as`, on the
+    // partition's own abort source, or on losing leadership. The retry budget
+    // is bounded (a multiple of the stm's sync timeout): a failure that
+    // outlasts it implies quorum trouble, which churns leadership, and the
+    // next leader's notification restarts the sync. Runs under
+    // _sync_partition_mode_gate, so stop() waits for every in-flight sync.
+    // The future can fail with shutdown exceptions (gate closed, abort);
+    // callers that must not block on the sync's raft commit detach with
+    // ssx::background + ssx::ignore_shutdown_exceptions.
+    //
+    // Concurrent syncs on one partition are tolerated rather than
+    // deduplicated: each loop recomputes its target per attempt and the stm
+    // no-ops idempotent writes under its mutex, so extras converge cheaply. (A
+    // skip-if-running guard would need a dirty-flag handshake to avoid
+    // dropping a config change that races a finishing loop.)
+    ss::future<> maybe_sync_partition_mode(ss::abort_source& as);
+
     bool has_followers() const;
     void block_new_leadership() const;
     void unblock_new_leadership() const;
@@ -437,6 +464,9 @@ private:
     ss::shared_ptr<partition_properties_stm> _partition_properties_stm;
     ss::sharded<cloud_topics::state_accessors>* _cloud_topics_state;
     ss::abort_source _as;
+    // Every in-flight partition_mode sync (background or sweep-initiated)
+    // runs inside this gate; closed in stop().
+    ss::gate _sync_partition_mode_gate;
     partition_probe _probe;
     ss::sharded<features::feature_table>& _feature_table;
     ss::lw_shared_ptr<const archival::configuration> _archival_conf;

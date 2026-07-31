@@ -65,6 +65,10 @@ public:
     // callers (ntp_config) fall back to the topic-config-derived mode.
     model::redpanda_storage_mode partition_mode() const;
 
+    // Timeout for a single sync()/replication in this stm; a caller sizing a
+    // retry budget around set_partition_mode should use a multiple of it.
+    std::chrono::milliseconds sync_timeout() const { return _sync_timeout(); }
+
     // Registers a callback invoked on this shard whenever partition_mode may
     // have changed (on apply and on raft-snapshot restore), so the owner can
     // re-read partition_mode() and propagate it (e.g. into ntp_config).

@@ -31,8 +31,10 @@
 #include "raft/fwd.h"
 #include "raft/state_machine_manager.h"
 #include "ssx/future-util.h"
+#include "ssx/sleep_abortable.h"
 #include "ssx/when_all.h"
 #include "storage/ntp_config.h"
+#include "utils/retry_chain_node.h"
 
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/util/defer.hh>
@@ -560,6 +562,8 @@ ss::future<> partition::stop() {
     vlog(clusterlog.debug, "Stopping partition: {}", partition_ntp);
     _as.request_abort();
 
+    co_await _sync_partition_mode_gate.close();
+
     unregister_flush_hook(_archiver_flush_subscription);
 
     {
@@ -912,6 +916,13 @@ ss::future<> partition::update_configuration(topic_properties new_properties) {
 
     // Pass the configuration update to the raft layer
     _raft->notify_config_update();
+
+    // A storage.mode change lands in topic_mode() (above); keep the durable
+    // partition_mode in step so serving predicates see the new mode. In the
+    // background: the sync takes a raft commit, and this path runs inside
+    // controller_backend's per-NTP reconciliation, which must not block on it.
+    ssx::background = ssx::ignore_shutdown_exceptions(
+      maybe_sync_partition_mode(_as));
 
     // If this partition's cloud storage mode changed, rebuild the archiver.
     // This must happen after the raft+storage update, because it reads raft's
@@ -1776,6 +1787,72 @@ void partition::update_partition_mode() {
     }
     _raft->log()->set_partition_mode(
       _partition_properties_stm->partition_mode());
+}
+
+ss::future<> partition::maybe_sync_partition_mode(ss::abort_source& as) {
+    auto holder = _sync_partition_mode_gate.hold();
+    if (!_partition_properties_stm) {
+        co_return;
+    }
+    if (!_feature_table.local().is_active(
+          features::feature::topic_mode_migration)) {
+        co_return;
+    }
+    // All allowed storage mode transitions are simply passed through: mirror
+    // topic_mode() into partition_mode whenever they differ. (A legacy
+    // shadow_indexing topic has topic_mode() == unset; partition_mode starts
+    // unset too, so this is a no-op and it stays unset.)
+    //
+    // A failed attempt can cost up to the stm's sync timeout, so the retry
+    // budget is a multiple of it.
+    retry_chain_node rtc(
+      as, 5 * _partition_properties_stm->sync_timeout(), 100ms);
+    while (is_leader() && !as.abort_requested()) {
+        // Recomputed on every attempt: the topic config may change while
+        // retrying, including while a previous attempt was replicating.
+        const auto target = get_ntp_config().topic_mode();
+        if (_partition_properties_stm->partition_mode() == target) {
+            co_return;
+        }
+        auto res = co_await _partition_properties_stm->set_partition_mode(
+          target);
+        if (!res.has_error()) {
+            continue;
+        }
+        // A replication error steps the leader down and the successor's
+        // leadership notification takes over; re-check before paying for a
+        // permit and a backoff sleep so that path exits immediately. What the
+        // retries cover is a sync failure on a stable leader.
+        if (!is_leader() || as.abort_requested()) {
+            co_return;
+        }
+        auto err_msg = res.error().message();
+        auto permit = rtc.retry();
+        if (!permit.is_allowed) {
+            vlog(
+              clusterlog.info,
+              "{}: failed to sync partition_mode to {}: {}; giving up (will "
+              "retry on the next leadership change or topic config update)",
+              _raft->ntp(),
+              target,
+              err_msg);
+            co_return;
+        }
+        vlog(
+          clusterlog.debug,
+          "{}: failed to sync partition_mode to {}: {}; retrying in {}ms",
+          _raft->ntp(),
+          target,
+          err_msg,
+          permit.delay / 1ms);
+        try {
+            // Sleep aborts on the caller's abort source (node shutdown, on
+            // the sweep path) and on the partition's own (partition removal).
+            co_await ssx::sleep_abortable(permit.delay, as, _as);
+        } catch (const ss::sleep_aborted&) {
+            co_return;
+        }
+    }
 }
 
 ss::future<result<model::offset>> partition::set_writes_disabled(
