@@ -209,7 +209,8 @@ public:
       std::optional<cloud_storage_clients::http_byte_range> byte_range
       = std::nullopt,
       std::function<void(size_t)> throttle_metric_ms_cb = {},
-      group_id gid = group_id::default_group) override;
+      group_id gid = group_id::default_group,
+      take_io_throttle take_throttle = take_io_throttle::yes) override;
 
     template<typename R>
     requires std::ranges::range<R>

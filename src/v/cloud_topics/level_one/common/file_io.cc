@@ -103,9 +103,11 @@ struct one_time_stream_provider : public stream_provider {
 // peak in-memory bytes and the connection-hold duration are bounded by the
 // range length. Backs read_object's skip_cache path without populating the
 // cloud cache; the range is bounded because open_object invokes read_object
-// once per chunk. A download failure throws (rethrowing the original
-// exception, or a runtime_error for a non-success result), surfaced from the
-// caller's read of the returned stream.
+// once per chunk. The body is not metered by the io_resources throughput limit
+// (take_io_throttle::no): that limit is derived from the storage device's write
+// throughput, and this read never writes to disk. A download failure throws
+// (rethrowing the original exception, or a runtime_error for a non-success
+// result), surfaced from the caller's read of the returned stream.
 ss::future<std::expected<ss::input_stream<char>, io::errc>>
 download_range_bypassing_cache(
   cloud_io::remote* remote,
@@ -157,7 +159,8 @@ download_range_bypassing_cache(
       "l1_stream_download",
       cloud_storage_clients::http_byte_range{pos, pos + len - 1},
       {},
-      gid));
+      gid,
+      cloud_io::take_io_throttle::no));
     if (result_fut.failed()) {
         std::rethrow_exception(result_fut.get_exception());
     }

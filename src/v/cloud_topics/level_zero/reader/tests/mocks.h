@@ -84,7 +84,8 @@ public:
        const std::string_view,
        std::optional<cloud_storage_clients::http_byte_range>,
        std::function<void(size_t)>,
-       cloud_io::group_id),
+       cloud_io::group_id,
+       cloud_io::take_io_throttle),
       (override));
 
     MOCK_METHOD(

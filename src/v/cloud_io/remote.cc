@@ -319,7 +319,8 @@ ss::future<download_result> remote::download_stream(
   const std::string_view stream_label,
   std::optional<cloud_storage_clients::http_byte_range> byte_range,
   std::function<void(size_t)> throttle_metric_ms_cb,
-  group_id gid) {
+  group_id gid,
+  take_io_throttle take_throttle) {
     const auto& path = transfer_details.key;
     const auto& bucket = transfer_details.bucket;
     const auto bucket_parts = cloud_storage_clients::parse_bucket_name(bucket);
@@ -369,11 +370,15 @@ ss::future<download_result> remote::download_stream(
               resp.value()->get_headers().at(
                 boost::beast::http::field::content_length));
             try {
-                auto underlying_st = resp.value()->as_input_stream();
-                auto throttled_st = _resources->throttle_download(
-                  std::move(underlying_st), _as, throttle_metric_ms_cb);
+                // input_stream is not move-assignable, so select the stream in
+                // one expression and move-construct it.
+                auto st = take_throttle ? _resources->throttle_download(
+                                            resp.value()->as_input_stream(),
+                                            _as,
+                                            throttle_metric_ms_cb)
+                                        : resp.value()->as_input_stream();
                 uint64_t content_length = co_await cons_str(
-                  length, std::move(throttled_st));
+                  length, std::move(st));
                 transfer_details.on_success_size(content_length);
                 co_return download_result::success;
             } catch (...) {

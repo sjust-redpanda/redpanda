@@ -17,6 +17,8 @@
 #include "utils/lazy_abort_source.h"
 #include "utils/stream_provider.h"
 
+#include <seastar/util/bool_class.hh>
+
 namespace cloud_io {
 
 template<class Clock>
@@ -37,6 +39,12 @@ struct basic_download_request {
 };
 using download_request = basic_download_request<ss::lowres_clock>;
 using remote_path = named_type<ss::sstring, struct remote_path_tag>;
+
+/// Whether a download's body is metered by the shard's io_resources
+/// throughput limit. That limit is derived from the storage device's write
+/// throughput, so a read that never lands on disk need not be charged against
+/// it. Applied per buffer as the consumer drains the stream.
+using take_io_throttle = ss::bool_class<struct take_io_throttle_tag>;
 
 using list_result = result<
   cloud_storage_clients::client::list_bucket_result,
@@ -107,7 +115,8 @@ public:
       std::optional<cloud_storage_clients::http_byte_range> byte_range
       = std::nullopt,
       std::function<void(size_t)> throttle_metric_ms_cb = {},
-      group_id gid = group_id::default_group)
+      group_id gid = group_id::default_group,
+      take_io_throttle take_throttle = take_io_throttle::yes)
       = 0;
 };
 
