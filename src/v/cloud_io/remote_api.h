@@ -104,11 +104,11 @@ public:
       transfer_details transfer_details,
       const try_consume_stream& cons_str,
       const std::string_view stream_label,
-      bool acquire_hydration_units,
       std::optional<cloud_storage_clients::http_byte_range> byte_range
       = std::nullopt,
       std::function<void(size_t)> throttle_metric_ms_cb = {},
-      group_id gid = group_id::default_group) = 0;
+      group_id gid = group_id::default_group)
+      = 0;
 };
 
 } // namespace cloud_io

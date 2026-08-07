@@ -155,7 +155,6 @@ download_range_bypassing_cache(
       },
       consumer,
       "l1_stream_download",
-      /*acquire_hydration_units=*/true,
       cloud_storage_clients::http_byte_range{pos, pos + len - 1},
       {},
       gid));
@@ -337,7 +336,6 @@ ss::future<std::expected<void, io::errc>> file_io::do_download_to_cache(
           },
           consumer,
           download_label,
-          /*acquire_hydration_units=*/true,
           range,
           {},
           gid));

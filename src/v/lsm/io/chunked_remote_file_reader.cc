@@ -244,7 +244,6 @@ ss::future<bool> chunked_remote_file_reader::download_chunk(
             content_length, std::move(input_stream), key);
       },
       "chunked SST chunk download",
-      /*acquire_hydration_units=*/true,
       byte_range,
       /*throttle_metric_ms_cb=*/{},
       _gid);

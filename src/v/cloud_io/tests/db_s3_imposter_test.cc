@@ -153,7 +153,6 @@ public:
                            co_return content_length;
                        },
                        "test-download-stream",
-                       /*acquire_hydration_units=*/true,
                        range)
                      .get();
         return {res, out};

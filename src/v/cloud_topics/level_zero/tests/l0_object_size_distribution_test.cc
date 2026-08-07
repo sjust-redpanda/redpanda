@@ -87,7 +87,6 @@ public:
       (cloud_io::basic_transfer_details<ss::manual_clock>,
        const cloud_io::try_consume_stream&,
        const std::string_view,
-       bool,
        std::optional<cloud_storage_clients::http_byte_range>,
        std::function<void(size_t)>,
        cloud_io::group_id),

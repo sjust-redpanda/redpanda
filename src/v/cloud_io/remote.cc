@@ -317,7 +317,6 @@ ss::future<download_result> remote::download_stream(
   transfer_details transfer_details,
   const try_consume_stream& cons_str,
   const std::string_view stream_label,
-  [[maybe_unused]] bool acquire_hydration_units,
   std::optional<cloud_storage_clients::http_byte_range> byte_range,
   std::function<void(size_t)> throttle_metric_ms_cb,
   group_id gid) {
