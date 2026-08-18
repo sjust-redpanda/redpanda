@@ -216,6 +216,11 @@ public:
     /// added with `add_segments`.
     const cloud_storage::partition_manifest& manifest() const;
 
+    /// True if the partition holds tiered-storage data: the manifest has
+    /// segments, or a non-empty spillover archive. Used to detect that a
+    /// partition is (still) tiered storage independent of the topic config.
+    bool has_archived_data() const;
+
     ss::future<> stop() override;
 
     static ss::future<> make_snapshot(

@@ -1674,6 +1674,11 @@ archival_metadata_stm::manifest() const {
     return *_manifest;
 }
 
+bool archival_metadata_stm::has_archived_data() const {
+    return _manifest->size() > 0
+           || _manifest->get_archive_start_offset() != model::offset{};
+}
+
 model::offset archival_metadata_stm::get_start_offset() const {
     auto p = _manifest->get_start_offset();
     if (p.has_value()) {
