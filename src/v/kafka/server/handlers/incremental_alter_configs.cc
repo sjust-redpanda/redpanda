@@ -575,6 +575,8 @@ create_topic_properties_update(
                   op,
                   validator,
                   parse);
+                record_migrated_from_on_migration(
+                  update.properties, current_storage_mode);
                 continue;
             }
         } catch (const validation_error& e) {

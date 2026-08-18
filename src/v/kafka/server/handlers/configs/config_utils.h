@@ -485,6 +485,30 @@ struct storage_mode_validator {
     }
 };
 
+/// If a validated storage.mode update migrates the topic into a cloud mode
+/// (cloud/tiered_cloud) from a non-cloud one, record the pre-migration mode in
+/// migrated_from alongside it. migrated_from is what keeps the tiered-storage
+/// STMs (archival_metadata_stm, log_eviction_stm) installed on the migrated
+/// partitions, including across restarts.
+inline void record_migrated_from_on_migration(
+  cluster::incremental_topic_updates& update,
+  std::optional<model::redpanda_storage_mode> current_mode) {
+    using sm = model::redpanda_storage_mode;
+    if (
+      update.storage_mode.op != cluster::incremental_update_operation::set
+      || !update.storage_mode.value.has_value() || !current_mode.has_value()) {
+        return;
+    }
+    const auto to = *update.storage_mode.value;
+    const auto from = *current_mode;
+    const bool to_cloud = to == sm::cloud || to == sm::tiered_cloud;
+    const bool from_cloud = from == sm::cloud || from == sm::tiered_cloud;
+    if (to_cloud && !from_cloud && from != sm::unset) {
+        update.migrated_from.op = cluster::incremental_update_operation::set;
+        update.migrated_from.value = from;
+    }
+}
+
 template<typename T, typename... ValidatorTypes>
 requires requires(
   model::topic_namespace_view tns,

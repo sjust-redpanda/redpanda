@@ -607,6 +607,8 @@ create_topic_properties_update(
                   kafka::config_resource_operation::set,
                   validator,
                   parse);
+                record_migrated_from_on_migration(
+                  update.properties, current_storage_mode);
                 continue;
             }
 

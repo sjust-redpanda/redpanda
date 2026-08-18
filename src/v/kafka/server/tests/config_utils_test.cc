@@ -186,3 +186,50 @@ BOOST_AUTO_TEST_CASE(test_min_replication_factor) {
 
     BOOST_REQUIRE_EQUAL(property.value, cluster::replication_factor{3});
 }
+
+BOOST_AUTO_TEST_CASE(record_migrated_from_on_migration_test) {
+    using mode = model::redpanda_storage_mode;
+    using op_t = cluster::incremental_update_operation;
+
+    auto make_update = [](op_t op, std::optional<mode> to) {
+        cluster::incremental_topic_updates update;
+        update.storage_mode.op = op;
+        update.storage_mode.value = to;
+        return update;
+    };
+
+    // tiered -> cloud is a migration: the pre-migration mode is recorded.
+    auto update = make_update(op_t::set, mode::cloud);
+    kafka::record_migrated_from_on_migration(update, mode::tiered);
+    BOOST_REQUIRE(update.migrated_from.op == op_t::set);
+    BOOST_REQUIRE(update.migrated_from.value == mode::tiered);
+
+    update = make_update(op_t::set, mode::tiered_cloud);
+    kafka::record_migrated_from_on_migration(update, mode::tiered);
+    BOOST_REQUIRE(update.migrated_from.op == op_t::set);
+    BOOST_REQUIRE(update.migrated_from.value == mode::tiered);
+
+    // A transition between non-cloud modes records nothing.
+    update = make_update(op_t::set, mode::tiered);
+    kafka::record_migrated_from_on_migration(update, mode::local);
+    BOOST_REQUIRE(update.migrated_from.op == op_t::none);
+
+    // A move within the cloud modes is not a migration.
+    update = make_update(op_t::set, mode::tiered_cloud);
+    kafka::record_migrated_from_on_migration(update, mode::cloud);
+    BOOST_REQUIRE(update.migrated_from.op == op_t::none);
+
+    // No recorded prior mode (new topic / unset) records nothing.
+    update = make_update(op_t::set, mode::cloud);
+    kafka::record_migrated_from_on_migration(update, std::nullopt);
+    BOOST_REQUIRE(update.migrated_from.op == op_t::none);
+
+    update = make_update(op_t::set, mode::cloud);
+    kafka::record_migrated_from_on_migration(update, mode::unset);
+    BOOST_REQUIRE(update.migrated_from.op == op_t::none);
+
+    // An update that does not set storage_mode records nothing.
+    update = make_update(op_t::none, std::nullopt);
+    kafka::record_migrated_from_on_migration(update, mode::tiered);
+    BOOST_REQUIRE(update.migrated_from.op == op_t::none);
+}
